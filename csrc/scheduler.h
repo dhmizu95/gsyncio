@@ -257,6 +257,15 @@ void scheduler_set_energy_efficient_mode(bool enabled);
 double scheduler_get_worker_utilization(void);
 size_t scheduler_get_recommended_workers(void);
 
+/* Batch spawn for high-performance task creation */
+typedef struct {
+    void* func;
+    void* args;
+    uint64_t fiber_id;
+} python_task_t;
+
+int scheduler_spawn_batch_python(python_task_t* tasks, size_t count);
+
 #ifdef __cplusplus
 }
 #endif

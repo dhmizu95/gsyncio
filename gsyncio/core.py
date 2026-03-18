@@ -22,6 +22,8 @@ try:
         shutdown_scheduler,
         get_scheduler_stats,
         spawn,
+        spawn_batch,
+        spawn_batch_fast,
         sleep_ns,
         sleep_us,
         sleep_ms,
@@ -339,6 +341,24 @@ except ImportError:
         """Get recommended workers (returns CPU count in pure Python)"""
         import os
         return os.cpu_count() or 1
+    
+    # Batch spawn (pure Python fallback)
+    def spawn_batch(funcs_and_args):
+        """Spawn multiple tasks in batch (pure Python - uses threading)"""
+        import threading
+        results = []
+        for func, args in funcs_and_args:
+            t = threading.Thread(target=func, args=args, daemon=True)
+            t.start()
+            results.append(id(t))  # Return thread ID as fiber ID substitute
+        return results
+    
+    def spawn_batch_fast(funcs_and_args):
+        """Ultra-fast batch spawn (pure Python - no return values)"""
+        import threading
+        for func, args in funcs_and_args:
+            t = threading.Thread(target=func, args=args, daemon=True)
+            t.start()
 
 
 __all__ = [

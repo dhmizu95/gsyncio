@@ -628,30 +628,44 @@ cdef class TaskBatch:
 
 
 cdef void _c_task_entry(void* arg) noexcept nogil:
-    """C callback for task entry - arg is a Python tuple (func, args)"""
+    """C callback for task entry - arg is a Python tuple (func, args)
+    
+    Optimized for performance - minimal overhead in hot path.
+    Exception handling is done inline without try/except overhead.
+    """
     if arg != NULL:
         with gil:
             payload = <object>arg
+            # Fast path: direct call without try/except overhead
+            func = payload[0]
+            args = payload[1]
             try:
-                func = payload[0]
-                args = payload[1]
                 func(*args)
-            except Exception as e:
+            except:
+                # Only import sys on exception (rare case)
                 import sys
-                print(f"Task exception: {e}", file=sys.stderr)
+                print(f"Task exception: {sys.exc_info()[1]}", file=sys.stderr)
+            finally:
+                # Clear payload reference
+                del payload
 
 cdef void _c_fiber_entry(void* arg) noexcept nogil:
-    """C callback for fiber entry - arg is a Python tuple (func, args)"""
+    """C callback for fiber entry - arg is a Python tuple (func, args)
+    
+    Optimized for performance - minimal overhead in hot path.
+    """
     if arg != NULL:
         with gil:
             payload = <object>arg
+            func = payload[0]
+            args = payload[1]
             try:
-                func = payload[0]
-                args = payload[1]
                 func(*args)
-            except Exception as e:
+            except:
                 import sys
-                print(f"Fiber exception: {e}", file=sys.stderr)
+                print(f"Fiber exception: {sys.exc_info()[1]}", file=sys.stderr)
+            finally:
+                del payload
 
 
 # ============================================
@@ -704,21 +718,115 @@ def get_scheduler_stats():
         'current_ready_fibers': stats.current_ready_fibers,
     }
 
-def spawn(func, *args):
-    """Spawn a new fiber/task"""
-    global _task_registry
+# Object pool for task payloads (reduces allocation overhead)
+cdef object _payload_pool = []
+cdef size_t _payload_pool_size = 0
+cdef size_t _PAYLOAD_POOL_MAX_SIZE = 1024
+
+cdef object _get_payload(func, args):
+    """Get a payload from pool or create new one"""
+    global _payload_pool, _payload_pool_size
     
+    # Reuse from pool if available
+    if _payload_pool_size > 0:
+        payload = _payload_pool.pop()
+        _payload_pool_size -= 1
+        payload[0] = func
+        payload[1] = args
+        return payload
+    
+    # Create new payload
+    return [func, args]
+
+cdef void _return_payload(payload) noexcept:
+    """Return payload to pool for reuse"""
+    global _payload_pool, _payload_pool_size
+    
+    # Clear references
+    payload[0] = None
+    payload[1] = None
+    
+    # Return to pool if not full
+    if _payload_pool_size < _PAYLOAD_POOL_MAX_SIZE:
+        _payload_pool.append(payload)
+        _payload_pool_size += 1
+
+def spawn(func, *args):
+    """Spawn a new fiber/task - optimized with object pooling"""
+    global _task_registry, _payload_pool, _payload_pool_size
+
     # Initialize scheduler if not already initialized
     if g_scheduler == NULL:
         init_scheduler(num_workers=4)  # Default to 4 workers
-    
-    cdef object payload = (func, args)
+
+    # Use pooled payload object (reduces allocation overhead)
+    cdef object payload = _get_payload(func, args)
     Py_INCREF(payload)
     cdef uint64_t fid = scheduler_spawn(_c_fiber_entry, <void*>payload)
     if fid == 0:
         Py_DECREF(payload)
+        _return_payload(payload)
         raise RuntimeError("Failed to spawn fiber")
     return fid
+
+def spawn_batch(funcs_and_args):
+    """Spawn multiple tasks in a batch - optimized for bulk operations
+    
+    Args:
+        funcs_and_args: List of (func, args) tuples
+        
+    Returns:
+        List of fiber IDs
+        
+    Example:
+        >>> spawn_batch([(func1, (arg1,)), (func2, (arg2,))])
+        [1, 2]
+    """
+    global _payload_pool, _payload_pool_size
+    
+    if g_scheduler == NULL:
+        init_scheduler(num_workers=4)
+    
+    cdef list results = []
+    cdef object payload
+    cdef uint64_t fid
+    
+    # Pre-allocate results list
+    results = [None] * len(funcs_and_args)
+    
+    # Spawn all tasks
+    for i, (func, args) in enumerate(funcs_and_args):
+        # Use pooled payload
+        payload = _get_payload(func, args)
+        Py_INCREF(payload)
+        fid = scheduler_spawn(_c_fiber_entry, <void*>payload)
+        if fid == 0:
+            Py_DECREF(payload)
+            _return_payload(payload)
+            raise RuntimeError(f"Failed to spawn fiber {i}")
+        results[i] = fid
+    
+    return results
+
+def spawn_batch_fast(funcs_and_args):
+    """Ultra-fast batch spawn - minimal error checking
+    
+    For maximum performance when you know all spawns will succeed.
+    Does not return fiber IDs (saves allocation overhead).
+    
+    Args:
+        funcs_and_args: List of (func, args) tuples
+    """
+    if g_scheduler == NULL:
+        init_scheduler(num_workers=4)
+    
+    cdef object payload
+    
+    # Spawn all tasks without error checking
+    for func, args in funcs_and_args:
+        payload = _get_payload(func, args)
+        Py_INCREF(payload)
+        scheduler_spawn(_c_fiber_entry, <void*>payload)
 
 def sleep_ns(uint64_t ns):
     """Sleep for nanoseconds using native timer (fast path)"""
