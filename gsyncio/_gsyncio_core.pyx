@@ -7,13 +7,13 @@ _gsyncio_core.pyx - Cython wrapper for gsyncio C core
 
 This module provides Python bindings to the high-performance C core
 of gsyncio, including fibers, scheduler, futures, channels, waitgroups,
-and select operations.
+select operations, and task/sync model.
 """
 
 from libc.stdlib cimport malloc, free
 from libc.stdint cimport uint64_t, int64_t
-from libc.string cimport memset
-from cpython.ref cimport PyObject, Py_INCREF, Py_DECREF
+from libc.string cimport memset, memcpy
+from cpython.ref cimport PyObject, Py_INCREF, Py_DECREF, Py_XINCREF, Py_XDECREF
 from cpython.object cimport PyObject
 
 # Use size_t from libc.stddef
@@ -31,7 +31,9 @@ cdef extern from "setjmp.h":
     ctypedef struct sigjmp_buf:
         pass
 
-# Forward declarations for C types
+# ============================================
+# Fiber declarations
+# ============================================
 cdef extern from "fiber.h":
     ctypedef enum fiber_state_t:
         FIBER_NEW
@@ -40,7 +42,7 @@ cdef extern from "fiber.h":
         FIBER_WAITING
         FIBER_COMPLETED
         FIBER_CANCELLED
-    
+
     ctypedef struct fiber_t:
         uint64_t id
         fiber_state_t state
@@ -60,7 +62,7 @@ cdef extern from "fiber.h":
         sigjmp_buf context
         sigjmp_buf* sched_jump
         void* waiting_on
-    
+
     int fiber_init()
     void fiber_cleanup()
     fiber_t* fiber_create(void (*func)(void*), void* arg, size_t stack_size)
@@ -74,6 +76,9 @@ cdef extern from "fiber.h":
     fiber_state_t fiber_state(fiber_t* fiber)
     int fiber_is_parked(fiber_t* fiber)
 
+# ============================================
+# Scheduler declarations
+# ============================================
 cdef extern from "scheduler.h":
     ctypedef struct scheduler_config_t:
         size_t num_workers
@@ -82,7 +87,7 @@ cdef extern from "scheduler.h":
         int work_stealing
         int backend
         size_t io_uring_entries
-    
+
     ctypedef struct scheduler_stats_t:
         uint64_t total_fibers_created
         uint64_t total_fibers_completed
@@ -90,12 +95,12 @@ cdef extern from "scheduler.h":
         uint64_t total_work_steals
         uint64_t current_active_fibers
         uint64_t current_ready_fibers
-    
+
     ctypedef struct scheduler_t:
         pass
-    
+
     scheduler_t* g_scheduler
-    
+
     int scheduler_init(scheduler_config_t* config)
     void scheduler_shutdown(int wait_for_completion)
     scheduler_t* scheduler_get()
@@ -113,18 +118,21 @@ cdef extern from "scheduler.h":
     void scheduler_stop()
     void scheduler_sleep_ns(uint64_t ns)
 
+# ============================================
+# Future declarations
+# ============================================
 cdef extern from "future.h":
     ctypedef enum future_state:
         FUTURE_PENDING
         FUTURE_READY
         FUTURE_EXCEPTION
-    
+
     ctypedef struct future_t:
         future_state state
         void* result
         void* exception
         int refcount
-    
+
     future_t* future_create()
     void future_destroy(future_t* f)
     void future_incref(future_t* f)
@@ -138,6 +146,9 @@ cdef extern from "future.h":
     void future_wait(future_t* f)
     void future_await(future_t* f)
 
+# ============================================
+# Channel declarations
+# ============================================
 cdef extern from "channel.h":
     ctypedef struct channel_t:
         uint64_t id
@@ -145,7 +156,7 @@ cdef extern from "channel.h":
         size_t size
         int closed
         int refcount
-    
+
     channel_t* channel_create(size_t capacity)
     void channel_destroy(channel_t* ch)
     void channel_incref(channel_t* ch)
@@ -161,11 +172,14 @@ cdef extern from "channel.h":
     int channel_is_full(channel_t* ch)
     uint64_t channel_id(channel_t* ch)
 
+# ============================================
+# WaitGroup declarations
+# ============================================
 cdef extern from "waitgroup.h":
     ctypedef struct waitgroup_t:
         int64_t counter
         int refcount
-    
+
     waitgroup_t* waitgroup_create()
     void waitgroup_destroy(waitgroup_t* wg)
     void waitgroup_incref(waitgroup_t* wg)
@@ -175,81 +189,132 @@ cdef extern from "waitgroup.h":
     void waitgroup_wait(waitgroup_t* wg)
     int64_t waitgroup_counter(waitgroup_t* wg)
 
-cdef extern from "fiber_pool.h":
-    ctypedef struct fiber_pool_t:
-        size_t capacity
-        size_t available
-        size_t allocated
-    
-    fiber_pool_t* fiber_pool_create(size_t initial_size)
-    void fiber_pool_destroy(fiber_pool_t* pool)
-    fiber_t* fiber_pool_alloc(fiber_pool_t* pool)
-    void fiber_pool_free(fiber_pool_t* pool, fiber_t* fiber)
-    size_t fiber_pool_available(fiber_pool_t* pool)
-    size_t fiber_pool_allocated(fiber_pool_t* pool)
-    size_t fiber_pool_capacity(fiber_pool_t* pool)
+# ============================================
+# Select declarations
+# ============================================
+cdef extern from "select.h":
+    ctypedef enum select_case_type:
+        SELECT_CASE_RECV
+        SELECT_CASE_SEND
+        SELECT_CASE_DEFAULT
+
+    ctypedef struct select_case_t:
+        select_case_type type
+        channel_t* channel
+        void* value
+        void* recv_value
+        int executed
+
+    ctypedef struct select_result_t:
+        int case_index
+        select_case_t* case_info
+        void* value
+        int success
+
+    ctypedef struct select_state_t:
+        select_case_t* cases
+        size_t case_count
+        select_result_t result
+        void* waiting_fiber
+        int refcount
+
+    select_state_t* select_create(size_t case_count)
+    void select_destroy(select_state_t* sel)
+    void select_set_recv(select_state_t* sel, size_t index, channel_t* ch)
+    void select_set_send(select_state_t* sel, size_t index, channel_t* ch, void* value)
+    void select_set_default(select_state_t* sel, size_t index)
+    select_result_t select_try(select_state_t* sel)
+    select_result_t select_execute(select_state_t* sel)
+    select_result_t select_result(select_state_t* sel)
 
 # ============================================
-# Python-visible classes and functions
+# Task declarations
+# ============================================
+cdef extern from "task.h":
+    ctypedef enum task_state:
+        TASK_STATE_RUNNING
+        TASK_STATE_COMPLETED
+        TASK_STATE_CANCELLED
+
+    ctypedef struct task_handle_t:
+        uint64_t fiber_id
+        task_state state
+        void* result
+        void* exception
+
+    ctypedef struct task_registry_t:
+        size_t active_count
+
+    task_registry_t* task_registry_create()
+    void task_registry_destroy(task_registry_t* reg)
+    task_handle_t* task_spawn(task_registry_t* reg, void (*func)(void*), void* arg)
+    void task_sync(task_registry_t* reg)
+    int task_sync_timeout(task_registry_t* reg, uint64_t timeout_ns)
+    size_t task_count(task_registry_t* reg)
+    task_registry_t* task_get_registry()
+    void task_set_registry(task_registry_t* reg)
+
+# ============================================
+# Python-visible classes
 # ============================================
 
 cdef class Future:
     """Python wrapper for future_t"""
     cdef future_t* _future
-    
+
     def __cinit__(self):
         self._future = future_create()
         if not self._future:
             raise MemoryError("Failed to create future")
-    
+
     def __dealloc__(self):
         if self._future:
             future_decref(self._future)
-    
+
     @property
     def done(self):
         """Check if future is done"""
         return future_is_done(self._future) != 0
-    
+
     @property
     def cancelled(self):
         """Check if future is cancelled (not implemented)"""
         return False
-    
+
     def result(self, timeout=None):
         """Get the result of the future"""
         if not future_is_done(self._future):
             future_wait(self._future)
-        
+
         if future_has_exception(self._future):
             exc = <object>future_exception(self._future)
             if exc is not None:
                 raise exc
             raise RuntimeError("Future completed with exception")
-        
+
         return <object>future_result(self._future)
-    
+
     def exception(self, timeout=None):
         """Get the exception of the future"""
         if not future_is_done(self._future):
             future_wait(self._future)
-        
+
         return <object>future_exception(self._future)
-    
+
     def set_result(self, result):
         """Set the result of the future"""
         Py_INCREF(result)
         if future_set_result(self._future, <void*>result) != 0:
             Py_DECREF(result)
             raise RuntimeError("Future already completed")
-    
+
     def set_exception(self, exc):
         """Set the exception of the future"""
         Py_INCREF(exc)
         if future_set_exception(self._future, <void*>exc) != 0:
             Py_DECREF(exc)
             raise RuntimeError("Future already completed")
-    
+
     def __await__(self):
         """Make future awaitable"""
         if not future_is_done(self._future):
@@ -260,38 +325,38 @@ cdef class Future:
 cdef class Channel:
     """Python wrapper for channel_t"""
     cdef channel_t* _channel
-    
+
     def __cinit__(self, size_t capacity=0):
         self._channel = channel_create(capacity)
         if not self._channel:
             raise MemoryError("Failed to create channel")
-    
+
     def __dealloc__(self):
         if self._channel:
             channel_decref(self._channel)
-    
+
     @property
     def capacity(self):
         """Channel buffer capacity"""
         return self._channel.capacity if self._channel else 0
-    
+
     @property
     def size(self):
         """Current number of items in buffer"""
         return channel_size(self._channel) if self._channel else 0
-    
+
     @property
     def closed(self):
         """Check if channel is closed"""
         return channel_is_closed(self._channel) != 0 if self._channel else True
-    
+
     async def send(self, value):
         """Send value to channel (async)"""
         Py_INCREF(value)
         if channel_send(self._channel, <void*>value) != 0:
             Py_DECREF(value)
             raise RuntimeError("Channel closed")
-    
+
     async def recv(self):
         """Receive value from channel (async)"""
         cdef void* value = channel_recv(self._channel)
@@ -300,7 +365,7 @@ cdef class Channel:
                 raise StopAsyncIteration("Channel closed")
             return None
         return <object>value
-    
+
     def send_nowait(self, value):
         """Send value without blocking"""
         Py_INCREF(value)
@@ -308,21 +373,21 @@ cdef class Channel:
             Py_DECREF(value)
             return False
         return True
-    
+
     def recv_nowait(self):
         """Receive value without blocking"""
         cdef void* value
         if channel_try_recv(self._channel, &value) != 0:
             return None
         return <object>value
-    
+
     def close(self):
         """Close the channel"""
         channel_close(self._channel)
-    
+
     def __len__(self):
         return self.size
-    
+
     def __bool__(self):
         return not self.closed
 
@@ -330,57 +395,190 @@ cdef class Channel:
 cdef class WaitGroup:
     """Python wrapper for waitgroup_t"""
     cdef waitgroup_t* _wg
-    
+
     def __cinit__(self):
         self._wg = waitgroup_create()
         if not self._wg:
             raise MemoryError("Failed to create waitgroup")
-    
+
     def __dealloc__(self):
         if self._wg:
             waitgroup_decref(self._wg)
-    
+
     def add(self, int64_t delta=1):
         """Add delta to counter"""
         if waitgroup_add(self._wg, delta) != 0:
             raise RuntimeError("WaitGroup counter would be negative")
-    
+
     def done(self):
         """Decrement counter by 1"""
         waitgroup_done(self._wg)
-    
+
     async def wait(self):
         """Wait for counter to reach zero"""
         waitgroup_wait(self._wg)
-    
+
     @property
     def counter(self):
         """Current counter value"""
         return waitgroup_counter(self._wg)
 
 
+cdef class SelectState:
+    """Python wrapper for select_state_t"""
+    cdef select_state_t* _sel
+
+    def __cinit__(self, size_t case_count):
+        if case_count == 0:
+            raise ValueError("Case count must be > 0")
+        self._sel = select_create(case_count)
+        if not self._sel:
+            raise MemoryError("Failed to create select state")
+
+    def __dealloc__(self):
+        if self._sel:
+            select_destroy(self._sel)
+
+    def set_recv(self, size_t index, Channel ch):
+        """Set up a receive case"""
+        if self._sel and ch._channel:
+            select_set_recv(self._sel, index, ch._channel)
+
+    def set_send(self, size_t index, Channel ch, value):
+        """Set up a send case"""
+        if self._sel and ch._channel:
+            Py_INCREF(value)
+            select_set_send(self._sel, index, ch._channel, <void*>value)
+
+    def set_default(self, size_t index):
+        """Set up a default case"""
+        if self._sel:
+            select_set_default(self._sel, index)
+
+    def try_select(self):
+        """Try select without blocking"""
+        if not self._sel:
+            return None
+        cdef select_result_t result = select_try(self._sel)
+        if result.success:
+            return {
+                'case_index': result.case_index,
+                'value': <object>result.value if result.value else None,
+                'success': True
+            }
+        return None
+
+    def execute(self):
+        """Execute select (blocks until a case is ready)"""
+        if not self._sel:
+            return None
+        cdef select_result_t result = select_execute(self._sel)
+        if result.success:
+            return {
+                'case_index': result.case_index,
+                'value': <object>result.value if result.value else None,
+                'success': True
+            }
+        return None
+
+
+cdef class TaskRegistry:
+    """Python wrapper for task_registry_t"""
+    cdef task_registry_t* _reg
+
+    def __cinit__(self):
+        self._reg = task_registry_create()
+        if not self._reg:
+            raise MemoryError("Failed to create task registry")
+
+    def __dealloc__(self):
+        if self._reg:
+            task_registry_destroy(self._reg)
+
+    def spawn(self, func, *args):
+        """Spawn a new task"""
+        cdef object payload = (func, args)
+        Py_INCREF(payload)
+        cdef task_handle_t* handle = task_spawn(self._reg, _c_task_entry, <void*>payload)
+        if not handle:
+            Py_DECREF(payload)
+            raise RuntimeError("Failed to spawn task")
+        cdef uint64_t fid = handle.fiber_id
+        return fid
+
+    def sync(self):
+        """Wait for all tasks to complete"""
+        task_sync(self._reg)
+
+    def sync_timeout(self, float timeout_s):
+        """Wait for all tasks with timeout"""
+        cdef uint64_t timeout_ns = <uint64_t>(timeout_s * 1000000000)
+        return task_sync_timeout(self._reg, timeout_ns) == 0
+
+    @property
+    def active_count(self):
+        """Number of active tasks"""
+        return self._reg.active_count if self._reg else 0
+
+
+cdef void _c_task_entry(void* arg) noexcept nogil:
+    """C callback for task entry - arg is a Python tuple (func, args)"""
+    if arg != NULL:
+        with gil:
+            payload = <object>arg
+            try:
+                func = payload[0]
+                args = payload[1]
+                func(*args)
+            except Exception as e:
+                import sys
+                print(f"Task exception: {e}", file=sys.stderr)
+
+cdef void _c_fiber_entry(void* arg) noexcept nogil:
+    """C callback for fiber entry - arg is a Python tuple (func, args)"""
+    if arg != NULL:
+        with gil:
+            payload = <object>arg
+            try:
+                func = payload[0]
+                args = payload[1]
+                func(*args)
+            except Exception as e:
+                import sys
+                print(f"Fiber exception: {e}", file=sys.stderr)
+
+
 # ============================================
 # Module-level functions
 # ============================================
 
+# Global task registry
+_task_registry = None
+
 def init_scheduler(size_t num_workers=0, size_t max_fibers=1000000, int work_stealing=1):
     """Initialize the gsyncio scheduler"""
+    global _task_registry
     cdef scheduler_config_t config
-    # Use 0 to trigger auto-detection in C code
     config.num_workers = num_workers
     config.max_fibers = max_fibers
-    config.stack_size = 2048  # 2KB default (like Go)
+    config.stack_size = 2048
     config.work_stealing = work_stealing
     config.backend = 0
     config.io_uring_entries = 256
-    
+
     if scheduler_init(&config) != 0:
         raise RuntimeError("Failed to initialize scheduler")
-    
-    # fiber_init is called inside scheduler_init
+
+    fiber_init()
+
+    # Create global task registry
+    _task_registry = TaskRegistry()
 
 def shutdown_scheduler(int wait=1):
     """Shutdown the gsyncio scheduler"""
+    global _task_registry
+    if wait and _task_registry:
+        _task_registry.sync()
     scheduler_shutdown(wait)
     fiber_cleanup()
 
@@ -397,49 +595,15 @@ def get_scheduler_stats():
         'current_ready_fibers': stats.current_ready_fibers,
     }
 
-cdef void _c_fiber_entry(void* arg) noexcept with gil:
-    """C callback for fiber execution - arg is a Python tuple (func, args)"""
-    cdef object payload
-    cdef object func
-    cdef tuple args
-    
-    if arg != NULL:
-        # Extract the Python tuple from the void*
-        payload = <object>arg
-        
-        try:
-            func = payload[0]
-            args = payload[1]
-            func(*args)
-        except Exception as e:
-            import sys
-            print(f"Fiber exception: {e}", file=sys.stderr)
-
-# Fiber handle for tracking spawned fibers
-class FiberHandle:
-    """Handle for a spawned fiber - allows join-like waiting"""
-    def __init__(self, fid=0):
-        self.fid = fid
-    
-    @property
-    def done(self):
-        """Check if fiber is done (not implemented yet)"""
-        return False
-    
-    def join(self, timeout=None):
-        """Wait for fiber to complete (not implemented yet)"""
-        pass
-
 def spawn(func, *args):
-    """Spawn a new fiber/task.
-    
-    Note: Currently uses threading.Thread as a fallback.
-    Full fiber-based spawn implementation is work in progress.
-    """
-    import threading
-    t = threading.Thread(target=lambda: func(*args), daemon=True)
-    t.start()
-    return t
+    """Spawn a new fiber/task"""
+    cdef object payload = (func, args)
+    Py_INCREF(payload)
+    cdef uint64_t fid = scheduler_spawn(_c_fiber_entry, <void*>payload)
+    if fid == 0:
+        Py_DECREF(payload)
+        raise RuntimeError("Failed to spawn fiber")
+    return fid
 
 def sleep_ns(uint64_t ns):
     """Sleep for nanoseconds using native timer (fast path)"""
@@ -466,4 +630,60 @@ def num_workers():
     """Get number of worker threads"""
     return scheduler_num_workers()
 
-# Native networking initialized in scheduler
+def task(func, *args):
+    """Spawn a task using global task registry"""
+    global _task_registry
+    if not _task_registry:
+        init_scheduler()
+    return _task_registry.spawn(func, *args)
+
+def sync():
+    """Wait for all tasks to complete"""
+    global _task_registry
+    if _task_registry:
+        _task_registry.sync()
+
+def sync_timeout(float timeout_s):
+    """Wait for all tasks with timeout"""
+    global _task_registry
+    if not _task_registry:
+        return True
+    return _task_registry.sync_timeout(timeout_s)
+
+def task_count():
+    """Get number of active tasks"""
+    global _task_registry
+    if not _task_registry:
+        return 0
+    return _task_registry.active_count
+
+def run(func, *args):
+    """Run a function in the gsyncio runtime"""
+    init_scheduler()
+    try:
+        func(*args)
+        sync()
+    finally:
+        shutdown_scheduler(wait=True)
+
+# Select helper functions
+def select(*cases):
+    """Execute a select on multiple channel operations"""
+    if not cases:
+        return None
+
+    cdef size_t n = len(cases)
+    cdef SelectState sel = SelectState(n)
+
+    for i, case in enumerate(cases):
+        if isinstance(case, dict) and 'channel' in case:
+            ch = case['channel']
+            if case.get('is_send', False):
+                sel.set_send(i, ch, case.get('value'))
+            else:
+                sel.set_recv(i, ch)
+        elif isinstance(case, str) and case == 'default':
+            sel.set_default(i)
+
+    result = sel.execute()
+    return result
