@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "cython>=0.29.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gsyncio"
+version = "0.1.0"
+description = "High-performance fiber-based concurrency for Python"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "gsyncio team", email = "gsyncio@example.com"}
+]
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Concurrency",
+]
+keywords = ["async", "concurrency", "fiber", "coroutine", "goroutine", "asyncio"]
+
+[project.optional-dependencies]
+dev = [
+    "cython>=0.29.0",
+    "pytest>=6.0.0",
+    "pytest-asyncio>=0.18.0",
+    "pytest-benchmark>=3.4.0",
+    "black>=22.0.0",
+    "isort>=5.0.0",
+    "mypy>=0.950",
+]
+docs = [
+    "sphinx>=4.0.0",
+    "sphinx-rtd-theme>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/gsyncio/gsyncio"
+Documentation = "https://gsyncio.readthedocs.io"
+Repository = "https://github.com/gsyncio/gsyncio"
+Issues = "https://github.com/gsyncio/gsyncio/issues"
+
+[tool.setuptools.packages.find]
+include = ["gsyncio*"]
+
+[tool.setuptools.package-data]
+gsyncio = ["*.pxd", "*.pyx"]
+"gsyncio.csrc" = ["*.h", "*.c"]
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311", "py312"]
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+line_length = 100
+multi_line_output = 3
+include_trailing_comma = true
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --tb=short"

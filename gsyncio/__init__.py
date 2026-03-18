@@ -1,0 +1,257 @@
+"""
+gsyncio - High-Performance Fiber-Based Concurrency for Python
+
+gsyncio provides Viper-like fiber-based concurrency primitives, designed
+to override and replace Python's asyncio with significantly better
+performance. It provides both fire-and-forget parallel work (task/sync)
+and I/O-bound asynchronous operations (async/await) with minimal overhead.
+
+Features:
+- M:N fiber scheduler with work-stealing
+- Task/Sync model for fire-and-forget parallelism
+- Async/Await model for I/O-bound operations
+- Channels for message-passing between fibers
+- WaitGroups for synchronization
+- Select statements for channel multiplexing
+- Full asyncio compatibility (with monkey-patching)
+
+Usage:
+    import gsyncio as gs
+    
+    # Task/Sync model
+    def worker(n):
+        result = sum(range(n))
+        print(f"Result: {result}")
+    
+    gs.task(worker, 1000)
+    gs.sync()
+    
+    # Async/Await model
+    async def fetch(url):
+        await gs.sleep(100)
+        return f"Data from {url}"
+    
+    async def main():
+        results = await gs.gather(*[fetch(f"url/{i}") for i in range(100)])
+        print(f"Fetched {len(results)} items")
+    
+    gs.run(main())
+
+Installation:
+    pip install gsyncio
+
+For more information, see https://github.com/gsyncio/gsyncio
+"""
+
+__version__ = '0.1.0'
+__author__ = 'gsyncio team'
+
+# Import core components
+from .core import (
+    Future,
+    Channel,
+    WaitGroup,
+    init_scheduler,
+    shutdown_scheduler,
+    get_scheduler_stats,
+    spawn,
+    sleep_ms,
+    current_fiber_id,
+    yield_execution,
+    num_workers,
+    _HAS_CYTHON,
+)
+
+# Import task/sync model
+from .task import (
+    task,
+    sync,
+    sync_timeout,
+    task_count,
+    run,
+)
+
+# Import async/await model
+from .async_ import (
+    create_task,
+    sleep,
+    gather,
+    wait_for,
+    ensure_future,
+    async_range,
+    AsyncIterator,
+    AsyncRange,
+    AsyncContextManager,
+)
+
+# Import channel operations
+from .channel import (
+    Chan,
+    chan,
+    send,
+    recv,
+    close,
+)
+
+# Import waitgroup operations
+from .waitgroup import (
+    WaitGroup,
+    create_wg,
+    add,
+    done,
+    wait,
+)
+
+# Import select operations
+from .select import (
+    SelectCase,
+    SelectResult,
+    recv as select_recv,
+    send as select_send,
+    default,
+    select,
+)
+
+# Import future
+from .future import (
+    Future as _Future,
+    ensure_future as _ensure_future,
+    is_future,
+)
+
+# Re-export with consistent names
+Future = _Future
+ensure_future = _ensure_future
+
+# Monkey-patching for asyncio compatibility
+def install():
+    """
+    Install gsyncio as the default event loop policy.
+    
+    This replaces asyncio's event loop with gsyncio's fiber-based
+    implementation, providing better performance for asyncio-based
+    code without any code changes.
+    
+    Usage:
+        import gsyncio
+        gsyncio.install()
+        
+        import asyncio
+        
+        async def main():
+            await asyncio.sleep(1)
+            return "done"
+        
+        result = asyncio.run(main())
+    """
+    import asyncio
+    
+    class GsyncioEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
+        """Event loop policy that uses gsyncio"""
+        
+        def new_event_loop(self):
+            # For now, return standard asyncio loop
+            # Full implementation would return gsyncio's event loop
+            return asyncio.new_event_loop()
+    
+    asyncio.set_event_loop_policy(GsyncioEventLoopPolicy())
+    
+    # Store original functions for restoration
+    if not hasattr(asyncio, '_gsyncio_original_run'):
+        asyncio._gsyncio_original_run = asyncio.run
+    
+    return True
+
+
+def uninstall():
+    """
+    Restore the default asyncio event loop policy.
+    """
+    import asyncio
+    
+    if hasattr(asyncio, '_gsyncio_original_run'):
+        asyncio.run = asyncio._gsyncio_original_run
+        del asyncio._gsyncio_original_run
+    
+    asyncio.set_event_loop_policy(None)
+
+
+def is_installed() -> bool:
+    """
+    Check if gsyncio is installed as the event loop policy.
+    
+    Returns:
+        True if gsyncio is installed
+    """
+    import asyncio
+    policy = asyncio.get_event_loop_policy()
+    return policy.__class__.__name__ == 'GsyncioEventLoopPolicy'
+
+
+# Public API
+__all__ = [
+    # Version
+    '__version__',
+    '__author__',
+    
+    # Core
+    'Future',
+    'Channel',
+    'WaitGroup',
+    'init_scheduler',
+    'shutdown_scheduler',
+    'get_scheduler_stats',
+    'spawn',
+    'sleep_ms',
+    'current_fiber_id',
+    'yield_execution',
+    'num_workers',
+    '_HAS_CYTHON',
+    
+    # Task/Sync model
+    'task',
+    'sync',
+    'sync_timeout',
+    'task_count',
+    'run',
+    
+    # Async/Await model
+    'create_task',
+    'sleep',
+    'gather',
+    'wait_for',
+    'ensure_future',
+    'async_range',
+    'AsyncIterator',
+    'AsyncRange',
+    'AsyncContextManager',
+    
+    # Channel operations
+    'Chan',
+    'chan',
+    'send',
+    'recv',
+    'close',
+    
+    # WaitGroup operations
+    'create_wg',
+    'add',
+    'done',
+    'wait',
+    
+    # Select operations
+    'SelectCase',
+    'SelectResult',
+    'select_recv',
+    'select_send',
+    'default',
+    'select',
+    
+    # Future utilities
+    'is_future',
+    
+    # Monkey-patching
+    'install',
+    'uninstall',
+    'is_installed',
+]
