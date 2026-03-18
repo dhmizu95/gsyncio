@@ -84,6 +84,16 @@ from .async_ import (
     AsyncIterator,
     AsyncRange,
     AsyncContextManager,
+    create_tcp_socket,
+    create_udp_socket,
+    has_native_io,
+)
+
+# Import native I/O
+from .native_io import (
+    NativeSocket,
+    NativeEventLoop,
+    _HAS_NATIVE_IO,
 )
 
 # Import channel operations
@@ -165,6 +175,14 @@ __all__ = [
     'AsyncIterator',
     'AsyncRange',
     'AsyncContextManager',
+    'create_tcp_socket',
+    'create_udp_socket',
+    'has_native_io',
+
+    # Native I/O
+    'NativeSocket',
+    'NativeEventLoop',
+    '_HAS_NATIVE_IO',
     
     # Channel operations
     'Chan',

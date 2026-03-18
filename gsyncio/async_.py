@@ -6,17 +6,17 @@ scheduler for high-performance I/O-bound operations.
 
 Usage:
     import gsyncio as gs
-    
+
     async def fetch_url(url):
         await gs.sleep(100)  # Simulate I/O
         return f"Data from {url}"
-    
+
     async def main():
         urls = [f"http://example.com/{i}" for i in range(100)]
         tasks = [gs.create_task(fetch_url(url)) for url in urls]
         results = await gs.gather(*tasks)
         print(f"Fetched {len(results)} URLs")
-    
+
     gs.run(main())
 """
 
@@ -25,6 +25,13 @@ import threading
 import time
 from typing import Any, Callable, Coroutine, List, Optional, Awaitable
 from .core import Future, sleep_ms, sleep_ns, init_scheduler, shutdown_scheduler, _HAS_CYTHON
+
+# Try to import native I/O
+try:
+    from .native_io import NativeSocket, _HAS_NATIVE_IO
+except ImportError:
+    _HAS_NATIVE_IO = False
+    NativeSocket = None
 
 
 def create_task(coro: Coroutine) -> Future:
@@ -222,12 +229,56 @@ class AsyncContextManager:
     """
     Base class for async context managers.
     """
-    
+
     async def __aenter__(self):
         raise NotImplementedError
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         raise NotImplementedError
+
+
+# ============================================
+# Native I/O Functions
+# ============================================
+
+def create_tcp_socket():
+    """
+    Create a native TCP socket.
+    
+    Returns:
+        NativeSocket object
+    
+    Raises:
+        RuntimeError: If native I/O not available
+    """
+    if not _HAS_NATIVE_IO or NativeSocket is None:
+        raise RuntimeError("Native I/O not available")
+    return NativeSocket.tcp()
+
+
+def create_udp_socket():
+    """
+    Create a native UDP socket.
+    
+    Returns:
+        NativeSocket object
+    
+    Raises:
+        RuntimeError: If native I/O not available
+    """
+    if not _HAS_NATIVE_IO or NativeSocket is None:
+        raise RuntimeError("Native I/O not available")
+    return NativeSocket.udp()
+
+
+def has_native_io():
+    """
+    Check if native I/O is available.
+    
+    Returns:
+        bool: True if native I/O is available
+    """
+    return _HAS_NATIVE_IO
 
 
 __all__ = [
@@ -241,4 +292,7 @@ __all__ = [
     'AsyncIterator',
     'AsyncRange',
     'AsyncContextManager',
+    'create_tcp_socket',
+    'create_udp_socket',
+    'has_native_io',
 ]

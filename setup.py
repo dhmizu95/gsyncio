@@ -54,6 +54,7 @@ C_SOURCES = [
     str(CSRC_DIR / 'evloop.c'),
     str(CSRC_DIR / 'net.c'),
     str(CSRC_DIR / 'io_uring.c'),
+    str(CSRC_DIR / 'native_io.c'),
 ]
 
 # Compiler flags
@@ -84,7 +85,7 @@ elif sys.platform == 'win32':
 def get_extensions():
     if not HAS_CYTHON:
         return []
-    
+
     extensions = [
         Extension(
             'gsyncio._gsyncio_core',
@@ -92,9 +93,18 @@ def get_extensions():
             include_dirs=[str(CSRC_DIR)],
             extra_compile_args=CFLAGS,
             extra_link_args=['-pthread'],
-        )
+        ),
+        Extension(
+            'gsyncio._gsyncio_native_io',
+            sources=[
+                'gsyncio/_gsyncio_native_io.pyx',
+            ] + C_SOURCES,
+            include_dirs=[str(CSRC_DIR)],
+            extra_compile_args=CFLAGS,
+            extra_link_args=['-pthread'],
+        ),
     ]
-    
+
     return cythonize(
         extensions,
         compiler_directives={
