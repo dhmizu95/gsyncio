@@ -12,9 +12,57 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <pthread.h>
 
 /* Global fiber state */
 static uint64_t g_fiber_id_counter = 0;
+static fiber_t** g_fiber_table = NULL;
+static size_t g_fiber_table_capacity = 0;
+static size_t g_fiber_table_count = 0;
+static pthread_mutex_t g_fiber_table_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int fiber_table_resize(size_t new_capacity) {
+    fiber_t** new_table = realloc(g_fiber_table, new_capacity * sizeof(fiber_t*));
+    if (!new_table) {
+        return -1;
+    }
+    g_fiber_table = new_table;
+    g_fiber_table_capacity = new_capacity;
+    return 0;
+}
+
+static int fiber_table_add(fiber_t* f) {
+    if (!f) return -1;
+    
+    pthread_mutex_lock(&g_fiber_table_mutex);
+    
+    if (g_fiber_table_count >= g_fiber_table_capacity) {
+        size_t new_capacity = g_fiber_table_capacity == 0 ? 256 : g_fiber_table_capacity * 2;
+        if (fiber_table_resize(new_capacity) != 0) {
+            pthread_mutex_unlock(&g_fiber_table_mutex);
+            return -1;
+        }
+    }
+    
+    g_fiber_table[g_fiber_table_count++] = f;
+    pthread_mutex_unlock(&g_fiber_table_mutex);
+    return 0;
+}
+
+static void fiber_table_remove(fiber_t* f) {
+    if (!f) return;
+    
+    pthread_mutex_lock(&g_fiber_table_mutex);
+    
+    for (size_t i = 0; i < g_fiber_table_count; i++) {
+        if (g_fiber_table[i] == f) {
+            g_fiber_table[i] = g_fiber_table[--g_fiber_table_count];
+            break;
+        }
+    }
+    
+    pthread_mutex_unlock(&g_fiber_table_mutex);
+}
 
 /* Current executing fiber (TLS) */
 #ifdef __linux__
@@ -85,6 +133,15 @@ int fiber_init(void) {
 
 void fiber_cleanup(void) {
     g_current_fiber = NULL;
+    
+    pthread_mutex_lock(&g_fiber_table_mutex);
+    if (g_fiber_table) {
+        free(g_fiber_table);
+        g_fiber_table = NULL;
+    }
+    g_fiber_table_capacity = 0;
+    g_fiber_table_count = 0;
+    pthread_mutex_unlock(&g_fiber_table_mutex);
 }
 
 fiber_t* fiber_create(void (*func)(void*), void* arg, size_t stack_size) {
@@ -127,6 +184,8 @@ fiber_t* fiber_create(void (*func)(void*), void* arg, size_t stack_size) {
     /* Stack grows downward, so stack_ptr starts at base + size */
     fiber->stack_ptr = (char*)fiber->stack_base + stack_size + 4096;
     
+    fiber_table_add(fiber);
+    
     return fiber;
 }
 
@@ -134,6 +193,8 @@ void fiber_free(fiber_t* fiber) {
     if (!fiber) {
         return;
     }
+    
+    fiber_table_remove(fiber);
     
     if (fiber->stack_base && fiber->stack_base != MAP_FAILED) {
         munmap(fiber->stack_base, fiber->stack_capacity + 4096);
@@ -262,4 +323,19 @@ bool fiber_is_parked(fiber_t* fiber) {
         return false;
     }
     return fiber->state == FIBER_WAITING;
+}
+
+fiber_t* fiber_get_by_id(uint64_t id) {
+    pthread_mutex_lock(&g_fiber_table_mutex);
+    
+    for (size_t i = 0; i < g_fiber_table_count; i++) {
+        if (g_fiber_table[i] && g_fiber_table[i]->id == id) {
+            fiber_t* f = g_fiber_table[i];
+            pthread_mutex_unlock(&g_fiber_table_mutex);
+            return f;
+        }
+    }
+    
+    pthread_mutex_unlock(&g_fiber_table_mutex);
+    return NULL;
 }

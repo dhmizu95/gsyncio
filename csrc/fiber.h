@@ -165,6 +165,13 @@ uint64_t fiber_id(fiber_t* fiber);
  */
 fiber_state_t fiber_state(fiber_t* fiber);
 
+/**
+ * Get fiber by ID
+ * @param id Fiber ID
+ * @return Fiber, or NULL if not found
+ */
+fiber_t* fiber_get_by_id(uint64_t id);
+
 /* ============================================ */
 /* Fiber Parking (for async I/O)               */
 /* ============================================ */
