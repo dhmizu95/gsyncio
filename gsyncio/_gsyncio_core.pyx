@@ -126,6 +126,34 @@ cdef extern from "scheduler.h":
     size_t scheduler_get_recommended_workers()
 
 # ============================================
+# C Tasks declarations (GIL-free execution)
+# ============================================
+cdef extern from "c_tasks.h":
+    int c_tasks_init()
+    void c_tasks_shutdown()
+    int c_task_register(char* name, void* func)
+    int c_task_unregister(int task_id)
+    int c_task_lookup(char* name)
+    int c_task_execute(int task_id, void* arg)
+    uint64_t c_task_spawn(int task_id, void* arg) nogil
+    uint64_t c_task_spawn_int(int task_id, int value) nogil
+    int c_task_sum_squares(void* arg) nogil
+    int c_task_count_primes(void* arg) nogil
+    int c_task_array_fill(void* arg) nogil
+    int c_task_array_copy(void* arg) nogil
+    
+    ctypedef struct c_task_stats_t:
+        uint64_t total_c_tasks_spawned
+        uint64_t total_c_tasks_completed
+        uint64_t total_c_task_time_ns
+        uint64_t total_python_tasks_spawned
+        uint64_t total_python_tasks_completed
+        uint64_t total_python_task_time_ns
+    
+    void c_task_get_stats(c_task_stats_t* stats) nogil
+    void c_task_reset_stats() nogil
+
+# ============================================
 # Future declarations
 # ============================================
 cdef extern from "future.h":
@@ -710,6 +738,9 @@ def init_scheduler(size_t num_workers=0, size_t max_fibers=1000000, int work_ste
         raise RuntimeError("Failed to initialize scheduler")
 
     fiber_init()
+    
+    # Initialize C task system (GIL-free execution)
+    c_tasks_init()
 
     # Create global task registry
     _task_registry = TaskRegistry()
@@ -722,6 +753,7 @@ def shutdown_scheduler(int wait=1):
         _task_registry.sync()
     scheduler_shutdown(wait)
     fiber_cleanup()
+    c_tasks_shutdown()
     # Reset registry for next use
     if _task_registry:
         _task_registry.reset()
@@ -1076,6 +1108,62 @@ def run(func, *args):
     finally:
         shutdown_scheduler(wait=True)
 
+
+# ============================================
+# C Task Functions (GIL-free execution)
+# ============================================
+
+def c_task_init():
+    """Initialize C task system"""
+    c_tasks_init()
+
+def c_task_shutdown():
+    """Shutdown C task system"""
+    c_tasks_shutdown()
+
+def c_task_register_py(name, func_ptr):
+    """Register a C task function (for internal use)"""
+    return c_task_register(name, <void*>func_ptr)
+
+def c_task_lookup_py(name):
+    """Lookup C task by name"""
+    cdef bytes name_bytes = name.encode('utf-8') if isinstance(name, str) else name
+    return c_task_lookup(<char*>name_bytes)
+
+def c_task_spawn_py(task_id, arg=None):
+    """Spawn a C task (GIL-free!)
+    
+    Note: For integer arguments, use c_task_spawn_int() directly.
+    """
+    if arg is None:
+        return c_task_spawn(task_id, NULL)
+    else:
+        raise ValueError("Use c_task_spawn_int() for integer arguments")
+
+def c_task_spawn_sum_squares(int n):
+    """Spawn sum_squares C task - GIL-free!"""
+    return c_task_spawn_int(c_task_lookup(b"sum_squares"), n)
+
+def c_task_spawn_count_primes(int n):
+    """Spawn count_primes C task - GIL-free!"""
+    return c_task_spawn_int(c_task_lookup(b"count_primes"), n)
+
+def c_task_get_stats_py():
+    """Get C task statistics"""
+    cdef c_task_stats_t stats
+    c_task_get_stats(&stats)
+    return {
+        'c_tasks_spawned': stats.total_c_tasks_spawned,
+        'c_tasks_completed': stats.total_c_tasks_completed,
+        'c_task_time_ns': stats.total_c_task_time_ns,
+        'python_tasks_spawned': stats.total_python_tasks_spawned,
+        'python_tasks_completed': stats.total_python_tasks_completed,
+        'python_task_time_ns': stats.total_python_task_time_ns,
+    }
+
+def c_task_reset_stats_py():
+    """Reset C task statistics"""
+    c_task_reset_stats()
 
 # Select helper functions
 def select(*cases):

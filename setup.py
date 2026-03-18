@@ -56,6 +56,7 @@ C_SOURCES = [
     str(CSRC_DIR / 'io_uring.c'),
     str(CSRC_DIR / 'native_io.c'),
     str(CSRC_DIR / 'worker_manager.c'),
+    str(CSRC_DIR / 'c_tasks.c'),  # C-based task execution
 ]
 
 # Compiler flags
