@@ -238,12 +238,19 @@ cdef extern from "task.h":
 
     ctypedef struct task_handle_t:
         uint64_t fiber_id
+        uint64_t task_id
         task_state state
         void* result
         void* exception
 
     ctypedef struct task_registry_t:
         size_t active_count
+        size_t task_count
+        size_t completion_count
+
+    ctypedef struct task_batch_t:
+        size_t count
+        size_t capacity
 
     task_registry_t* task_registry_create()
     void task_registry_destroy(task_registry_t* reg)
@@ -251,8 +258,16 @@ cdef extern from "task.h":
     void task_sync(task_registry_t* reg)
     int task_sync_timeout(task_registry_t* reg, uint64_t timeout_ns)
     size_t task_count(task_registry_t* reg)
+    size_t task_completed_count(task_registry_t* reg)
     task_registry_t* task_get_registry()
     void task_set_registry(task_registry_t* reg)
+    void task_reset_registry(task_registry_t* reg)
+    
+    # Batch operations
+    task_batch_t* task_batch_create(size_t capacity)
+    void task_batch_destroy(task_batch_t* batch)
+    int task_batch_add(task_batch_t* batch, void (*func)(void*), void* arg)
+    int task_batch_spawn(task_batch_t* batch, task_registry_t* reg)
 
 # ============================================
 # Python-visible classes
@@ -506,6 +521,34 @@ cdef class TaskRegistry:
         cdef uint64_t fid = handle.fiber_id
         return fid
 
+    def spawn_batch(self, tasks):
+        """Spawn multiple tasks in a batch (optimized)"""
+        cdef task_batch_t* batch_ptr = task_batch_create(len(tasks))
+        if not batch_ptr:
+            raise MemoryError("Failed to create task batch")
+        
+        cdef object payload
+        cdef void* arg_ptr
+        
+        try:
+            # Add all tasks to batch
+            for func, args in tasks:
+                payload = (func, args)
+                Py_INCREF(payload)
+                arg_ptr = <void*>payload
+                if task_batch_add(batch_ptr, _c_task_entry, arg_ptr) != 0:
+                    Py_DECREF(payload)
+                    raise RuntimeError("Failed to add task to batch")
+
+            # Spawn all at once
+            if task_batch_spawn(batch_ptr, self._reg) != 0:
+                raise RuntimeError("Failed to spawn batch")
+
+            # Return count of spawned tasks
+            return batch_ptr.count
+        finally:
+            task_batch_destroy(batch_ptr)
+
     def sync(self):
         """Wait for all tasks to complete"""
         task_sync(self._reg)
@@ -515,10 +558,66 @@ cdef class TaskRegistry:
         cdef uint64_t timeout_ns = <uint64_t>(timeout_s * 1000000000)
         return task_sync_timeout(self._reg, timeout_ns) == 0
 
+    def reset(self):
+        """Reset registry state for reuse"""
+        task_reset_registry(self._reg)
+
     @property
     def active_count(self):
         """Number of active tasks"""
         return self._reg.active_count if self._reg else 0
+
+    @property
+    def task_count(self):
+        """Total tasks spawned"""
+        return self._reg.task_count if self._reg else 0
+
+    @property
+    def completed_count(self):
+        """Number of completed tasks"""
+        return self._reg.completion_count if self._reg else 0
+
+
+cdef class TaskBatch:
+    """Python wrapper for task_batch_t - batch task spawning"""
+    cdef task_batch_t* _batch
+    cdef TaskRegistry _registry
+    cdef list _payloads
+
+    def __cinit__(self, TaskRegistry registry, size_t capacity=64):
+        self._batch = task_batch_create(capacity)
+        if not self._batch:
+            raise MemoryError("Failed to create task batch")
+        self._registry = registry
+        self._payloads = []
+
+    def __dealloc__(self):
+        if self._batch:
+            task_batch_destroy(self._batch)
+
+    def add(self, func, *args):
+        """Add a task to the batch"""
+        cdef object payload
+        cdef void* arg_ptr
+        
+        payload = (func, args)
+        self._payloads.append(payload)
+        Py_INCREF(payload)
+        arg_ptr = <void*>payload
+        if task_batch_add(self._batch, _c_task_entry, arg_ptr) != 0:
+            raise RuntimeError("Failed to add task to batch")
+        return len(self._payloads) - 1
+
+    def spawn(self):
+        """Spawn all tasks in the batch"""
+        if task_batch_spawn(self._batch, self._registry._reg) != 0:
+            raise RuntimeError("Failed to spawn batch")
+        
+        # Return count of spawned tasks
+        return self._batch.count
+
+    def __len__(self):
+        return self._batch.count if self._batch else 0
 
 
 cdef void _c_task_entry(void* arg) noexcept nogil:
@@ -581,6 +680,9 @@ def shutdown_scheduler(int wait=1):
         _task_registry.sync()
     scheduler_shutdown(wait)
     fiber_cleanup()
+    # Reset registry for next use
+    if _task_registry:
+        _task_registry.reset()
 
 def get_scheduler_stats():
     """Get scheduler statistics"""
@@ -637,6 +739,13 @@ def task(func, *args):
         init_scheduler()
     return _task_registry.spawn(func, *args)
 
+def task_batch():
+    """Create a task batch for efficient bulk spawning"""
+    global _task_registry
+    if not _task_registry:
+        init_scheduler()
+    return TaskBatch(_task_registry)
+
 def sync():
     """Wait for all tasks to complete"""
     global _task_registry
@@ -656,6 +765,13 @@ def task_count():
     if not _task_registry:
         return 0
     return _task_registry.active_count
+
+def task_completed_count():
+    """Get number of completed tasks"""
+    global _task_registry
+    if not _task_registry:
+        return 0
+    return _task_registry.completed_count
 
 def run(func, *args):
     """Run a function in the gsyncio runtime"""

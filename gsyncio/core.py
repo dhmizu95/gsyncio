@@ -16,6 +16,8 @@ try:
         Future,
         Channel,
         WaitGroup,
+        TaskRegistry,
+        TaskBatch,
         init_scheduler,
         shutdown_scheduler,
         get_scheduler_stats,
@@ -26,6 +28,13 @@ try:
         current_fiber_id,
         yield_execution,
         num_workers,
+        task,
+        task_batch,
+        sync,
+        sync_timeout,
+        task_count,
+        task_completed_count,
+        run,
     )
     _HAS_CYTHON = True
 except ImportError:

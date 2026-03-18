@@ -1,8 +1,8 @@
 /**
  * task.c - Task/Sync model for gsyncio
  *
- * Fire-and-forget parallel work with collective synchronization
- * (like Go's goroutines with sync.WaitGroup).
+ * Fire-and-forget parallel work with collective synchronization.
+ * Optimized C implementation with batch spawning and lock-free tracking.
  */
 
 #include "task.h"
@@ -12,6 +12,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <stdatomic.h>
+#include <errno.h>
 
 /* High-resolution timer */
 static inline uint64_t get_time_ns(void) {
@@ -23,6 +25,10 @@ static inline uint64_t get_time_ns(void) {
 /* Global task registry */
 static task_registry_t* g_task_registry = NULL;
 
+/* ============================================ */
+/* Task Registry Implementation                */
+/* ============================================ */
+
 task_registry_t* task_registry_create(void) {
     task_registry_t* reg = (task_registry_t*)calloc(1, sizeof(task_registry_t));
     if (!reg) {
@@ -32,15 +38,19 @@ task_registry_t* task_registry_create(void) {
     reg->tasks = NULL;
     reg->task_count = 0;
     reg->task_capacity = 0;
-    reg->active_count = 0;
+    atomic_store(&reg->active_count, 0);
+    atomic_store(&reg->completion_count, 0);
+    
     reg->wg = waitgroup_create();
     if (!reg->wg) {
         free(reg);
         return NULL;
     }
 
+    /* Initialize semaphore-like condition */
     pthread_mutex_init(&reg->mutex, NULL);
     pthread_cond_init(&reg->cond, NULL);
+    reg->waiters = 0;
 
     return reg;
 }
@@ -64,63 +74,13 @@ void task_registry_destroy(task_registry_t* reg) {
     free(reg);
 }
 
-task_handle_t* task_spawn(task_registry_t* reg, void (*func)(void*), void* arg) {
-    if (!reg || !func) {
-        return NULL;
-    }
-
-    task_handle_t* handle = (task_handle_t*)calloc(1, sizeof(task_handle_t));
-    if (!handle) {
-        return NULL;
-    }
-
-    /* Create wrapper to track completion */
-    task_wrapper_arg_t* wrapper_arg = (task_wrapper_arg_t*)calloc(1, sizeof(task_wrapper_arg_t));
-    if (!wrapper_arg) {
-        free(handle);
-        return NULL;
-    }
-
-    wrapper_arg->func = func;
-    wrapper_arg->arg = arg;
-    wrapper_arg->handle = handle;
-    wrapper_arg->registry = reg;
-
-    handle->state = TASK_STATE_RUNNING;
-    handle->result = NULL;
-    handle->exception = NULL;
-    handle->wrapper_arg = wrapper_arg;
-
-    /* Add to registry */
-    pthread_mutex_lock(&reg->mutex);
-
-    if (reg->task_count >= reg->task_capacity) {
-        size_t new_capacity = reg->task_capacity == 0 ? 64 : reg->task_capacity * 2;
-        task_handle_t** new_tasks = (task_handle_t**)realloc(reg->tasks, new_capacity * sizeof(task_handle_t*));
-        if (!new_tasks) {
-            pthread_mutex_unlock(&reg->mutex);
-            free(wrapper_arg);
-            free(handle);
-            return NULL;
-        }
-        reg->tasks = new_tasks;
-        reg->task_capacity = new_capacity;
-    }
-
-    reg->tasks[reg->task_count++] = handle;
-    reg->active_count++;
-
-    pthread_mutex_unlock(&reg->mutex);
-
-    /* Increment waitgroup before spawning */
-    waitgroup_add(reg->wg, 1);
-
-    /* Spawn fiber */
-    uint64_t fid = scheduler_spawn(task_wrapper, wrapper_arg);
-    handle->fiber_id = fid;
-
-    return handle;
-}
+/* Internal task wrapper that tracks completion */
+typedef struct task_wrapper_arg {
+    void (*func)(void*);
+    void* arg;
+    task_registry_t* registry;
+    uint64_t task_id;
+} task_wrapper_arg_t;
 
 void task_wrapper(void* arg) {
     task_wrapper_arg_t* wrapper = (task_wrapper_arg_t*)arg;
@@ -128,41 +88,242 @@ void task_wrapper(void* arg) {
         return;
     }
 
-    task_registry_t* reg = wrapper->registry;
-    task_handle_t* handle = wrapper->handle;
-
     /* Execute user function */
     wrapper->func(wrapper->arg);
 
-    /* Mark task as completed */
-    if (handle) {
-        handle->state = TASK_STATE_COMPLETED;
-    }
-
-    /* Decrement waitgroup */
-    if (reg) {
-        waitgroup_done(reg->wg);
-    }
-
-    /* Update registry */
-    if (reg) {
-        pthread_mutex_lock(&reg->mutex);
-        reg->active_count--;
-        pthread_cond_broadcast(&reg->cond);
-        pthread_mutex_unlock(&reg->mutex);
+    /* Mark task as completed - atomic increment */
+    if (wrapper->registry) {
+        task_registry_t* reg = wrapper->registry;
+        
+        /* Atomic increment of completion count */
+        uint64_t completed = atomic_fetch_add(&reg->completion_count, 1) + 1;
+        
+        /* Atomic decrement of active count */
+        uint64_t active = atomic_fetch_sub(&reg->active_count, 1) - 1;
+        
+        /* If last task, wake up waiters */
+        if (active == 0) {
+            pthread_mutex_lock(&reg->mutex);
+            reg->all_done = 1;
+            pthread_cond_broadcast(&reg->cond);
+            pthread_mutex_unlock(&reg->mutex);
+        }
     }
 
     /* Free wrapper */
     free(wrapper);
 }
 
+task_handle_t* task_spawn(task_registry_t* reg, void (*func)(void*), void* arg) {
+    if (!reg || !func) {
+        return NULL;
+    }
+
+    /* Create wrapper */
+    task_wrapper_arg_t* wrapper = (task_wrapper_arg_t*)calloc(1, sizeof(task_wrapper_arg_t));
+    if (!wrapper) {
+        return NULL;
+    }
+
+    wrapper->func = func;
+    wrapper->arg = arg;
+    wrapper->registry = reg;
+    wrapper->task_id = atomic_fetch_add(&reg->task_count, 1);
+
+    /* Create handle */
+    task_handle_t* handle = (task_handle_t*)calloc(1, sizeof(task_handle_t));
+    if (!handle) {
+        free(wrapper);
+        return NULL;
+    }
+
+    handle->task_id = wrapper->task_id;
+    handle->state = TASK_STATE_RUNNING;
+    handle->wrapper_arg = wrapper;
+
+    /* Atomic increment of active count BEFORE spawning */
+    atomic_fetch_add(&reg->active_count, 1);
+
+    /* Spawn fiber */
+    uint64_t fid = scheduler_spawn(task_wrapper, wrapper);
+    handle->fiber_id = fid;
+
+    if (fid == 0) {
+        /* Spawn failed */
+        atomic_fetch_sub(&reg->active_count, 1);
+        free(wrapper);
+        free(handle);
+        return NULL;
+    }
+
+    return handle;
+}
+
+/* ============================================ */
+/* Batch Task Spawning - Key Optimization     */
+/* ============================================ */
+
+task_batch_t* task_batch_create(size_t capacity) {
+    if (capacity == 0) {
+        capacity = 64;
+    }
+
+    task_batch_t* batch = (task_batch_t*)calloc(1, sizeof(task_batch_t));
+    if (!batch) {
+        return NULL;
+    }
+
+    batch->funcs = (void(**)(void*))calloc(capacity, sizeof(void(*)(void*)));
+    batch->args = (void**)calloc(capacity, sizeof(void*));
+    batch->handles = (task_handle_t**)calloc(capacity, sizeof(task_handle_t*));
+    
+    if (!batch->funcs || !batch->args || !batch->handles) {
+        free(batch->funcs);
+        free(batch->args);
+        free(batch->handles);
+        free(batch);
+        return NULL;
+    }
+
+    batch->capacity = capacity;
+    batch->count = 0;
+    batch->registry = NULL;
+
+    return batch;
+}
+
+void task_batch_destroy(task_batch_t* batch) {
+    if (!batch) {
+        return;
+    }
+
+    /* Free any pending handles */
+    for (size_t i = 0; i < batch->count; i++) {
+        if (batch->handles[i]) {
+            free(batch->handles[i]);
+        }
+    }
+
+    free(batch->funcs);
+    free(batch->args);
+    free(batch->handles);
+    free(batch);
+}
+
+int task_batch_add(task_batch_t* batch, void (*func)(void*), void* arg) {
+    if (!batch || !func) {
+        return -1;
+    }
+
+    /* Grow if needed */
+    if (batch->count >= batch->capacity) {
+        size_t new_capacity = batch->capacity * 2;
+        
+        void (**new_funcs)(void*) = realloc(batch->funcs, new_capacity * sizeof(void(*)(void*)));
+        void** new_args = realloc(batch->args, new_capacity * sizeof(void*));
+        task_handle_t** new_handles = realloc(batch->handles, new_capacity * sizeof(task_handle_t*));
+        
+        if (!new_funcs || !new_args || !new_handles) {
+            return -1;
+        }
+        
+        batch->funcs = new_funcs;
+        batch->args = new_args;
+        batch->handles = new_handles;
+        batch->capacity = new_capacity;
+    }
+
+    batch->funcs[batch->count] = func;
+    batch->args[batch->count] = arg;
+    batch->handles[batch->count] = NULL;
+    batch->count++;
+
+    return 0;
+}
+
+/* Spawn all tasks in batch with minimal overhead */
+int task_batch_spawn(task_batch_t* batch, task_registry_t* reg) {
+    if (!batch || !reg || batch->count == 0) {
+        return -1;
+    }
+
+    batch->registry = reg;
+
+    /* Pre-increment active count for all tasks (single atomic operation) */
+    atomic_fetch_add(&reg->active_count, batch->count);
+
+    /* Spawn all fibers */
+    for (size_t i = 0; i < batch->count; i++) {
+        /* Create wrapper */
+        task_wrapper_arg_t* wrapper = (task_wrapper_arg_t*)calloc(1, sizeof(task_wrapper_arg_t));
+        if (!wrapper) {
+            /* Rollback on failure */
+            atomic_fetch_sub(&reg->active_count, batch->count - i);
+            return -1;
+        }
+
+        wrapper->func = batch->funcs[i];
+        wrapper->arg = batch->args[i];
+        wrapper->registry = reg;
+        wrapper->task_id = atomic_fetch_add(&reg->task_count, 1);
+
+        /* Create handle */
+        task_handle_t* handle = (task_handle_t*)calloc(1, sizeof(task_handle_t));
+        if (!handle) {
+            free(wrapper);
+            atomic_fetch_sub(&reg->active_count, batch->count - i);
+            return -1;
+        }
+
+        handle->task_id = wrapper->task_id;
+        handle->state = TASK_STATE_RUNNING;
+        handle->wrapper_arg = wrapper;
+
+        /* Spawn fiber */
+        uint64_t fid = scheduler_spawn(task_wrapper, wrapper);
+        handle->fiber_id = fid;
+
+        if (fid == 0) {
+            atomic_fetch_sub(&reg->active_count, 1);
+            free(wrapper);
+            free(handle);
+            return -1;
+        }
+
+        batch->handles[i] = handle;
+    }
+
+    return 0;
+}
+
+/* ============================================ */
+/* Synchronization                             */
+/* ============================================ */
+
 void task_sync(task_registry_t* reg) {
     if (!reg) {
         return;
     }
 
-    /* Wait for all tasks to complete */
-    waitgroup_wait(reg->wg);
+    /* Wait using condition variable */
+    pthread_mutex_lock(&reg->mutex);
+
+    /* Check inside mutex to avoid race condition */
+    if (atomic_load(&reg->active_count) == 0) {
+        pthread_mutex_unlock(&reg->mutex);
+        return;
+    }
+
+    /* Reset all_done flag for this wait cycle */
+    reg->all_done = 0;
+
+    while (atomic_load(&reg->active_count) > 0) {
+        reg->waiters++;
+        pthread_cond_wait(&reg->cond, &reg->mutex);
+        reg->waiters--;
+    }
+
+    pthread_mutex_unlock(&reg->mutex);
 }
 
 int task_sync_timeout(task_registry_t* reg, uint64_t timeout_ns) {
@@ -170,12 +331,20 @@ int task_sync_timeout(task_registry_t* reg, uint64_t timeout_ns) {
         return -1;
     }
 
-    uint64_t start = get_time_ns();
-    uint64_t deadline = start + timeout_ns;
+    uint64_t deadline = get_time_ns() + timeout_ns;
 
     pthread_mutex_lock(&reg->mutex);
 
-    while (reg->active_count > 0) {
+    /* Check inside mutex to avoid race condition */
+    if (atomic_load(&reg->active_count) == 0) {
+        pthread_mutex_unlock(&reg->mutex);
+        return 0;
+    }
+
+    /* Reset all_done flag for this wait cycle */
+    reg->all_done = 0;
+
+    while (atomic_load(&reg->active_count) > 0) {
         uint64_t now = get_time_ns();
         if (now >= deadline) {
             pthread_mutex_unlock(&reg->mutex);
@@ -187,7 +356,14 @@ int task_sync_timeout(task_registry_t* reg, uint64_t timeout_ns) {
         ts.tv_sec = remaining / 1000000000ULL;
         ts.tv_nsec = remaining % 1000000000ULL;
 
-        pthread_cond_timedwait(&reg->cond, &reg->mutex, &ts);
+        reg->waiters++;
+        int ret = pthread_cond_timedwait(&reg->cond, &reg->mutex, &ts);
+        reg->waiters--;
+
+        if (ret == ETIMEDOUT) {
+            pthread_mutex_unlock(&reg->mutex);
+            return -1;
+        }
     }
 
     pthread_mutex_unlock(&reg->mutex);
@@ -198,12 +374,14 @@ size_t task_count(task_registry_t* reg) {
     if (!reg) {
         return 0;
     }
+    return atomic_load(&reg->active_count);
+}
 
-    pthread_mutex_lock(&reg->mutex);
-    size_t count = reg->active_count;
-    pthread_mutex_unlock(&reg->mutex);
-
-    return count;
+size_t task_completed_count(task_registry_t* reg) {
+    if (!reg) {
+        return 0;
+    }
+    return atomic_load(&reg->completion_count);
 }
 
 task_registry_t* task_get_registry(void) {
@@ -215,4 +393,15 @@ void task_set_registry(task_registry_t* reg) {
         task_registry_destroy(g_task_registry);
     }
     g_task_registry = reg;
+}
+
+void task_reset_registry(task_registry_t* reg) {
+    if (!reg) {
+        return;
+    }
+    
+    atomic_store(&reg->active_count, 0);
+    atomic_store(&reg->completion_count, 0);
+    atomic_store(&reg->task_count, 0);
+    reg->all_done = 0;
 }
