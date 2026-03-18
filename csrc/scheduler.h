@@ -208,6 +208,10 @@ void scheduler_shutdown(bool wait_for_completion);
 scheduler_t* scheduler_get(void);
 
 uint64_t scheduler_spawn(void (*entry)(void*), void* user_data);
+
+/* Batch spawn for creating multiple fibers efficiently */
+uint64_t* scheduler_spawn_batch(void (*entry)(void*), void** user_data_array, size_t count);
+
 void scheduler_schedule(fiber_t* f, int worker_id);
 
 /* Batch scheduling APIs */

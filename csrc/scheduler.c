@@ -702,6 +702,68 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
     return fiber_id(f);
 }
 
+/* ============================================ */
+/* Batch Spawn Implementation                  */
+/* ============================================ */
+
+uint64_t* scheduler_spawn_batch(void (*entry)(void*), void** user_data_array, size_t count) {
+    if (!g_scheduler || !entry || !user_data_array || count == 0) {
+        return NULL;
+    }
+
+    uint64_t* fids = (uint64_t*)malloc(count * sizeof(uint64_t));
+    if (!fids) {
+        return NULL;
+    }
+
+    /* Allocate all fibers first */
+    fiber_t** fibers = (fiber_t**)malloc(count * sizeof(fiber_t*));
+    if (!fibers) {
+        free(fids);
+        return NULL;
+    }
+
+    /* Single lock acquisition for all spawns */
+    pthread_mutex_lock(&g_scheduler->mutex);
+
+    for (size_t i = 0; i < count; i++) {
+        fiber_t* f = fiber_pool_alloc((fiber_pool_t*)g_scheduler->fiber_pool);
+        if (!f) {
+            f = fiber_create(entry, user_data_array[i], g_scheduler->config.stack_size);
+        } else {
+            f->func = entry;
+            f->arg = user_data_array[i];
+            f->parent = fiber_current();
+        }
+
+        if (f) {
+            fibers[i] = f;
+            fids[i] = fiber_id(f);
+            g_scheduler->stats.total_fibers_created++;
+        } else {
+            fids[i] = 0;
+            fibers[i] = NULL;
+        }
+    }
+
+    /* Schedule all fibers */
+    for (size_t i = 0; i < count; i++) {
+        if (fibers[i]) {
+            int worker_id = g_scheduler->next_worker % g_scheduler->num_workers;
+            g_scheduler->next_worker++;
+            worker_t* w = &g_scheduler->workers[worker_id];
+            push_top(w->deque, fibers[i]);
+        }
+    }
+
+    /* Single signal for all fibers */
+    pthread_cond_broadcast(&g_scheduler->cond);
+    pthread_mutex_unlock(&g_scheduler->mutex);
+
+    free(fibers);
+    return fids;
+}
+
 void scheduler_schedule(fiber_t* f, int worker_id) {
     if (!g_scheduler || !f) {
         return;
