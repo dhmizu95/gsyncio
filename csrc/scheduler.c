@@ -175,7 +175,14 @@ static void process_timers(scheduler_t *sched) {
 
             node->fiber->state = FIBER_READY;
             node->fiber->waiting_on = NULL;
-            scheduler_schedule(node->fiber, -1);
+            
+            /* Wake up fiber using siglongjmp if it has a sched_jump */
+            if (node->fiber->sched_jump) {
+                siglongjmp(*node->fiber->sched_jump, 1);
+            } else {
+                /* No jump point - schedule normally */
+                scheduler_schedule(node->fiber, -1);
+            }
 
             timer_node_t *to_free = node;
             node = node->next;
@@ -202,7 +209,7 @@ static void process_timers(scheduler_t *sched) {
 void scheduler_sleep_ns(uint64_t ns) {
     fiber_t* current = fiber_current();
     if (!current) {
-        return;
+        return;  /* Not in fiber context - return immediately */
     }
 
     uint64_t deadline = get_time_ns() + ns;
@@ -228,8 +235,12 @@ void scheduler_sleep_ns(uint64_t ns) {
     g_scheduler->timers = node;
     pthread_mutex_unlock(&g_scheduler->timers_mutex);
 
-    /* Yield execution */
-    fiber_yield();
+    /* Longjmp back to worker - don't return to fiber code */
+    /* Worker will pick a different fiber */
+    /* When timer expires, process_timers will wake us up */
+    if (current->sched_jump) {
+        siglongjmp(*current->sched_jump, 1);
+    }
 }
 
 static void* worker_thread(void* arg) {
@@ -351,7 +362,10 @@ static void* worker_thread(void* arg) {
                 pthread_mutex_unlock(&sched->mutex);
             }
         }
-        
+
+        // Process timers on every iteration (for sleeping fibers)
+        process_timers(sched);
+
         if (w->stopped) {
             break;
         }

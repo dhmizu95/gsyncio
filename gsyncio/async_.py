@@ -8,7 +8,7 @@ Usage:
     import gsyncio as gs
 
     async def fetch_url(url):
-        await gs.sleep(100)  # Simulate I/O
+        await gs.sleep(100)  # Simulate I/O - uses native timer
         return f"Data from {url}"
 
     async def main():
@@ -25,13 +25,6 @@ import threading
 import time
 from typing import Any, Callable, Coroutine, List, Optional, Awaitable
 from .core import Future, sleep_ms, sleep_ns, init_scheduler, shutdown_scheduler, _HAS_CYTHON
-
-# Try to import native I/O
-try:
-    from .native_io import NativeSocket, _HAS_NATIVE_IO
-except ImportError:
-    _HAS_NATIVE_IO = False
-    NativeSocket = None
 
 
 def create_task(coro: Coroutine) -> Future:
@@ -82,13 +75,19 @@ async def sleep(ms: int) -> None:
     """
     Sleep for a specified number of milliseconds.
     
-    Uses native gsyncio timer when available (fast path),
-    falls back to asyncio.sleep otherwise.
+    Uses native gsyncio timer when in fiber context (fast path).
+    Falls back to asyncio.sleep when in asyncio context.
+    
+    Args:
+        ms: Milliseconds to sleep
     """
-    if _HAS_CYTHON:
-        # Use native sleep - blocks current fiber, not thread
+    # Check if we're in a gsyncio fiber context
+    from .core import current_fiber_id
+    if _HAS_CYTHON and current_fiber_id() > 0:
+        # In fiber context - use native sleep (fast path)
         sleep_ns(ms * 1000000)
     else:
+        # In asyncio context - use asyncio.sleep
         await asyncio.sleep(ms / 1000.0)
 
 
