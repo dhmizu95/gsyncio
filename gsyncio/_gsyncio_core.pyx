@@ -442,3 +442,5 @@ def yield_execution():
 def num_workers():
     """Get number of worker threads"""
     return scheduler_num_workers()
+
+# Native networking initialized in scheduler
