@@ -177,14 +177,9 @@ static void process_timers(scheduler_t *sched) {
 
             node->fiber->state = FIBER_READY;
             node->fiber->waiting_on = NULL;
-            
-            /* Wake up fiber using siglongjmp if it has a sched_jump */
-            if (node->fiber->sched_jump) {
-                siglongjmp(*node->fiber->sched_jump, 1);
-            } else {
-                /* No jump point - schedule normally */
-                scheduler_schedule(node->fiber, -1);
-            }
+
+            /* Schedule fiber to run */
+            scheduler_schedule(node->fiber, -1);
 
             timer_node_t *to_free = node;
             node = node->next;
@@ -237,12 +232,8 @@ void scheduler_sleep_ns(uint64_t ns) {
     g_scheduler->timers = node;
     pthread_mutex_unlock(&g_scheduler->timers_mutex);
 
-    /* Longjmp back to worker - don't return to fiber code */
-    /* Worker will pick a different fiber */
-    /* When timer expires, process_timers will wake us up */
-    if (current->sched_jump) {
-        siglongjmp(*current->sched_jump, 1);
-    }
+    /* Fiber is now waiting for timer.
+     * Worker will pick a different fiber on next iteration. */
 }
 
 static void* worker_thread(void* arg) {
@@ -293,14 +284,12 @@ static void* worker_thread(void* arg) {
             w->tasks_executed++;
 
             if (f->state == FIBER_NEW || f->state == FIBER_READY) {
-                jmp_buf jump_buf;
-                f->sched_jump = &jump_buf;
-
                 if (f->state == FIBER_NEW) {
+                    /* First time running this fiber */
                     if (setjmp(f->context) == 0) {
                         f->state = FIBER_RUNNING;
                         f->func(f->arg);
-
+                        /* Fiber completed - clean up */
                         f->state = FIBER_COMPLETED;
                         sched->stats.total_fibers_completed++;
 
@@ -315,17 +304,14 @@ static void* worker_thread(void* arg) {
                         }
 
                         w->current_fiber = NULL;
-                        f->sched_jump = NULL;
-                        continue;
+                        continue;  /* Pick next fiber */
                     }
+                    /* Fiber resumed here after yield */
                 } else {
-                    if (setjmp(f->context) == 0) {
-                        f->state = FIBER_RUNNING;
-                        longjmp(f->context, 1);
-                    }
+                    /* Resume existing fiber at its yield point */
+                    f->state = FIBER_RUNNING;
+                    longjmp(f->context, 1);
                 }
-
-                f->sched_jump = NULL;
             }
 
             w->current_fiber = NULL;
@@ -1018,27 +1004,26 @@ void scheduler_run(void) {
         
         if (f) {
             if (f->state == FIBER_NEW || f->state == FIBER_READY) {
-                jmp_buf jump_buf;
-                f->sched_jump = &jump_buf;
-                
-                if (setjmp(f->context) == 0) {
-                    f->state = FIBER_RUNNING;
-                    f->func(f->arg);
-                    
-                    f->state = FIBER_COMPLETED;
-                    sched->stats.total_fibers_completed++;
-                    
-                    if (f->pool) {
-                        fiber_pool_free(f->pool, f);
-                    } else {
-                        fiber_free(f);
+                if (f->state == FIBER_NEW) {
+                    if (setjmp(f->context) == 0) {
+                        f->state = FIBER_RUNNING;
+                        f->func(f->arg);
+
+                        f->state = FIBER_COMPLETED;
+                        sched->stats.total_fibers_completed++;
+
+                        if (f->pool) {
+                            fiber_pool_free(f->pool, f);
+                        } else {
+                            fiber_free(f);
+                        }
+
+                        continue;
                     }
-                    
-                    f->sched_jump = NULL;
-                    continue;
+                } else {
+                    f->state = FIBER_RUNNING;
+                    longjmp(f->context, 1);
                 }
-                
-                f->sched_jump = NULL;
             }
         } else {
             if (sched->io_uring_enabled) {

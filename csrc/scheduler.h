@@ -134,6 +134,7 @@ typedef struct worker {
     uint64_t steals_attempted;
     uint64_t steals_successful;
     int last_victim;
+    jmp_buf yield_jump;  /* Jump buffer for fiber yields */
 } worker_t;
 
 typedef struct scheduler_config {

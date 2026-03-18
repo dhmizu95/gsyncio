@@ -73,9 +73,6 @@ __thread fiber_t* g_current_fiber = NULL;
 fiber_t* g_current_fiber = NULL;
 #endif
 
-/* Scheduler jump buffer for yield return */
-static __thread jmp_buf g_sched_jump_buf;
-
 /* Global scheduler functions (from scheduler.c) */
 extern void* g_scheduler;
 extern void scheduler_schedule(fiber_t* f, int worker_id);
@@ -235,26 +232,17 @@ void fiber_yield(void) {
     if (!current) {
         return;
     }
-    
+
     /* Mark as ready (not waiting - we want to run again) */
     current->state = FIBER_READY;
-    
+
     /* Add back to scheduler queue */
     if (g_scheduler) {
         scheduler_schedule(current, -1);
     }
-    
-    /* Set up jump point for return */
-    current->sched_jump = &g_sched_jump_buf;
-    
-    /* Save context and jump to scheduler */
-    if (setjmp(g_sched_jump_buf) == 0) {
-        /* First time - jump to scheduler to get next fiber */
-        /* The scheduler will handle picking the next fiber */
-    }
-    /* else: we returned here via longjmp - continue execution */
-    
-    current->sched_jump = NULL;
+
+    /* Worker will pick next fiber - no explicit jump needed */
+    /* The worker loop continues to the next iteration */
 }
 
 void fiber_resume(fiber_t* fiber) {
@@ -273,22 +261,16 @@ void fiber_switch(fiber_t* from, fiber_t* to) {
     if (!from || !to) {
         return;
     }
-    
-    /* Save current fiber context */
+
+    /* Update current fiber pointer */
+    g_current_fiber = to;
+    to->state = FIBER_RUNNING;
+
+    /* Switch context directly */
     if (setjmp(from->context) == 0) {
-        /* First time - switch to 'to' fiber */
-        
-        /* Update current fiber pointer */
-        g_current_fiber = to;
-        to->state = FIBER_RUNNING;
-        
-        /* Set up jump point for 'to' fiber */
-        to->sched_jump = &g_sched_jump_buf;
-        
-        /* Jump to the 'to' fiber's context */
         longjmp(to->context, 1);
     }
-    /* else: we returned here from 'to' fiber yielding/switching back */
+    /* Returns here when 'to' fiber yields or switches back */
 }
 
 void fiber_park(void) {

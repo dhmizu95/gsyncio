@@ -84,7 +84,6 @@ struct fiber {
 
     /* Context switching */
     jmp_buf context;         /* Saved context for switch */
-    jmp_buf* sched_jump;     /* Jump point for yield return */
 
     /* Async/await support */
     void* waiting_on;           /* What fiber is waiting on (Future, Channel, etc.) */
