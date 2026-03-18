@@ -127,6 +127,12 @@ def main():
     print("gsyncio Performance Benchmark vs Go")
     print("=" * 60)
     print(f"Python: {sys.version.split()[0]}")
+    print(f"sys.path: {sys.path}")
+    
+    # Import gsyncio
+    sys.path.insert(0, '..')
+    import gsyncio
+    print(f"gsyncio.__file__: {gsyncio.__file__}")
     print(f"C Extension: {gsyncio._HAS_CYTHON}")
     print(f"CPU Cores: {gsyncio.num_workers()}")
     print()

@@ -144,14 +144,15 @@ class Future:
                 loop = asyncio.get_running_loop()
                 # We're in async context - use asyncio Future to wrap our future
                 async_fut = asyncio.Future()
-                
+
                 def on_done(fut):
                     if not async_fut.done():
-                        if self._exception:
-                            async_fut.set_exception(self._exception)
-                        else:
-                            async_fut.set_result(self._future.result())
-                
+                        try:
+                            result = self._future.result()
+                            async_fut.set_result(result)
+                        except Exception as e:
+                            async_fut.set_exception(e)
+
                 self.add_callback(on_done)
                 yield from async_fut
             except RuntimeError:
@@ -159,15 +160,21 @@ class Future:
                 # Use threading.Event for blocking wait
                 import threading
                 event = threading.Event()
-                
+
                 def on_done(fut):
                     event.set()
-                
+
                 self.add_callback(on_done)
                 event.wait()
-        
-        if self._exception:
-            raise self._exception
+
+        # Check for exception using the C future
+        try:
+            exc = self._future.exception()
+            if exc:
+                raise exc
+        except:
+            pass
+            
         return self._future.result()
     
     def __iter__(self):

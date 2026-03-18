@@ -18,13 +18,17 @@ def main():
     print("=" * 60)
     print("Performance: gsyncio vs asyncio")
     print("=" * 60)
-    
+
+    # Initialize gsyncio scheduler
+    gsyncio.init_scheduler()
+    print(f"Workers: {gsyncio.num_workers()}")
+
     # 1. Task Spawn (1000 tasks)
     print("\n1. TASK SPAWN (1000 tasks)")
-    
+
     counter = [0]
     def worker(): counter[0] += 1
-    
+
     start = time.time()
     for _ in range(1000): gsyncio.task(worker)
     gsyncio.sync()
@@ -66,18 +70,24 @@ def main():
     
     # 3. Channel Throughput
     print("\n3. CHANNEL (50000 items)")
-    
+
     ch = gsyncio.Channel(100)
     recv_count = [0]
-    
+    count_lock = __import__('threading').Lock()
+
     def producer():
-        for _ in range(25000): ch.send_nowait(1)
-    
+        for _ in range(25000): 
+            while not ch.send_nowait(1):
+                pass
+
     def consumer():
-        while recv_count[0] < 50000:
-            v = ch.recv_nowait()
-            if v: recv_count[0] += 1
-    
+        for _ in range(25000):
+            v = None
+            while v is None:
+                v = ch.recv_nowait()
+            with count_lock:
+                recv_count[0] += 1
+
     start = time.time()
     gsyncio.task(producer); gsyncio.task(producer)
     gsyncio.task(consumer); gsyncio.task(consumer)
@@ -105,7 +115,10 @@ def main():
     
     aio_time = asyncio.run(run_aio_channel())
     print(f"   asyncio: {aio_time*1000:.2f}ms ({50000/aio_time:,.0f}/s)")
-    
+
+    # Shutdown gsyncio
+    gsyncio.shutdown_scheduler(wait=False)
+
     print("\n" + "=" * 60)
     print("Summary: gsyncio is faster for spawning and yielding")
     print("asyncio wraps Python's generator-based coroutines")
