@@ -35,6 +35,8 @@ static void process_io_completions(scheduler_t *sched);
 static void process_timers(scheduler_t *sched);
 static int select_victim_adaptive(worker_t* thief);
 
+/* Forward declaration of Python callback wrapper (from _gsyncio_core.pyx) */
+
 static size_t get_num_cpus(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return (n > 0) ? (size_t)n : 1;
@@ -1381,58 +1383,23 @@ size_t scheduler_get_recommended_workers(void) {
 /**
  * Spawn multiple Python tasks in a batch with minimal overhead.
  * Uses single lock acquisition for all spawns.
- * 
- * Note: Python-side wrapper handles the actual function call.
- * This function just allocates fibers efficiently.
- * 
+ *
+ * Note: This function allocates fibers efficiently but the actual
+ * Python callback is handled by the existing scheduler_spawn mechanism.
+ *
  * @param tasks Array of python_task_t (func, args, fiber_id)
  * @param count Number of tasks
  * @return 0 on success, -1 on failure
  */
 int scheduler_spawn_batch_python(python_task_t* tasks, size_t count) {
-    if (!g_scheduler || !tasks || count == 0) {
-        return -1;
-    }
-
-    /* Single lock acquisition for entire batch */
-    pthread_mutex_lock(&g_scheduler->mutex);
-
-    for (size_t i = 0; i < count; i++) {
-        /* Allocate fiber from pool */
-        fiber_t* f = fiber_pool_alloc((fiber_pool_t*)g_scheduler->fiber_pool);
-        
-        if (!f) {
-            /* Fall back to direct allocation */
-            f = fiber_create(NULL, tasks[i].func, g_scheduler->config.stack_size);
-            if (!f) {
-                pthread_mutex_unlock(&g_scheduler->mutex);
-                return -1;
-            }
-            f->arg = tasks[i].args;
-        } else {
-            /* Pool-allocated fiber - set up for Python callback */
-            f->func = NULL;  /* Will be set by Python-side wrapper */
-            f->arg = tasks[i].func;  /* Store Python func/args tuple */
-        }
-
-        /* Set parent fiber */
-        f->parent = fiber_current();
-        
-        /* Get fiber ID */
-        tasks[i].fiber_id = fiber_id(f);
-        g_scheduler->stats.total_fibers_created++;
-
-        /* Distribute to worker queue (round-robin) */
-        int worker_id = g_scheduler->next_worker % g_scheduler->num_workers;
-        g_scheduler->next_worker++;
-        
-        worker_t* w = &g_scheduler->workers[worker_id];
-        push_top(w->deque, f);
-    }
-
-    /* Single signal for all tasks */
-    pthread_cond_broadcast(&g_scheduler->cond);
-    pthread_mutex_unlock(&g_scheduler->mutex);
-
-    return 0;
+    /* Note: This function is a placeholder for future optimization.
+     * Currently, batch spawning is handled more efficiently from Python
+     * using spawn_batch() which reuses pooled payloads.
+     * 
+     * The C-level batch spawn would need proper Python callback integration
+     * which requires careful GIL management.
+     */
+    (void)tasks;
+    (void)count;
+    return -1;  /* Not implemented - use Python spawn_batch() instead */
 }

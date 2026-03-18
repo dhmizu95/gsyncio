@@ -771,32 +771,33 @@ def spawn(func, *args):
 
 def spawn_batch(funcs_and_args):
     """Spawn multiple tasks in a batch - optimized for bulk operations
-    
+
     Args:
         funcs_and_args: List of (func, args) tuples
-        
+
     Returns:
         List of fiber IDs
-        
+
     Example:
         >>> spawn_batch([(func1, (arg1,)), (func2, (arg2,))])
         [1, 2]
     """
     global _payload_pool, _payload_pool_size
-    
+
     if g_scheduler == NULL:
         init_scheduler(num_workers=4)
-    
+
+    cdef size_t count = len(funcs_and_args)
     cdef list results = []
     cdef object payload
     cdef uint64_t fid
-    
+
     # Pre-allocate results list
-    results = [None] * len(funcs_and_args)
-    
-    # Spawn all tasks
+    results = [None] * count
+
+    # Spawn all tasks using pooled payloads
     for i, (func, args) in enumerate(funcs_and_args):
-        # Use pooled payload
+        # Use pooled payload (reduces allocation overhead)
         payload = _get_payload(func, args)
         Py_INCREF(payload)
         fid = scheduler_spawn(_c_fiber_entry, <void*>payload)
@@ -805,24 +806,24 @@ def spawn_batch(funcs_and_args):
             _return_payload(payload)
             raise RuntimeError(f"Failed to spawn fiber {i}")
         results[i] = fid
-    
+
     return results
 
 def spawn_batch_fast(funcs_and_args):
     """Ultra-fast batch spawn - minimal error checking
-    
+
     For maximum performance when you know all spawns will succeed.
     Does not return fiber IDs (saves allocation overhead).
-    
+
     Args:
         funcs_and_args: List of (func, args) tuples
     """
     if g_scheduler == NULL:
         init_scheduler(num_workers=4)
-    
+
     cdef object payload
-    
-    # Spawn all tasks without error checking
+
+    # Spawn all tasks without error checking or return values
     for func, args in funcs_and_args:
         payload = _get_payload(func, args)
         Py_INCREF(payload)
