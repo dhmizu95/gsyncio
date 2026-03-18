@@ -117,6 +117,13 @@ cdef extern from "scheduler.h":
     void scheduler_run()
     void scheduler_stop()
     void scheduler_sleep_ns(uint64_t ns)
+    
+    # Worker management
+    void scheduler_check_worker_scaling()
+    void scheduler_set_auto_scaling(int enabled)
+    void scheduler_set_energy_efficient_mode(int enabled)
+    double scheduler_get_worker_utilization()
+    size_t scheduler_get_recommended_workers()
 
 # ============================================
 # Future declarations
@@ -737,6 +744,26 @@ def yield_execution():
 def num_workers():
     """Get number of worker threads"""
     return scheduler_num_workers()
+
+def check_worker_scaling():
+    """Check if worker scaling is needed"""
+    scheduler_check_worker_scaling()
+
+def set_auto_scaling(enabled):
+    """Enable or disable automatic worker scaling"""
+    scheduler_set_auto_scaling(1 if enabled else 0)
+
+def set_energy_efficient_mode(enabled):
+    """Enable energy-efficient mode (fewer workers when idle)"""
+    scheduler_set_energy_efficient_mode(1 if enabled else 0)
+
+def get_worker_utilization():
+    """Get worker utilization percentage (0-100)"""
+    return scheduler_get_worker_utilization()
+
+def get_recommended_workers():
+    """Get recommended number of workers based on current workload"""
+    return scheduler_get_recommended_workers()
 
 def task(func, *args):
     """Spawn a task using global task registry"""

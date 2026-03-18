@@ -19,6 +19,8 @@
 #include "evloop.h"
 #endif
 
+#include "worker_manager.h"  /* Intelligent worker management */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -165,39 +167,42 @@ typedef struct scheduler {
     worker_t* workers;
     size_t num_workers;
     size_t next_worker;
-    
+
     fiber_t* ready_queue;
     fiber_t* blocked_queue;
-    
+
     scheduler_config_t config;
     scheduler_stats_t stats;
-    
+
     bool running;
     bool initialized;
-    
+
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-    
+
     void* fiber_pool;
-    
+
     scheduler_backend_t backend;
-    
+
+    /* Intelligent worker management */
+    worker_manager_t worker_manager;
+
 #ifdef __linux__
     io_uring_t io_uring_ring;
     bool io_uring_enabled;
     io_uring_submission_t *pending_submissions;
     pthread_mutex_t io_uring_mutex;
 #endif
-    
+
     fd_entry_t *fd_table;
     size_t fd_table_size;
-    
+
     io_poller_t *pollers;
     pthread_mutex_t pollers_mutex;
-    
+
     timer_node_t *timers;
     pthread_mutex_t timers_mutex;
-    
+
     uint64_t current_time_ns;
 } scheduler_t;
 
@@ -244,6 +249,13 @@ void scheduler_sleep_ns(uint64_t ns);
 
 int scheduler_register_fd(int fd, fiber_t *fiber, uint32_t events);
 void scheduler_unregister_fd(int fd);
+
+/* Worker management functions */
+void scheduler_check_worker_scaling(void);
+void scheduler_set_auto_scaling(bool enabled);
+void scheduler_set_energy_efficient_mode(bool enabled);
+double scheduler_get_worker_utilization(void);
+size_t scheduler_get_recommended_workers(void);
 
 #ifdef __cplusplus
 }

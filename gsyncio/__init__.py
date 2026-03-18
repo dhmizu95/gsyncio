@@ -62,6 +62,12 @@ from .core import (
     yield_execution,
     num_workers,
     _HAS_CYTHON,
+    # Worker management
+    check_worker_scaling,
+    set_auto_scaling,
+    set_energy_efficient_mode,
+    get_worker_utilization,
+    get_recommended_workers,
 )
 
 # Import task/sync model
@@ -157,6 +163,13 @@ __all__ = [
     'yield_execution',
     'num_workers',
     '_HAS_CYTHON',
+    
+    # Worker management
+    'check_worker_scaling',
+    'set_auto_scaling',
+    'set_energy_efficient_mode',
+    'get_worker_utilization',
+    'get_recommended_workers',
     
     # Task/Sync model
     'task',

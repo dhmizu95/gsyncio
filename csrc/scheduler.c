@@ -540,7 +540,10 @@ int scheduler_init(scheduler_config_t* config) {
     
     pthread_mutex_init(&sched->mutex, NULL);
     pthread_cond_init(&sched->cond, NULL);
-    
+
+    /* Initialize worker manager */
+    worker_manager_init(&sched->worker_manager, sched->num_workers);
+
     sched->fiber_pool = fiber_pool_create(sched->config.max_fibers);
     
     sched->ready_queue = NULL;
@@ -651,6 +654,7 @@ void scheduler_shutdown(bool wait_for_completion) {
 #endif
     
     fiber_pool_destroy(sched->fiber_pool);
+    worker_manager_shutdown(&sched->worker_manager);
     fiber_cleanup();
     
     free(sched->workers);
@@ -1299,4 +1303,73 @@ void scheduler_unregister_fd(int fd) {
     
     g_scheduler->fd_table[fd].active = false;
     g_scheduler->fd_table[fd].fiber = NULL;
+}
+/* ============================================ */
+/* Worker Manager Integration                   */
+/* ============================================ */
+
+/**
+ * Background thread for worker scaling decisions
+ */
+static void* worker_manager_loop(scheduler_t *sched) {
+    while (sched->running) {
+        /* Check if scaling is needed */
+        size_t queue_depth = 0;
+        
+        pthread_mutex_lock(&sched->mutex);
+        fiber_t* f = sched->ready_queue;
+        while (f) {
+            queue_depth++;
+            f = f->next_ready;
+            if (queue_depth > 1000) break;  /* Cap counting */
+        }
+        pthread_mutex_unlock(&sched->mutex);
+        
+        /* Check scaling */
+        worker_manager_check_scale(&sched->worker_manager, queue_depth);
+        
+        /* Sleep for check interval */
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = WORKER_MANAGER_CHECK_INTERVAL_MS * 1000000;
+        nanosleep(&ts, NULL);
+    }
+    
+    return NULL;
+}
+
+void scheduler_check_worker_scaling(void) {
+    if (!g_scheduler) return;
+    
+    size_t queue_depth = 0;
+    pthread_mutex_lock(&g_scheduler->mutex);
+    fiber_t* f = g_scheduler->ready_queue;
+    while (f) {
+        queue_depth++;
+        f = f->next_ready;
+        if (queue_depth > 1000) break;
+    }
+    pthread_mutex_unlock(&g_scheduler->mutex);
+    
+    worker_manager_check_scale(&g_scheduler->worker_manager, queue_depth);
+}
+
+void scheduler_set_auto_scaling(bool enabled) {
+    if (!g_scheduler) return;
+    worker_manager_set_auto_scaling(&g_scheduler->worker_manager, enabled);
+}
+
+void scheduler_set_energy_efficient_mode(bool enabled) {
+    if (!g_scheduler) return;
+    worker_manager_set_energy_efficient_mode(&g_scheduler->worker_manager, enabled);
+}
+
+double scheduler_get_worker_utilization(void) {
+    if (!g_scheduler) return 0.0;
+    return worker_manager_get_utilization(&g_scheduler->worker_manager);
+}
+
+size_t scheduler_get_recommended_workers(void) {
+    if (!g_scheduler) return WORKER_MANAGER_MIN_WORKERS;
+    return worker_manager_get_recommended_workers(&g_scheduler->worker_manager);
 }

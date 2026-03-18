@@ -55,6 +55,7 @@ C_SOURCES = [
     str(CSRC_DIR / 'net.c'),
     str(CSRC_DIR / 'io_uring.c'),
     str(CSRC_DIR / 'native_io.c'),
+    str(CSRC_DIR / 'worker_manager.c'),
 ]
 
 # Compiler flags

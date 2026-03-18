@@ -35,6 +35,12 @@ try:
         task_count,
         task_completed_count,
         run,
+        # Worker management
+        check_worker_scaling,
+        set_auto_scaling,
+        set_energy_efficient_mode,
+        get_worker_utilization,
+        get_recommended_workers,
     )
     _HAS_CYTHON = True
 except ImportError:
@@ -302,13 +308,35 @@ except ImportError:
     def current_fiber_id():
         """Get current thread ID (fiber ID in pure Python)"""
         return threading.current_thread().ident
-    
+
     def yield_execution():
         """Yield execution (no-op in pure Python)"""
         pass
-    
+
     def num_workers():
         """Get number of CPU cores"""
+        import os
+        return os.cpu_count() or 1
+    
+    # Worker management (pure Python - no-op implementations)
+    def check_worker_scaling():
+        """Check if worker scaling is needed (no-op in pure Python)"""
+        pass
+    
+    def set_auto_scaling(enabled):
+        """Enable/disable auto-scaling (no-op in pure Python)"""
+        pass
+    
+    def set_energy_efficient_mode(enabled):
+        """Enable energy-efficient mode (no-op in pure Python)"""
+        pass
+    
+    def get_worker_utilization():
+        """Get worker utilization (returns 0 in pure Python)"""
+        return 0.0
+    
+    def get_recommended_workers():
+        """Get recommended workers (returns CPU count in pure Python)"""
         import os
         return os.cpu_count() or 1
 
