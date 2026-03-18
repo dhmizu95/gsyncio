@@ -72,11 +72,7 @@ async def sleep(ms: int) -> None:
     """
     Sleep for a specified number of milliseconds.
     """
-    if _HAS_CYTHON:
-        import asyncio
-        await asyncio.sleep(ms / 1000.0)
-    else:
-        await asyncio.sleep(ms / 1000.0)
+    await asyncio.sleep(ms / 1000.0)
 
 
 async def gather(*futures: Awaitable) -> List[Any]:
