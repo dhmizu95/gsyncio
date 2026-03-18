@@ -108,3 +108,4 @@ temp/
 # Benchmark results
 *.json
 !pyproject.toml
+!csrc/*
