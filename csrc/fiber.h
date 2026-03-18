@@ -46,6 +46,24 @@ typedef enum {
 
 typedef struct fiber fiber_t;
 
+#ifdef __x86_64__
+/* Minimal 64-byte context for x86_64 inline assembly */
+/* Saves: rbx, rbp, r12, r13, r14, r15, rsp, rip (8 × 8 = 64 bytes) */
+typedef struct {
+    void* rbx;
+    void* rbp;
+    void* r12;
+    void* r13;
+    void* r14;
+    void* r15;
+    void* rsp;
+    void* rip;
+} fiber_context_t;
+#else
+/* Fallback to jmp_buf for non-x86_64 */
+typedef jmp_buf fiber_context_t;
+#endif
+
 struct fiber {
     /* Fiber ID */
     uint64_t id;
@@ -82,8 +100,8 @@ struct fiber {
     /* Debug info */
     const char* name;
 
-    /* Context switching - using jmp_buf for portability */
-    jmp_buf context;
+    /* Context switching - minimal 64-byte context on x86_64 */
+    fiber_context_t context;
 
     /* Async/await support */
     void* waiting_on;           /* What fiber is waiting on (Future, Channel, etc.) */
@@ -149,6 +167,11 @@ fiber_t* fiber_current(void);
  * @param to Fiber to switch to
  */
 void fiber_switch(fiber_t* from, fiber_t* to);
+
+#ifdef __x86_64__
+/* Entry point for inline assembly context switch */
+void fiber_entry_point(void);
+#endif
 
 /**
  * Get fiber ID

@@ -95,11 +95,12 @@ cdef extern from "scheduler.h":
         pass
     
     scheduler_t* g_scheduler
-    
+
     int scheduler_init(scheduler_config_t* config)
     void scheduler_shutdown(int wait_for_completion)
     scheduler_t* scheduler_get()
     uint64_t scheduler_spawn(void (*entry)(void*), void* user_data)
+    uint64_t scheduler_spawn_python(void* py_func, void* py_args, void* py_kwargs)
     void scheduler_schedule(fiber_t* f, int worker_id)
     void scheduler_block(void* reason)
     void scheduler_unblock(fiber_t* f)
@@ -435,16 +436,14 @@ class FiberHandle:
         """Wait for fiber to complete (not implemented yet)"""
         pass
 
-# Global storage for pending fiber callbacks (for future fiber-based spawn)
-_fiber_callbacks = {}
-
 def spawn(func, *args):
     """Spawn a new fiber/task
     
-    Note: Currently uses threading fallback. Full fiber-based spawn
-    is in development and will provide 100x faster task creation.
+    Note: Uses threading fallback for reliability.
+    Fiber-based spawn (scheduler_spawn_python) is implemented in C
+    with proper GIL management, ready for integration.
     """
-    # Fallback to threading - reliable and works correctly
+    # Use threading fallback - reliable and works correctly
     import threading
     t = threading.Thread(target=lambda: func(*args), daemon=True)
     t.start()

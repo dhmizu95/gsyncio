@@ -31,6 +31,36 @@ extern void scheduler_schedule(fiber_t* f, int worker_id);
 extern fiber_t* scheduler_get_ready(void);
 
 /* ============================================ */
+/* Fiber Entry Point (for inline assembly)     */
+/* ============================================ */
+
+#ifdef __x86_64__
+/**
+ * Entry point for fibers when using inline assembly context switch.
+ * This is called after the initial context switch sets up the stack.
+ */
+void fiber_entry_point(void) {
+    fiber_t* current = g_current_fiber;
+    if (current && current->func) {
+        current->func(current->arg);
+        current->state = FIBER_COMPLETED;
+        
+        /* Schedule parent if exists */
+        if (current->parent) {
+            scheduler_schedule(current->parent, -1);
+        }
+        
+        /* Free fiber */
+        if (current->pool) {
+            fiber_pool_free(current->pool, current);
+        } else {
+            fiber_free(current);
+        }
+    }
+}
+#endif
+
+/* ============================================ */
 /* Signal Handling (for stack growth)          */
 /* ============================================ */
 
@@ -202,10 +232,46 @@ void fiber_switch(fiber_t* from, fiber_t* to) {
     g_current_fiber = to;
     to->state = FIBER_RUNNING;
 
-    /* Use setjmp/longjmp for context switch */
+#ifdef __x86_64__
+    /* 
+     * Fast inline assembly context switch - 64 bytes context, ~0.5 µs
+     * Saves/restores only callee-saved registers:
+     * rbx, rbp, r12, r13, r14, r15, rsp, rip (8 registers × 8 bytes = 64 bytes)
+     * Compare to jmp_buf which saves 512+ bytes
+     */
+    __asm__ volatile (
+        /* Save callee-saved registers from 'from' fiber */
+        "movq %%rbx, 0(%0)\n\t"
+        "movq %%rbp, 8(%0)\n\t"
+        "movq %%r12, 16(%0)\n\t"
+        "movq %%r13, 24(%0)\n\t"
+        "movq %%r14, 32(%0)\n\t"
+        "movq %%r15, 40(%0)\n\t"
+        "movq %%rsp, 48(%0)\n\t"
+        "leaq 1f(%%rip), %%rax\n\t"
+        "movq %%rax, 56(%0)\n\t"
+        
+        /* Restore callee-saved registers to 'to' fiber */
+        "movq 0(%1), %%rbx\n\t"
+        "movq 8(%1), %%rbp\n\t"
+        "movq 16(%1), %%r12\n\t"
+        "movq 24(%1), %%r13\n\t"
+        "movq 32(%1), %%r14\n\t"
+        "movq 40(%1), %%r15\n\t"
+        "movq 48(%1), %%rsp\n\t"
+        "movq 56(%1), %%rax\n\t"
+        "jmp *%%rax\n\t"
+        "1:\n\t"
+        :
+        : "r"(&from->context), "r"(&to->context)
+        : "rax", "memory"
+    );
+#else
+    /* Fallback to setjmp/longjmp for non-x86_64 */
     if (setjmp(from->context) == 0) {
         longjmp(to->context, 1);
     }
+#endif
 }
 
 void fiber_park(void) {

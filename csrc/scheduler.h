@@ -161,6 +161,14 @@ typedef struct spawn_batch {
     size_t capacity;
 } spawn_batch_t;
 
+/* Python callback data for fiber execution */
+typedef struct {
+    void* func;
+    void* args;
+    void* kwargs;
+    int has_gil;
+} python_callback_t;
+
 typedef struct scheduler {
     worker_t* workers;
     size_t num_workers;
@@ -208,6 +216,9 @@ void scheduler_shutdown(bool wait_for_completion);
 scheduler_t* scheduler_get(void);
 
 uint64_t scheduler_spawn(void (*entry)(void*), void* user_data);
+
+/* Python-aware spawn - acquires GIL and calls Python function */
+uint64_t scheduler_spawn_python(void* py_func, void* py_args, void* py_kwargs);
 
 /* Batch spawn for creating multiple fibers efficiently */
 uint64_t* scheduler_spawn_batch(void (*entry)(void*), void** user_data_array, size_t count);

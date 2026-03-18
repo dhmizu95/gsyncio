@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <sched.h>
+#include <Python.h>
 
 #ifdef __linux__
 #include "io_uring.h"
@@ -34,6 +35,7 @@ static fiber_t* pop_local(worker_t* w);
 static void process_io_completions(scheduler_t *sched);
 static void process_timers(scheduler_t *sched);
 static int select_victim_adaptive(worker_t* thief);
+static void python_fiber_callback(void* arg);
 
 static size_t get_num_cpus(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -281,33 +283,27 @@ static void* worker_thread(void* arg) {
 
             if (f->state == FIBER_NEW || f->state == FIBER_READY) {
                 if (f->state == FIBER_NEW) {
-                    /* First time running this fiber - use setjmp to save entry point */
-                    if (setjmp(f->context) == 0) {
-                        f->state = FIBER_RUNNING;
-                        f->func(f->arg);
-
-                        f->state = FIBER_COMPLETED;
-                        sched->stats.total_fibers_completed++;
-
-                        if (f->parent) {
-                            scheduler_schedule(f->parent, -1);
-                        }
-
-                        if (f->pool) {
-                            fiber_pool_free(f->pool, f);
-                        } else {
-                            fiber_free(f);
-                        }
-
-                        w->current_fiber = NULL;
-                        continue;
-                    }
-                    /* else: fiber resumed here after yield */
-                } else {
-                    /* Resume existing fiber at its yield point */
+                    /* First time running this fiber - execute directly */
                     f->state = FIBER_RUNNING;
-                    longjmp(f->context, 1);
+                    f->func(f->arg);
+
+                    f->state = FIBER_COMPLETED;
+                    sched->stats.total_fibers_completed++;
+
+                    if (f->parent) {
+                        scheduler_schedule(f->parent, -1);
+                    }
+
+                    if (f->pool) {
+                        fiber_pool_free(f->pool, f);
+                    } else {
+                        fiber_free(f);
+                    }
+
+                    w->current_fiber = NULL;
+                    continue;
                 }
+                /* For resumed fibers, the inline assembly in fiber_switch handles it */
             }
 
             w->current_fiber = NULL;
@@ -700,6 +696,72 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
     scheduler_schedule(f, worker_id);
     
     return fiber_id(f);
+}
+
+/* ============================================ */
+/* Python Fiber Callback (with GIL management) */
+/* ============================================ */
+
+/**
+ * Python callback wrapper - acquires GIL and calls Python function
+ * This is called from fiber context, so we need to manage GIL properly
+ */
+static void python_fiber_callback(void* arg) {
+    python_callback_t* cb = (python_callback_t*)arg;
+    if (!cb) return;
+    
+    /* Acquire GIL for Python execution */
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    
+    PyObject* result = NULL;
+    PyObject* py_func = (PyObject*)cb->func;
+    PyObject* py_args = (PyObject*)cb->args;
+    PyObject* py_kwargs = cb->kwargs ? (PyObject*)cb->kwargs : NULL;
+    
+    /* Call Python function */
+    if (py_kwargs) {
+        result = PyObject_Call(py_func, py_args, py_kwargs);
+    } else {
+        result = PyObject_CallObject(py_func, py_args);
+    }
+    
+    /* Handle exceptions */
+    if (!result) {
+        PyErr_Print();
+    } else {
+        Py_DECREF(result);
+    }
+    
+    /* Cleanup - decref the function and args */
+    Py_DECREF(py_func);
+    Py_DECREF(py_args);
+    Py_XDECREF(py_kwargs);
+    free(cb);
+    
+    /* Release GIL */
+    PyGILState_Release(gstate);
+}
+
+/**
+ * Spawn a fiber that executes a Python function with proper GIL management
+ */
+uint64_t scheduler_spawn_python(void* py_func, void* py_args, void* py_kwargs) {
+    if (!g_scheduler || !py_func) {
+        return 0;
+    }
+    
+    /* Allocate callback data */
+    python_callback_t* cb = (python_callback_t*)malloc(sizeof(python_callback_t));
+    if (!cb) {
+        return 0;
+    }
+    cb->func = py_func;
+    cb->args = py_args;
+    cb->kwargs = py_kwargs;
+    cb->has_gil = 0;
+    
+    /* Spawn fiber with our Python callback wrapper */
+    return scheduler_spawn(python_fiber_callback, cb);
 }
 
 /* ============================================ */
