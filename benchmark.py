@@ -14,18 +14,24 @@ import asyncio
 def benchmark_task_spawn(num_tasks=1000):
     """Benchmark task spawning overhead"""
     print(f"\n=== Task Spawn Benchmark ({num_tasks} tasks) ===")
-    
+
     counter = [0]
-    
+
     def worker():
         counter[0] += 1
-    
-    start = time.time()
-    for _ in range(num_tasks):
-        gsyncio.task(worker)
-    gsyncio.sync()
-    elapsed = time.time() - start
-    
+
+    def main():
+        start = time.time()
+        for _ in range(num_tasks):
+            gsyncio.task(worker)
+        gsyncio.sync()
+        elapsed = time.time() - start
+        return elapsed
+
+    gsyncio.init_scheduler()
+    elapsed = main()
+    gsyncio.shutdown_scheduler(wait=True)
+
     print(f"  Total time: {elapsed*1000:.2f}ms")
     print(f"  Tasks/sec: {num_tasks/elapsed:,.0f}")
     print(f"  Per task: {elapsed*1000000/num_tasks:.2f}µs")
@@ -56,23 +62,29 @@ def benchmark_async_gather(num_tasks=100):
 def benchmark_waitgroup(num_workers=10):
     """Benchmark WaitGroup synchronization"""
     print(f"\n=== WaitGroup Benchmark ({num_workers} workers) ===")
-    
-    wg = gsyncio.create_wg()
-    counter = [0]
-    
-    def worker():
-        for _ in range(100):
-            counter[0] += 1
-        gsyncio.done(wg)
-    
-    gsyncio.add(wg, num_workers)
-    
-    start = time.time()
-    for _ in range(num_workers):
-        gsyncio.task(worker)
-    gsyncio.sync()
-    elapsed = time.time() - start
-    
+
+    def run_benchmark():
+        wg = gsyncio.create_wg()
+        counter = [0]
+
+        def worker():
+            for _ in range(100):
+                counter[0] += 1
+            gsyncio.done(wg)
+
+        gsyncio.add(wg, num_workers)
+
+        start = time.time()
+        for _ in range(num_workers):
+            gsyncio.task(worker)
+        gsyncio.sync()
+        elapsed = time.time() - start
+        return elapsed, counter[0]
+
+    gsyncio.init_scheduler()
+    elapsed, count = run_benchmark()
+    gsyncio.shutdown_scheduler(wait=True)
+
     total_ops = num_workers * 100
     print(f"  Total time: {elapsed*1000:.2f}ms")
     print(f"  Operations: {total_ops}")
@@ -83,16 +95,22 @@ def benchmark_waitgroup(num_workers=10):
 def benchmark_context_switch(num_yields=10000):
     """Benchmark context switching via yield"""
     print(f"\n=== Context Switch Benchmark ({num_yields} yields) ===")
-    
-    def yielder():
-        for _ in range(num_yields // 10):
-            gsyncio.yield_execution()
-    
-    start = time.time()
-    for _ in range(10):
-        gsyncio.task(yielder)
-    gsyncio.sync()
-    elapsed = time.time() - start
+
+    def run_benchmark():
+        def yielder():
+            for _ in range(num_yields // 10):
+                gsyncio.yield_execution()
+
+        start = time.time()
+        for _ in range(10):
+            gsyncio.task(yielder)
+        gsyncio.sync()
+        elapsed = time.time() - start
+        return elapsed
+
+    gsyncio.init_scheduler()
+    elapsed = run_benchmark()
+    gsyncio.shutdown_scheduler(wait=True)
     
     print(f"  Total time: {elapsed*1000:.2f}ms")
     print(f"  Yields/sec: {num_yields/elapsed:,.0f}")

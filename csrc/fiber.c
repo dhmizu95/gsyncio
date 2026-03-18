@@ -9,8 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <signal.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/mman.h>
 
 /* Global fiber state */
@@ -26,7 +26,7 @@ fiber_t* g_current_fiber = NULL;
 #endif
 
 /* Scheduler jump buffer for yield return */
-static __thread sigjmp_buf g_sched_jump_buf;
+static __thread jmp_buf g_sched_jump_buf;
 
 /* Global scheduler functions (from scheduler.c) */
 extern void* g_scheduler;
@@ -187,11 +187,11 @@ void fiber_yield(void) {
     current->sched_jump = &g_sched_jump_buf;
     
     /* Save context and jump to scheduler */
-    if (sigsetjmp(g_sched_jump_buf, 1) == 0) {
+    if (setjmp(g_sched_jump_buf) == 0) {
         /* First time - jump to scheduler to get next fiber */
         /* The scheduler will handle picking the next fiber */
     }
-    /* else: we returned here via siglongjmp - continue execution */
+    /* else: we returned here via longjmp - continue execution */
     
     current->sched_jump = NULL;
 }
@@ -214,7 +214,7 @@ void fiber_switch(fiber_t* from, fiber_t* to) {
     }
     
     /* Save current fiber context */
-    if (sigsetjmp(from->context, 1) == 0) {
+    if (setjmp(from->context) == 0) {
         /* First time - switch to 'to' fiber */
         
         /* Update current fiber pointer */
@@ -225,7 +225,7 @@ void fiber_switch(fiber_t* from, fiber_t* to) {
         to->sched_jump = &g_sched_jump_buf;
         
         /* Jump to the 'to' fiber's context */
-        siglongjmp(to->context, 1);
+        longjmp(to->context, 1);
     }
     /* else: we returned here from 'to' fiber yielding/switching back */
 }

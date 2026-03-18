@@ -20,6 +20,8 @@ try:
         shutdown_scheduler,
         get_scheduler_stats,
         spawn,
+        sleep_ns,
+        sleep_us,
         sleep_ms,
         current_fiber_id,
         yield_execution,
@@ -277,6 +279,16 @@ except ImportError:
         """Sleep for milliseconds"""
         import time
         time.sleep(ms / 1000.0)
+
+    def sleep_ns(ns):
+        """Sleep for nanoseconds"""
+        import time
+        time.sleep(ns / 1000000000.0)
+
+    def sleep_us(us):
+        """Sleep for microseconds"""
+        import time
+        time.sleep(us / 1000000.0)
     
     def current_fiber_id():
         """Get current thread ID (fiber ID in pure Python)"""
@@ -294,12 +306,14 @@ except ImportError:
 
 __all__ = [
     'Future',
-    'Channel', 
+    'Channel',
     'WaitGroup',
     'init_scheduler',
     'shutdown_scheduler',
     'get_scheduler_stats',
     'spawn',
+    'sleep_ns',
+    'sleep_us',
     'sleep_ms',
     'current_fiber_id',
     'yield_execution',

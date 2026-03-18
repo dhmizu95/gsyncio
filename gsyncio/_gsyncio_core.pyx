@@ -111,6 +111,7 @@ cdef extern from "scheduler.h":
     size_t scheduler_num_workers()
     void scheduler_run()
     void scheduler_stop()
+    void scheduler_sleep_ns(uint64_t ns)
 
 cdef extern from "future.h":
     ctypedef enum future_state:
@@ -396,48 +397,59 @@ def get_scheduler_stats():
         'current_ready_fibers': stats.current_ready_fibers,
     }
 
-cdef object _fiber_wrapper_func
-cdef object _fiber_wrapper_args
+cdef void _c_fiber_entry(void* arg) noexcept with gil:
+    """C callback for fiber execution - arg is a Python tuple (func, args)"""
+    cdef object payload
+    cdef object func
+    cdef tuple args
+    
+    if arg != NULL:
+        # Extract the Python tuple from the void*
+        payload = <object>arg
+        
+        try:
+            func = payload[0]
+            args = payload[1]
+            func(*args)
+        except Exception as e:
+            import sys
+            print(f"Fiber exception: {e}", file=sys.stderr)
 
-cdef void _c_fiber_entry(void* arg) noexcept:
-    """C callback for fiber execution"""
-    global _fiber_wrapper_func, _fiber_wrapper_args
-    try:
-        _fiber_wrapper_func(*_fiber_wrapper_args)
-    except Exception as e:
-        import sys
-        print(f"Fiber exception: {e}", file=sys.stderr)
+# Fiber handle for tracking spawned fibers
+class FiberHandle:
+    """Handle for a spawned fiber - allows join-like waiting"""
+    def __init__(self, fid=0):
+        self.fid = fid
+    
+    @property
+    def done(self):
+        """Check if fiber is done (not implemented yet)"""
+        return False
+    
+    def join(self, timeout=None):
+        """Wait for fiber to complete (not implemented yet)"""
+        pass
 
 def spawn(func, *args):
-    """Spawn a new fiber/task using fiber pool when available"""
-    global _fiber_wrapper_func, _fiber_wrapper_args
-    
-    # Check if scheduler is initialized and has workers
-    try:
-        nw = num_workers()
-        if nw > 0:
-            _fiber_wrapper_func = func
-            _fiber_wrapper_args = args
-            fid = scheduler_spawn(_c_fiber_entry, NULL)
-            if fid > 0:
-                return fid
-    except:
-        pass
-    
+    """Spawn a new fiber/task - currently uses threading fallback"""
     # Fallback to lightweight thread
+    # Note: Full fiber-based spawn is work in progress
     import threading
     t = threading.Thread(target=lambda: func(*args), daemon=True)
     t.start()
     return t
 
+def sleep_ns(uint64_t ns):
+    """Sleep for nanoseconds using native timer (fast path)"""
+    scheduler_sleep_ns(ns)
+
 def sleep_ms(int ms):
-    """Sleep for milliseconds - uses asyncio for non-blocking sleep"""
-    # Delegate to asyncio for proper async sleep
-    # This is called from async context, so we return a coroutine
-    import asyncio
-    async def _sleep():
-        await asyncio.sleep(ms / 1000.0)
-    return _sleep()
+    """Sleep for milliseconds using native timer"""
+    scheduler_sleep_ns(ms * 1000000)
+
+def sleep_us(int us):
+    """Sleep for microseconds using native timer"""
+    scheduler_sleep_ns(us * 1000)
 
 def current_fiber_id():
     """Get current fiber ID"""

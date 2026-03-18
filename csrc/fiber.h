@@ -11,7 +11,6 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-#include <signal.h>
 #include <setjmp.h>
 
 #ifdef __cplusplus
@@ -84,8 +83,8 @@ struct fiber {
     const char* name;
 
     /* Context switching */
-    sigjmp_buf context;         /* Saved context for switch */
-    sigjmp_buf* sched_jump;     /* Jump point for yield return */
+    jmp_buf context;         /* Saved context for switch */
+    jmp_buf* sched_jump;     /* Jump point for yield return */
 
     /* Async/await support */
     void* waiting_on;           /* What fiber is waiting on (Future, Channel, etc.) */

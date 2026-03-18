@@ -154,6 +154,13 @@ typedef struct scheduler_stats {
     uint64_t total_io_completed;
 } scheduler_stats_t;
 
+/* Batch scheduling support */
+typedef struct spawn_batch {
+    fiber_t** fibers;
+    size_t count;
+    size_t capacity;
+} spawn_batch_t;
+
 typedef struct scheduler {
     worker_t* workers;
     size_t num_workers;
@@ -203,6 +210,12 @@ scheduler_t* scheduler_get(void);
 uint64_t scheduler_spawn(void (*entry)(void*), void* user_data);
 void scheduler_schedule(fiber_t* f, int worker_id);
 
+/* Batch scheduling APIs */
+spawn_batch_t* scheduler_create_spawn_batch(size_t initial_capacity);
+void scheduler_destroy_spawn_batch(spawn_batch_t* batch);
+int scheduler_spawn_batch_add(spawn_batch_t* batch, void (*entry)(void*), void* user_data);
+void scheduler_spawn_batch_submit(spawn_batch_t* batch);
+
 void scheduler_block(void* reason);
 void scheduler_unblock(fiber_t* f);
 void scheduler_yield(void);
@@ -225,6 +238,9 @@ void scheduler_wake_io(int fd, uint32_t events);
 
 int scheduler_add_timer(uint64_t deadline_ns, fiber_t *fiber);
 void scheduler_cancel_timer(fiber_t *fiber);
+
+/* Native sleep - sleep for specified nanoseconds without asyncio */
+void scheduler_sleep_ns(uint64_t ns);
 
 int scheduler_register_fd(int fd, fiber_t *fiber, uint32_t events);
 void scheduler_unregister_fd(int fd);

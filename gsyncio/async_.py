@@ -24,7 +24,7 @@ import asyncio
 import threading
 import time
 from typing import Any, Callable, Coroutine, List, Optional, Awaitable
-from .core import Future, sleep_ms, init_scheduler, shutdown_scheduler, _HAS_CYTHON
+from .core import Future, sleep_ms, sleep_ns, init_scheduler, shutdown_scheduler, _HAS_CYTHON
 
 
 def create_task(coro: Coroutine) -> Future:
@@ -71,8 +71,15 @@ def _run_coroutine(coro: Coroutine) -> Any:
 async def sleep(ms: int) -> None:
     """
     Sleep for a specified number of milliseconds.
+    
+    Uses native gsyncio timer when available (fast path),
+    falls back to asyncio.sleep otherwise.
     """
-    await asyncio.sleep(ms / 1000.0)
+    if _HAS_CYTHON:
+        # Use native sleep - blocks current fiber, not thread
+        sleep_ns(ms * 1000000)
+    else:
+        await asyncio.sleep(ms / 1000.0)
 
 
 async def gather(*futures: Awaitable) -> List[Any]:
