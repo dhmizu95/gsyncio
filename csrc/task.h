@@ -66,6 +66,55 @@ struct task_batch {
     task_registry_t* registry;    /* Associated registry */
 };
 
+/* ============================================ */
+/* Ultra-fast batch spawn (no Python overhead) */
+/* ============================================ */
+
+/**
+ * Fast batch spawn context - stores all data in C arrays
+ * This structure is designed for zero Python overhead during spawn
+ */
+typedef struct task_batch_fast {
+    void (**funcs)(void*);       /* C function pointers */
+    void** args;                  /* Pre-stored arguments (Python objects as void*) */
+    uint64_t* fiber_ids;          /* Optional: store fiber IDs */
+    size_t count;
+    size_t capacity;
+    int store_fiber_ids;          /* Whether to store fiber IDs */
+} task_batch_fast_t;
+
+/**
+ * Create a fast batch spawn context
+ * @param capacity Initial capacity
+ * @return Fast batch context, or NULL on error
+ */
+task_batch_fast_t* task_batch_fast_create(size_t capacity);
+
+/**
+ * Destroy a fast batch spawn context
+ * @param batch Fast batch context
+ * @param free_args Whether to free argument storage (0 = no, 1 = yes)
+ */
+void task_batch_fast_destroy(task_batch_fast_t* batch, int free_args);
+
+/**
+ * Add a task to fast batch (C function pointer + void* arg)
+ * @param batch Fast batch context
+ * @param func C function pointer
+ * @param arg Void pointer argument
+ * @return 0 on success, -1 on error
+ */
+int task_batch_fast_add(task_batch_fast_t* batch, void (*func)(void*), void* arg);
+
+/**
+ * Spawn all tasks in fast batch - NO GIL held during spawn
+ * This is the key optimization - entire spawn loop runs without GIL
+ * @param batch Fast batch context
+ * @param registry Task registry
+ * @return Number of tasks spawned
+ */
+size_t task_batch_fast_spawn_nogil(task_batch_fast_t* batch, task_registry_t* registry);
+
 /* Task registry API */
 
 /**

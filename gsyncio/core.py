@@ -24,6 +24,7 @@ try:
         spawn,
         spawn_batch,
         spawn_batch_fast,
+        spawn_batch_ultra_fast,
         sleep_ns,
         sleep_us,
         sleep_ms,
@@ -360,6 +361,14 @@ except ImportError:
             t = threading.Thread(target=func, args=args, daemon=True)
             t.start()
 
+    def spawn_batch_ultra_fast(funcs_and_args, store_fiber_ids=0):
+        """Ultra-fast batch spawn with GIL release (pure Python fallback)"""
+        import threading
+        for func, args in funcs_and_args:
+            t = threading.Thread(target=func, args=args, daemon=True)
+            t.start()
+        return len(funcs_and_args)
+
 
 __all__ = [
     'Future',
@@ -369,6 +378,9 @@ __all__ = [
     'shutdown_scheduler',
     'get_scheduler_stats',
     'spawn',
+    'spawn_batch',
+    'spawn_batch_fast',
+    'spawn_batch_ultra_fast',
     'sleep_ns',
     'sleep_us',
     'sleep_ms',

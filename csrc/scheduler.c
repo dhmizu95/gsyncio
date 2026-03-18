@@ -316,31 +316,66 @@ static void* worker_thread(void* arg) {
 
             w->current_fiber = NULL;
         } else {
-            // No work - process completions and timers
-            if (sched->io_uring_enabled) {
-                io_uring_submit(&sched->io_uring_ring);
-                process_io_completions(sched);
-            }
-
-            // Process expired timers
+            // No work - process timers
             process_timers(sched);
 
-            // Brief spin before sleeping to reduce wake-up latency
-            for (int spin = 0; spin < 100 && !w->stopped; spin++) {
+            int found_work = 0;
+
+            // Brief spin before sleeping - check BOTH local and global queues
+            for (int spin = 0; spin < 100 && !w->stopped && !found_work; spin++) {
                 __asm__ __volatile__("" ::: "memory");
 
-                // Check queue during spin
-                pthread_mutex_lock(&sched->mutex);
-                fiber_t* f = sched->ready_queue;
+                // Check local queue first (fast path - no lock needed)
+                fiber_t* f = pop_local(w);
                 if (f) {
-                    sched->ready_queue = f->next_ready;
+                    found_work = 1;
+                    // Found work in local queue - execute it
+                    w->current_fiber = f;
+                    w->tasks_executed++;
+
+                    if (f->state == FIBER_NEW || f->state == FIBER_READY) {
+                        if (f->state == FIBER_NEW) {
+                            if (setjmp(f->context) == 0) {
+                                f->state = FIBER_RUNNING;
+                                f->func(f->arg);
+                                f->state = FIBER_COMPLETED;
+                                sched->stats.total_fibers_completed++;
+
+                                if (f->parent) {
+                                    scheduler_schedule(f->parent, -1);
+                                }
+
+                                if (f->pool) {
+                                    fiber_pool_free(f->pool, f);
+                                } else {
+                                    fiber_free(f);
+                                }
+
+                                w->current_fiber = NULL;
+                                continue;
+                            }
+                        } else {
+                            f->state = FIBER_RUNNING;
+                            longjmp(f->context, 1);
+                        }
+                    }
+                    w->current_fiber = NULL;
+                } else {
+                    // Check global queue
+                    pthread_mutex_lock(&sched->mutex);
+                    f = sched->ready_queue;
+                    if (f) {
+                        sched->ready_queue = f->next_ready;
+                        pthread_mutex_unlock(&sched->mutex);
+                        found_work = 1;
+                    } else {
+                        pthread_mutex_unlock(&sched->mutex);
+                    }
                 }
-                pthread_mutex_unlock(&sched->mutex);
-                if (f) break;
             }
 
-            // Sleep with timeout instead of indefinite wait
-            if (!w->stopped) {
+            // Sleep with timeout if no work found
+            if (!found_work && !w->stopped) {
                 struct timespec ts;
                 ts.tv_sec = 0;
                 ts.tv_nsec = 1000000; // 1ms timeout

@@ -8,12 +8,14 @@
 #include "task.h"
 #include "scheduler.h"
 #include "fiber.h"
+#include "fiber_pool.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <sys/mman.h>
 
 /* High-resolution timer */
 static inline uint64_t get_time_ns(void) {
@@ -399,9 +401,194 @@ void task_reset_registry(task_registry_t* reg) {
     if (!reg) {
         return;
     }
-    
+
     atomic_store(&reg->active_count, 0);
     atomic_store(&reg->completion_count, 0);
     atomic_store(&reg->task_count, 0);
     reg->all_done = 0;
+}
+
+/* ============================================ */
+/* Ultra-Fast Batch Spawn Implementation        */
+/* ============================================ */
+
+task_batch_fast_t* task_batch_fast_create(size_t capacity) {
+    if (capacity == 0) {
+        capacity = 256;  /* Default larger capacity for batch ops */
+    }
+
+    task_batch_fast_t* batch = (task_batch_fast_t*)calloc(1, sizeof(task_batch_fast_t));
+    if (!batch) {
+        return NULL;
+    }
+
+    batch->funcs = (void (**)(void*))calloc(capacity, sizeof(void(*)(void*)));
+    batch->args = (void**)calloc(capacity, sizeof(void*));
+    batch->fiber_ids = (uint64_t*)calloc(capacity, sizeof(uint64_t));
+
+    if (!batch->funcs || !batch->args || !batch->fiber_ids) {
+        free(batch->funcs);
+        free(batch->args);
+        free(batch->fiber_ids);
+        free(batch);
+        return NULL;
+    }
+
+    batch->capacity = capacity;
+    batch->count = 0;
+    batch->store_fiber_ids = 0;
+
+    return batch;
+}
+
+void task_batch_fast_destroy(task_batch_fast_t* batch, int free_args) {
+    if (!batch) {
+        return;
+    }
+
+    /* Optionally free argument storage (caller manages Python refs) */
+    if (free_args && batch->args) {
+        /* Args are Python objects - don't free here, caller manages */
+        /* Just clear the array */
+        memset(batch->args, 0, batch->capacity * sizeof(void*));
+    }
+
+    free(batch->funcs);
+    free(batch->args);
+    free(batch->fiber_ids);
+    free(batch);
+}
+
+int task_batch_fast_add(task_batch_fast_t* batch, void (*func)(void*), void* arg) {
+    if (!batch || !func) {
+        return -1;
+    }
+
+    /* Grow if needed */
+    if (batch->count >= batch->capacity) {
+        size_t new_capacity = batch->capacity * 2;
+
+        void (**new_funcs)(void*) = realloc(batch->funcs, new_capacity * sizeof(void(*)(void*)));
+        void** new_args = realloc(batch->args, new_capacity * sizeof(void*));
+        uint64_t* new_ids = realloc(batch->fiber_ids, new_capacity * sizeof(uint64_t));
+
+        if (!new_funcs || !new_args || !new_ids) {
+            return -1;
+        }
+
+        batch->funcs = new_funcs;
+        batch->args = new_args;
+        batch->fiber_ids = new_ids;
+        batch->capacity = new_capacity;
+    }
+
+    batch->funcs[batch->count] = func;
+    batch->args[batch->count] = arg;
+    batch->fiber_ids[batch->count] = 0;
+    batch->count++;
+
+    return 0;
+}
+
+/* Forward declaration from scheduler */
+extern scheduler_t* g_scheduler;
+uint64_t scheduler_spawn(void (*entry)(void*), void* user_data);
+
+/**
+ * Ultra-fast batch spawn - runs completely without GIL
+ * 
+ * Key optimizations:
+ * 1. All function pointers and args pre-stored in C arrays
+ * 2. Single atomic increment for active_count (batch operation)
+ * 3. No Python API calls during spawn loop
+ * 4. Minimal error checking (assumes valid input)
+ * 5. Direct fiber allocation from pool
+ */
+size_t task_batch_fast_spawn_nogil(task_batch_fast_t* batch, task_registry_t* reg) {
+    if (!batch || !reg || batch->count == 0 || !g_scheduler) {
+        return 0;
+    }
+
+    size_t spawned = 0;
+    
+    /* Pre-increment active count for ALL tasks in one atomic op */
+    atomic_fetch_add(&reg->active_count, batch->count);
+
+    /* Spawn all fibers - NO GIL needed here */
+    for (size_t i = 0; i < batch->count; i++) {
+        /* Create minimal wrapper */
+        task_wrapper_arg_t* wrapper = (task_wrapper_arg_t*)calloc(1, sizeof(task_wrapper_arg_t));
+        if (!wrapper) {
+            /* Continue on failure - best effort batch spawn */
+            atomic_fetch_sub(&reg->active_count, 1);
+            continue;
+        }
+
+        wrapper->func = batch->funcs[i];
+        wrapper->arg = batch->args[i];
+        wrapper->registry = reg;
+        wrapper->task_id = atomic_fetch_add(&reg->task_count, 1);
+
+        /* Try fiber pool first (fast path) */
+        fiber_t* f = NULL;
+        if (g_scheduler->fiber_pool) {
+            f = fiber_pool_alloc((fiber_pool_t*)g_scheduler->fiber_pool);
+        }
+
+        /* Fall back to direct allocation */
+        if (!f) {
+            f = fiber_create(batch->funcs[i], wrapper, g_scheduler->config.stack_size);
+        } else {
+            /* Initialize pooled fiber */
+            f->func = batch->funcs[i];
+            f->arg = wrapper;
+            f->parent = fiber_current();
+
+            /* Lazy stack allocation */
+            if (!f->stack_base) {
+                size_t stack_size = g_scheduler->config.stack_size > 0 ?
+                    g_scheduler->config.stack_size : FIBER_DEFAULT_STACK_SIZE;
+                f->stack_base = mmap(
+                    NULL,
+                    stack_size + 4096,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    -1,
+                    0
+                );
+                if (f->stack_base == MAP_FAILED) {
+                    fiber_pool_free((fiber_pool_t*)g_scheduler->fiber_pool, f);
+                    atomic_fetch_sub(&reg->active_count, 1);
+                    free(wrapper);
+                    continue;
+                }
+                mprotect(f->stack_base, 4096, PROT_NONE);
+                f->stack_size = stack_size;
+                f->stack_capacity = stack_size;
+                f->stack_ptr = (char*)f->stack_base + stack_size + 4096;
+            }
+        }
+
+        if (!f) {
+            atomic_fetch_sub(&reg->active_count, 1);
+            free(wrapper);
+            continue;
+        }
+
+        g_scheduler->stats.total_fibers_created++;
+
+        /* Schedule fiber */
+        int worker_id = g_scheduler->next_worker % g_scheduler->num_workers;
+        g_scheduler->next_worker++;
+        scheduler_schedule(f, worker_id);
+
+        /* Store fiber ID if requested */
+        if (batch->store_fiber_ids) {
+            batch->fiber_ids[i] = fiber_id(f);
+        }
+
+        spawned++;
+    }
+
+    return spawned;
 }
