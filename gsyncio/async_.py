@@ -44,8 +44,11 @@ def create_task(coro: Coroutine) -> Future:
     try:
         loop = asyncio.get_event_loop()
         asyncio.ensure_future(run_coro())
-    except RuntimeError:
-        pass
+    except RuntimeError as e:
+        import sys
+        print(f"Warning: Could not schedule coroutine: {e}", file=sys.stderr)
+        # Set exception on the future since coroutine won't run
+        future.set_exception(RuntimeError(f"Failed to schedule coroutine: {e}"))
     
     return future
 

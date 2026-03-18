@@ -219,9 +219,12 @@ async def select(*cases: SelectCase) -> SelectResult:
         return_when=asyncio.FIRST_COMPLETED
     )
     
-    # Cancel pending tasks
+    # Cancel pending tasks with proper awaiting
     for task in pending:
-        task.cancel()
+        try:
+            await asyncio.gather(task, return_exceptions=True)
+        except Exception:
+            pass
     
     # Get result from first completed task
     for task in done:

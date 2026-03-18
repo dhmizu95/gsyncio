@@ -88,7 +88,7 @@ except ImportError:
                 else:
                     self._callbacks.append(cb)
         
-        def __await__(self):
+        async def __await__(self):
             """Make future awaitable in asyncio context"""
             import asyncio
             if not self._done:
@@ -99,7 +99,7 @@ except ImportError:
                     event.set()
                 
                 self.add_callback(on_done)
-                yield from event.wait().__await__()
+                await event.wait()
             return self.result()
     
     class Channel:

@@ -7,6 +7,7 @@
 
 #include "channel.h"
 #include "fiber.h"
+#include "Python.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -45,7 +46,10 @@ void channel_destroy(channel_t* ch) {
     channel_item_t* item = ch->head;
     while (item) {
         channel_item_t* next = item->next;
-        /* Note: value is a Python object, should be DECREF'd by caller */
+        /* Decrement Python object reference count */
+        if (item->value != NULL) {
+            Py_DECREF(item->value);
+        }
         free(item);
         item = next;
     }

@@ -431,9 +431,11 @@ class FiberHandle:
         pass
 
 def spawn(func, *args):
-    """Spawn a new fiber/task - currently uses threading fallback"""
-    # Fallback to lightweight thread
-    # Note: Full fiber-based spawn is work in progress
+    """Spawn a new fiber/task.
+    
+    Note: Currently uses threading.Thread as a fallback.
+    Full fiber-based spawn implementation is work in progress.
+    """
     import threading
     t = threading.Thread(target=lambda: func(*args), daemon=True)
     t.start()

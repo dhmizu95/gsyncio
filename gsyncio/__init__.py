@@ -152,8 +152,8 @@ def install():
         """Event loop policy that uses gsyncio"""
         
         def new_event_loop(self):
-            # For now, return standard asyncio loop
-            # Full implementation would return gsyncio's event loop
+            # TODO: Full implementation would return gsyncio's event loop
+            # Currently returns standard asyncio loop for compatibility
             return asyncio.new_event_loop()
     
     asyncio.set_event_loop_policy(GsyncioEventLoopPolicy())

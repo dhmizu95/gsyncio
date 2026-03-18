@@ -136,12 +136,39 @@ class Future:
             self._callbacks.remove(cb)
     
     def __await__(self):
-        """Make future awaitable"""
+        """Make future awaitable - supports both sync and async contexts"""
         if not self.done:
-            # In a full implementation, this would park the fiber
-            # For now, just yield control
-            yield
-        return self.result()
+            import asyncio
+            try:
+                # Try to get running loop - if we're in async context
+                loop = asyncio.get_running_loop()
+                # We're in async context - use asyncio Future to wrap our future
+                async_fut = asyncio.Future()
+                
+                def on_done(fut):
+                    if not async_fut.done():
+                        if self._exception:
+                            async_fut.set_exception(self._exception)
+                        else:
+                            async_fut.set_result(self._future.result())
+                
+                self.add_callback(on_done)
+                yield from async_fut
+            except RuntimeError:
+                # No running event loop - we're in sync context
+                # Use threading.Event for blocking wait
+                import threading
+                event = threading.Event()
+                
+                def on_done(fut):
+                    event.set()
+                
+                self.add_callback(on_done)
+                event.wait()
+        
+        if self._exception:
+            raise self._exception
+        return self._future.result()
     
     def __iter__(self):
         """Make future iterable for yield-from syntax"""

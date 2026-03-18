@@ -45,10 +45,7 @@ def task(func: Callable, *args, **kwargs):
         Handle to the spawned task (FiberHandle or Thread)
     """
     def wrapper():
-        try:
-            func(*args, **kwargs)
-        finally:
-            pass
+        func(*args, **kwargs)
     
     t = spawn(wrapper)
     
