@@ -1,0 +1,11 @@
+gsyncio vs Go Benchmark Comparison
+==================================================
+
+Python: 3.12.3 (main, Mar  3 2026, 12:15:18) [GCC 13.3.0]
+Go: go1.22.2
+
+Results:
+Task Spawn (1000): gsyncio=164.61ms, Go=0.38ms
+Sleep (100): gsyncio=23.80ms, Go=1.00ms
+WaitGroup (10×100): gsyncio=1.11ms, Go=0.03ms
+Context Switch (10000): gsyncio=1.12ms, Go=1.00ms

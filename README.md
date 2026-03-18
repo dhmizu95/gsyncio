@@ -244,7 +244,8 @@ See the `examples/` directory for complete examples:
 - `channel_example.py` - Channel-based communication
 - `waitgroup_example.py` - WaitGroup synchronization
 - `select_example.py` - Select statement multiplexing
-- `performance_comparison.py` - Benchmark vs asyncio/threading
+
+See the `benchmarks/` directory for performance benchmarks and comparisons with Go coroutines.
 
 ## Running Tests
 
