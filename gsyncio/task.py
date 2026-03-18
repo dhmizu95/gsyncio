@@ -29,7 +29,7 @@ _scheduler_initialized = False
 
 def _task_completion_wrapper(func, args, kwargs):
     """Wrapper that handles task completion tracking.
-    
+
     This is a module-level function to avoid closure issues with fibers.
     """
     global _pending_count
@@ -104,15 +104,11 @@ def task_batch(funcs_and_args: List[tuple]):
     if not _scheduler_initialized:
         _ensure_scheduler()
 
-    # Prepare batch - optimized wrapper creation
+    # Prepare batch - use completion wrapper for proper counting
     batch = []
     for f, a in funcs_and_args:
-        # Create minimal wrapper
-        def _make_wrapper(func, args):
-            def _wrapper():
-                func(*args)
-            return _wrapper
-        batch.append((_make_wrapper(f, a), ()))
+        # Use the same completion wrapper as regular task()
+        batch.append((_task_completion_wrapper, (f, a, {})))
 
     # Single lock acquisition for entire batch
     with _tasks_lock:

@@ -329,7 +329,7 @@ cdef class Future:
         if future_set_result(self._future, <void*>result) != 0:
             Py_DECREF(result)
             raise RuntimeError("Future already completed")
-
+        
     def set_exception(self, exc):
         """Set the exception of the future"""
         Py_INCREF(exc)
@@ -533,7 +533,7 @@ cdef class TaskRegistry:
         cdef task_batch_t* batch_ptr = task_batch_create(len(tasks))
         if not batch_ptr:
             raise MemoryError("Failed to create task batch")
-        
+         
         cdef object payload
         cdef void* arg_ptr
         
@@ -606,7 +606,7 @@ cdef class TaskBatch:
         """Add a task to the batch"""
         cdef object payload
         cdef void* arg_ptr
-        
+         
         payload = (func, args)
         self._payloads.append(payload)
         Py_INCREF(payload)
@@ -649,6 +649,7 @@ cdef void _c_task_entry(void* arg) noexcept nogil:
                 # Clear payload reference
                 del payload
 
+
 cdef void _c_fiber_entry(void* arg) noexcept nogil:
     """C callback for fiber entry - arg is a Python tuple (func, args)
     
@@ -675,6 +676,13 @@ cdef void _c_fiber_entry(void* arg) noexcept nogil:
 # Global task registry
 _task_registry = None
 
+# Object pool for task payloads (reduces allocation overhead)
+cdef object _payload_pool = []
+cdef size_t _payload_pool_size = 0
+cdef size_t _PAYLOAD_POOL_MAX_SIZE = 1024
+import threading
+cdef object _payload_pool_lock = threading.Lock()  # Lock for protecting payload pool access
+
 def init_scheduler(size_t num_workers=0, size_t max_fibers=1000000, int work_stealing=1):
     """Initialize the gsyncio scheduler"""
     global _task_registry
@@ -694,6 +702,7 @@ def init_scheduler(size_t num_workers=0, size_t max_fibers=1000000, int work_ste
     # Create global task registry
     _task_registry = TaskRegistry()
 
+
 def shutdown_scheduler(int wait=1):
     """Shutdown the gsyncio scheduler"""
     global _task_registry
@@ -704,6 +713,7 @@ def shutdown_scheduler(int wait=1):
     # Reset registry for next use
     if _task_registry:
         _task_registry.reset()
+
 
 def get_scheduler_stats():
     """Get scheduler statistics"""
@@ -718,38 +728,39 @@ def get_scheduler_stats():
         'current_ready_fibers': stats.current_ready_fibers,
     }
 
-# Object pool for task payloads (reduces allocation overhead)
-cdef object _payload_pool = []
-cdef size_t _payload_pool_size = 0
-cdef size_t _PAYLOAD_POOL_MAX_SIZE = 1024
 
+# Object pool for task payloads (reduces allocation overhead)
 cdef object _get_payload(func, args):
     """Get a payload from pool or create new one"""
-    global _payload_pool, _payload_pool_size
+    global _payload_pool, _payload_pool_size, _payload_pool_lock
     
-    # Reuse from pool if available
-    if _payload_pool_size > 0:
-        payload = _payload_pool.pop()
-        _payload_pool_size -= 1
-        payload[0] = func
-        payload[1] = args
-        return payload
-    
-    # Create new payload
-    return [func, args]
+    with _payload_pool_lock:
+        # Reuse from pool if available
+        if _payload_pool_size > 0:
+            payload = _payload_pool.pop()
+            _payload_pool_size -= 1
+            payload[0] = func
+            payload[1] = args
+            return payload
+        
+        # Create new payload
+        return [func, args]
+
 
 cdef void _return_payload(payload) noexcept:
     """Return payload to pool for reuse"""
-    global _payload_pool, _payload_pool_size
+    global _payload_pool, _payload_pool_size, _payload_pool_lock
     
-    # Clear references
-    payload[0] = None
-    payload[1] = None
-    
-    # Return to pool if not full
-    if _payload_pool_size < _PAYLOAD_POOL_MAX_SIZE:
-        _payload_pool.append(payload)
-        _payload_pool_size += 1
+    with _payload_pool_lock:
+        # Clear references
+        payload[0] = None
+        payload[1] = None
+        
+        # Return to pool if not full
+        if _payload_pool_size < _PAYLOAD_POOL_MAX_SIZE:
+            _payload_pool.append(payload)
+            _payload_pool_size += 1
+
 
 def spawn(func, *args):
     """Spawn a new fiber/task - optimized with object pooling"""
@@ -768,6 +779,7 @@ def spawn(func, *args):
         _return_payload(payload)
         raise RuntimeError("Failed to spawn fiber")
     return fid
+
 
 def spawn_batch(funcs_and_args):
     """Spawn multiple tasks in a batch - optimized for bulk operations
@@ -809,6 +821,7 @@ def spawn_batch(funcs_and_args):
 
     return results
 
+
 def spawn_batch_fast(funcs_and_args):
     """Ultra-fast batch spawn - minimal error checking
 
@@ -829,50 +842,62 @@ def spawn_batch_fast(funcs_and_args):
         Py_INCREF(payload)
         scheduler_spawn(_c_fiber_entry, <void*>payload)
 
+
 def sleep_ns(uint64_t ns):
     """Sleep for nanoseconds using native timer (fast path)"""
     scheduler_sleep_ns(ns)
+
 
 def sleep_ms(int ms):
     """Sleep for milliseconds using native timer"""
     scheduler_sleep_ns(ms * 1000000)
 
+
 def sleep_us(int us):
     """Sleep for microseconds using native timer"""
     scheduler_sleep_ns(us * 1000)
+
 
 def current_fiber_id():
     """Get current fiber ID"""
     cdef fiber_t* f = fiber_current()
     return fiber_id(f) if f else 0
 
+
 def yield_execution():
     """Yield execution to scheduler"""
     fiber_yield()
+
 
 def num_workers():
     """Get number of worker threads"""
     return scheduler_num_workers()
 
+
 def check_worker_scaling():
     """Check if worker scaling is needed"""
     scheduler_check_worker_scaling()
+
 
 def set_auto_scaling(enabled):
     """Enable or disable automatic worker scaling"""
     scheduler_set_auto_scaling(1 if enabled else 0)
 
+
 def set_energy_efficient_mode(enabled):
     """Enable energy-efficient mode (fewer workers when idle)"""
     scheduler_set_energy_efficient_mode(1 if enabled else 0)
+
 
 def get_worker_utilization():
     """Get worker utilization percentage (0-100)"""
     return scheduler_get_worker_utilization()
 
+
 def get_recommended_workers():
     """Get recommended number of workers based on current workload"""
     return scheduler_get_recommended_workers()
+
 
 def task(func, *args):
     """Spawn a task using global task registry"""
@@ -881,6 +906,7 @@ def task(func, *args):
         init_scheduler()
     return _task_registry.spawn(func, *args)
 
+
 def task_batch():
     """Create a task batch for efficient bulk spawning"""
     global _task_registry
@@ -888,11 +914,13 @@ def task_batch():
         init_scheduler()
     return TaskBatch(_task_registry)
 
+
 def sync():
     """Wait for all tasks to complete"""
     global _task_registry
     if _task_registry:
         _task_registry.sync()
+
 
 def sync_timeout(float timeout_s):
     """Wait for all tasks with timeout"""
@@ -901,6 +929,7 @@ def sync_timeout(float timeout_s):
         return True
     return _task_registry.sync_timeout(timeout_s)
 
+
 def task_count():
     """Get number of active tasks"""
     global _task_registry
@@ -908,12 +937,14 @@ def task_count():
         return 0
     return _task_registry.active_count
 
+
 def task_completed_count():
     """Get number of completed tasks"""
     global _task_registry
     if not _task_registry:
         return 0
     return _task_registry.completed_count
+
 
 def run(func, *args):
     """Run a function in the gsyncio runtime"""
@@ -923,6 +954,7 @@ def run(func, *args):
         sync()
     finally:
         shutdown_scheduler(wait=True)
+
 
 # Select helper functions
 def select(*cases):
