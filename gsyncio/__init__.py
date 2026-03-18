@@ -79,6 +79,9 @@ from .task import (
     sync_timeout,
     task_count,
     run,
+    task_batch,
+    task_fast,
+    task_batch_fast,
 )
 
 # Import async/await model
@@ -181,6 +184,9 @@ __all__ = [
     'sync_timeout',
     'task_count',
     'run',
+    'task_batch',
+    'task_fast',
+    'task_batch_fast',
     
     # Async/Await model
     'create_task',
