@@ -699,6 +699,12 @@ def get_scheduler_stats():
 
 def spawn(func, *args):
     """Spawn a new fiber/task"""
+    global _task_registry
+    
+    # Initialize scheduler if not already initialized
+    if g_scheduler == NULL:
+        init_scheduler(num_workers=4)  # Default to 4 workers
+    
     cdef object payload = (func, args)
     Py_INCREF(payload)
     cdef uint64_t fid = scheduler_spawn(_c_fiber_entry, <void*>payload)
