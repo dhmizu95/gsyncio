@@ -37,6 +37,9 @@ static void process_timers(scheduler_t *sched);
 static int select_victim_adaptive(worker_t* thief);
 static void python_fiber_callback(void* arg);
 
+/* Global Python thread state for worker threads */
+static PyThreadState* g_main_thread_state = NULL;
+
 static size_t get_num_cpus(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return (n > 0) ? (size_t)n : 1;
@@ -256,7 +259,7 @@ static void* worker_thread(void* arg) {
             if (victim >= 0) {
                 f = steal_from_worker(w, victim);
             }
-            
+
             // Fall back to round-robin if adaptive failed
             if (!f) {
                 for (size_t i = 0; i < sched->num_workers; i++) {
@@ -347,7 +350,7 @@ static void* worker_thread(void* arg) {
             break;
         }
     }
-    
+
     return NULL;
 }
 
@@ -552,6 +555,10 @@ int scheduler_init(scheduler_config_t* config) {
 
     fiber_init();
 
+    /* Save main thread state for worker threads to use */
+    g_main_thread_state = PyEval_SaveThread();
+    PyEval_RestoreThread(g_main_thread_state);
+
     // Set g_scheduler BEFORE creating worker threads
     // so worker threads can access it immediately
     g_scheduler = sched;
@@ -703,13 +710,13 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
 /* ============================================ */
 
 /**
- * Python callback wrapper - acquires GIL and calls Python function
- * This is called from fiber context, so we need to manage GIL properly
+ * Python callback wrapper - called from fiber context.
+ * Acquires GIL for Python execution.
  */
 static void python_fiber_callback(void* arg) {
     python_callback_t* cb = (python_callback_t*)arg;
     if (!cb) return;
-    
+
     /* Acquire GIL for Python execution */
     PyGILState_STATE gstate = PyGILState_Ensure();
     
@@ -717,21 +724,21 @@ static void python_fiber_callback(void* arg) {
     PyObject* py_func = (PyObject*)cb->func;
     PyObject* py_args = (PyObject*)cb->args;
     PyObject* py_kwargs = cb->kwargs ? (PyObject*)cb->kwargs : NULL;
-    
+
     /* Call Python function */
     if (py_kwargs) {
         result = PyObject_Call(py_func, py_args, py_kwargs);
     } else {
         result = PyObject_CallObject(py_func, py_args);
     }
-    
+
     /* Handle exceptions */
     if (!result) {
         PyErr_Print();
     } else {
         Py_DECREF(result);
     }
-    
+
     /* Cleanup - decref the function and args */
     Py_DECREF(py_func);
     Py_DECREF(py_args);
