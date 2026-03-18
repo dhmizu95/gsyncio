@@ -82,9 +82,8 @@ struct fiber {
     /* Debug info */
     const char* name;
 
-    /* Context switching */
-    jmp_buf context;         /* Saved context for switch */
-    jmp_buf* sched_jump;     /* Jump point for yield return */
+    /* Context switching - using jmp_buf for portability */
+    jmp_buf context;
 
     /* Async/await support */
     void* waiting_on;           /* What fiber is waiting on (Future, Channel, etc.) */

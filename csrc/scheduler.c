@@ -280,10 +280,8 @@ static void* worker_thread(void* arg) {
             w->tasks_executed++;
 
             if (f->state == FIBER_NEW || f->state == FIBER_READY) {
-                jmp_buf jump_buf;
-                f->sched_jump = &jump_buf;
-
                 if (f->state == FIBER_NEW) {
+                    /* First time running this fiber - use setjmp to save entry point */
                     if (setjmp(f->context) == 0) {
                         f->state = FIBER_RUNNING;
                         f->func(f->arg);
@@ -302,17 +300,14 @@ static void* worker_thread(void* arg) {
                         }
 
                         w->current_fiber = NULL;
-                        f->sched_jump = NULL;
                         continue;
                     }
+                    /* else: fiber resumed here after yield */
                 } else {
-                    if (setjmp(f->context) == 0) {
-                        f->state = FIBER_RUNNING;
-                        longjmp(f->context, 1);
-                    }
+                    /* Resume existing fiber at its yield point */
+                    f->state = FIBER_RUNNING;
+                    longjmp(f->context, 1);
                 }
-
-                f->sched_jump = NULL;
             }
 
             w->current_fiber = NULL;
@@ -998,27 +993,30 @@ void scheduler_run(void) {
         
         if (f) {
             if (f->state == FIBER_NEW || f->state == FIBER_READY) {
-                jmp_buf jump_buf;
-                f->sched_jump = &jump_buf;
-                
-                if (setjmp(f->context) == 0) {
+                if (f->state == FIBER_NEW) {
+                    /* First time running this fiber */
                     f->state = FIBER_RUNNING;
                     f->func(f->arg);
-                    
+
                     f->state = FIBER_COMPLETED;
                     sched->stats.total_fibers_completed++;
-                    
+
+                    if (f->parent) {
+                        scheduler_schedule(f->parent, -1);
+                    }
+
                     if (f->pool) {
                         fiber_pool_free(f->pool, f);
                     } else {
                         fiber_free(f);
                     }
-                    
-                    f->sched_jump = NULL;
+
                     continue;
+                } else {
+                    /* Resume existing fiber */
+                    f->state = FIBER_RUNNING;
+                    /* Fiber will resume at its yield point */
                 }
-                
-                f->sched_jump = NULL;
             }
         } else {
             if (sched->io_uring_enabled) {
