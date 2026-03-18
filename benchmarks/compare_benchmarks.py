@@ -1,14 +1,27 @@
 #!/usr/bin/env python3
 """
-Compare gsyncio vs Go coroutines performance
+Compare asyncio vs gsyncio vs Go coroutines performance
 """
 
 import subprocess
 import sys
 import time
+import asyncio
 
-def run_python_benchmark():
-    """Run the Python gsyncio benchmark"""
+def run_asyncio_benchmark():
+    """Run the asyncio benchmark"""
+    print("Running asyncio benchmark...")
+    result = subprocess.run(
+        [sys.executable, "benchmark_asyncio.py"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd="."
+    )
+    return result.stdout
+
+def run_gsyncio_benchmark():
+    """Run the gsyncio benchmark"""
     print("Running gsyncio benchmark...")
     result = subprocess.run(
         [sys.executable, "benchmark.py"],
@@ -79,7 +92,7 @@ def main():
     print()
     
     # Run benchmarks
-    python_output = run_python_benchmark()
+    python_output = run_gsyncio_benchmark()
     go_output = run_go_benchmark()
     
     # Parse results

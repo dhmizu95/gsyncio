@@ -154,13 +154,14 @@ def install():
         def new_event_loop(self):
             # TODO: Full implementation would return gsyncio's event loop
             # Currently returns standard asyncio loop for compatibility
-            return asyncio.new_event_loop()
+            # Use parent class to avoid recursion
+            return super().new_event_loop()
     
     asyncio.set_event_loop_policy(GsyncioEventLoopPolicy())
     
     # Store original functions for restoration
     if not hasattr(asyncio, '_gsyncio_original_run'):
-        asyncio._gsyncio_original_run = asyncio.run
+        setattr(asyncio, '_gsyncio_original_run', asyncio.run)
     
     return True
 
@@ -172,8 +173,8 @@ def uninstall():
     import asyncio
     
     if hasattr(asyncio, '_gsyncio_original_run'):
-        asyncio.run = asyncio._gsyncio_original_run
-        del asyncio._gsyncio_original_run
+        asyncio.run = getattr(asyncio, '_gsyncio_original_run')
+        delattr(asyncio, '_gsyncio_original_run')
     
     asyncio.set_event_loop_policy(None)
 

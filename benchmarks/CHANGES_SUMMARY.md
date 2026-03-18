@@ -1,7 +1,7 @@
-# Summary of Changes to Remove asyncio from gsyncio
+# Summary of Changes - asyncio vs gsyncio vs Go Comparison
 
 ## Overview
-This document summarizes the changes made to remove all asyncio usage from the gsyncio library as requested.
+This document summarizes the changes made to add asyncio benchmarking and comprehensive comparison between asyncio, gsyncio, and Go coroutines.
 
 ## Files Modified
 

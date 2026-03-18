@@ -1,0 +1,32 @@
+asyncio vs gsyncio vs Go Benchmark Comparison
+============================================================
+
+Python: 3.12.3 (main, Mar  3 2026, 12:15:18) [GCC 13.3.0]
+Go: Unknown
+
+Results (in milliseconds):
+------------------------------------------------------------
+Task Spawn (1000):
+  asyncio: 3.32ms
+  gsyncio: 228.08ms
+  Go:      0.43ms
+  vs Go:   asyncio=7.6x, gsyncio=524.3x
+
+Sleep (100):
+  asyncio: 1.79ms
+  gsyncio: 26.70ms
+  Go:      1.00ms
+  vs Go:   asyncio=1.8x, gsyncio=26.7x
+
+WaitGroup (10×100):
+  asyncio: 0.31ms
+  gsyncio: 2.97ms
+  Go:      0.12ms
+  vs Go:   asyncio=2.6x, gsyncio=24.5x
+
+Context Switch (10000):
+  asyncio: 8.64ms
+  gsyncio: 3.87ms
+  Go:      1.00ms
+  vs Go:   asyncio=8.6x, gsyncio=3.9x
+
