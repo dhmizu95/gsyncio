@@ -27,6 +27,35 @@
 
 scheduler_t* g_scheduler = NULL;
 
+/* ============================================ */
+/* Lock-Free Atomic Operations Implementation  */
+/* ============================================ */
+
+uint64_t scheduler_atomic_inc_task_count(void) {
+    if (!g_scheduler) return 0;
+    return __atomic_add_fetch(&g_scheduler->stats.atomic_task_count, 1, __ATOMIC_SEQ_CST);
+}
+
+uint64_t scheduler_atomic_dec_task_count(void) {
+    if (!g_scheduler) return 0;
+    return __atomic_sub_fetch(&g_scheduler->stats.atomic_task_count, 1, __ATOMIC_SEQ_CST);
+}
+
+uint64_t scheduler_atomic_get_task_count(void) {
+    if (!g_scheduler) return 0;
+    return __atomic_load_n(&g_scheduler->stats.atomic_task_count, __ATOMIC_SEQ_CST);
+}
+
+uint64_t scheduler_atomic_inc_fibers_spawned(void) {
+    if (!g_scheduler) return 0;
+    return __atomic_add_fetch(&g_scheduler->stats.atomic_fibers_spawned, 1, __ATOMIC_SEQ_CST);
+}
+
+uint64_t scheduler_atomic_inc_fibers_completed(void) {
+    if (!g_scheduler) return 0;
+    return __atomic_add_fetch(&g_scheduler->stats.atomic_fibers_completed, 1, __ATOMIC_SEQ_CST);
+}
+
 static void* worker_thread(void* arg);
 static fiber_t* steal_from_worker(worker_t* thief, int victim_id);
 static void push_local(worker_t* w, fiber_t* f);
@@ -291,7 +320,10 @@ static void* worker_thread(void* arg) {
                         f->func(f->arg);
                         /* Fiber completed - clean up */
                         f->state = FIBER_COMPLETED;
-                        sched->stats.total_fibers_completed++;
+                        
+                        /* Lock-free atomic increment */
+                        scheduler_atomic_inc_fibers_completed();
+                        scheduler_atomic_dec_task_count();
 
                         if (f->parent) {
                             scheduler_schedule(f->parent, -1);
@@ -693,9 +725,9 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
     if (!g_scheduler || !entry) {
         return 0;
     }
-    
+
     fiber_t* f = NULL;
-    
+
     /* Try fiber pool first for faster allocation */
     if (g_scheduler->fiber_pool) {
         f = fiber_pool_alloc((fiber_pool_t*)g_scheduler->fiber_pool);
@@ -704,10 +736,10 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
             f->func = entry;
             f->arg = user_data;
             f->parent = fiber_current();
-            
+
             /* Lazy stack allocation - allocate now if needed */
             if (!f->stack_base) {
-                size_t stack_size = g_scheduler->config.stack_size > 0 ? 
+                size_t stack_size = g_scheduler->config.stack_size > 0 ?
                     g_scheduler->config.stack_size : FIBER_DEFAULT_STACK_SIZE;
                 f->stack_base = mmap(
                     NULL,
@@ -728,23 +760,25 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
             }
         }
     }
-    
+
     /* Fall back to direct allocation if pool exhausted */
     if (!f) {
         f = fiber_create(entry, user_data, g_scheduler->config.stack_size);
     }
-    
+
     if (!f) {
         return 0;
     }
-    
-    g_scheduler->stats.total_fibers_created++;
-    
+
+    /* Lock-free atomic increment */
+    scheduler_atomic_inc_fibers_spawned();
+    scheduler_atomic_inc_task_count();
+
     int worker_id = g_scheduler->next_worker % g_scheduler->num_workers;
     g_scheduler->next_worker++;
-    
+
     scheduler_schedule(f, worker_id);
-    
+
     return fiber_id(f);
 }
 

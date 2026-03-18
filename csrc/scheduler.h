@@ -155,6 +155,11 @@ typedef struct scheduler_stats {
     uint64_t current_ready_fibers;
     uint64_t total_io_submitted;
     uint64_t total_io_completed;
+    
+    /* Lock-free counters (C11 atomics) */
+    _Atomic uint64_t atomic_fibers_spawned;
+    _Atomic uint64_t atomic_fibers_completed;
+    _Atomic uint64_t atomic_task_count;
 } scheduler_stats_t;
 
 /* Batch scheduling support */
@@ -163,6 +168,38 @@ typedef struct spawn_batch {
     size_t count;
     size_t capacity;
 } spawn_batch_t;
+
+/* ============================================ */
+/* Lock-Free Task Counting (C11 atomics)       */
+/* ============================================ */
+
+/* g_scheduler is declared in scheduler.c */
+
+/**
+ * Atomically increment task count (lock-free)
+ */
+static inline uint64_t scheduler_atomic_inc_task_count(void);
+
+/**
+ * Atomically decrement task count (lock-free)
+ * Returns the new value
+ */
+static inline uint64_t scheduler_atomic_dec_task_count(void);
+
+/**
+ * Get current task count (lock-free)
+ */
+static inline uint64_t scheduler_atomic_get_task_count(void);
+
+/**
+ * Atomically increment fibers spawned (lock-free)
+ */
+static inline uint64_t scheduler_atomic_inc_fibers_spawned(void);
+
+/**
+ * Atomically increment fibers completed (lock-free)
+ */
+static inline uint64_t scheduler_atomic_inc_fibers_completed(void);
 
 typedef struct scheduler {
     worker_t* workers;

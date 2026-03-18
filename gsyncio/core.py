@@ -38,6 +38,10 @@ try:
         task_count,
         task_completed_count,
         run,
+        # Lock-free atomic operations
+        atomic_task_count,
+        atomic_inc_task_count,
+        atomic_dec_task_count,
         # Worker management
         check_worker_scaling,
         set_auto_scaling,
@@ -368,6 +372,29 @@ except ImportError:
             t = threading.Thread(target=func, args=args, daemon=True)
             t.start()
         return len(funcs_and_args)
+
+    # Lock-free atomic operations (pure Python fallback - uses simple counter)
+    _atomic_counter = 0
+    _atomic_lock = threading.Lock()
+    
+    def atomic_task_count():
+        """Get current task count (pure Python - uses lock)"""
+        with _atomic_lock:
+            return _atomic_counter
+    
+    def atomic_inc_task_count():
+        """Atomically increment task count (pure Python - uses lock)"""
+        global _atomic_counter
+        with _atomic_lock:
+            _atomic_counter += 1
+            return _atomic_counter
+    
+    def atomic_dec_task_count():
+        """Atomically decrement task count (pure Python - uses lock)"""
+        global _atomic_counter
+        with _atomic_lock:
+            _atomic_counter -= 1
+            return _atomic_counter
 
 
 __all__ = [

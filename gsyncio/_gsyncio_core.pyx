@@ -1186,3 +1186,26 @@ def select(*cases):
 
     result = sel.execute()
     return result
+
+
+# ============================================
+# Lock-Free Task Counting (C11 atomics)
+# ============================================
+cdef extern from "scheduler.h":
+    uint64_t scheduler_atomic_inc_task_count() nogil
+    uint64_t scheduler_atomic_dec_task_count() nogil
+    uint64_t scheduler_atomic_get_task_count() nogil
+    uint64_t scheduler_atomic_inc_fibers_spawned() nogil
+    uint64_t scheduler_atomic_inc_fibers_completed() nogil
+
+def atomic_task_count():
+    """Get current task count (lock-free, thread-safe)"""
+    return scheduler_atomic_get_task_count()
+
+def atomic_inc_task_count():
+    """Atomically increment task count (lock-free)"""
+    return scheduler_atomic_inc_task_count()
+
+def atomic_dec_task_count():
+    """Atomically decrement task count (lock-free)"""
+    return scheduler_atomic_dec_task_count()

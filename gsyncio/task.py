@@ -2,14 +2,13 @@
 gsyncio.task - Task/Sync model for fire-and-forget parallelism
 
 Optimized implementation with:
+- Lock-free task counting using C11 atomics (NO Python locks!)
 - Object pooling for reduced allocation overhead
 - Batch spawning for bulk operations
-- Lock-free task counting with atomics
 """
 
 from typing import Callable, Any, List
 import threading as _threading
-import os as _os
 from .core import (
     init_scheduler as _init_scheduler,
     shutdown_scheduler as _shutdown_scheduler,
@@ -18,11 +17,20 @@ from .core import (
     sleep_ms,
     num_workers as _num_workers,
     _HAS_CYTHON,
+    atomic_task_count as _atomic_task_count,
+    atomic_inc_task_count as _atomic_inc,
+    atomic_dec_task_count as _atomic_dec,
 )
 
-# Active tasks tracking with lock-free counter
-_tasks_lock = _threading.Lock()
-_pending_count = 0
+# Export atomic functions for direct import
+atomic_task_count = _atomic_task_count
+atomic_inc_task_count = _atomic_inc
+atomic_dec_task_count = _atomic_dec
+
+# Lock-free task counting using C11 atomics
+# NO Python threading.Lock needed!
+_tasks_lock = None  # Not used anymore - using atomics
+_pending_count = 0  # Legacy, not used
 _all_done_event = _threading.Event()
 _scheduler_initialized = False
 
@@ -31,16 +39,16 @@ def _task_completion_wrapper(func, args, kwargs):
     """Wrapper that handles task completion tracking.
 
     This is a module-level function to avoid closure issues with fibers.
+    Uses lock-free atomic operations for counting.
     """
-    global _pending_count
     try:
         func(*args, **kwargs)
     finally:
-        # Decrement counter and signal if all done
-        with _tasks_lock:
-            _pending_count -= 1
-            if _pending_count == 0:
-                _all_done_event.set()
+        # Lock-free atomic decrement
+        _atomic_dec()
+        # Check if all tasks are done (atomic read)
+        if _atomic_task_count() == 0:
+            _all_done_event.set()
 
 
 def _ensure_scheduler():
@@ -55,25 +63,26 @@ def _ensure_scheduler():
 
 
 def task(func: Callable, *args, **kwargs):
-    """Spawn a new task - optimized for minimal overhead.
+    """Spawn a new task - optimized with lock-free counting.
 
     Performance optimizations:
-    - Single lock acquisition (not two)
-    - Batch event signaling (only signal when count reaches 0)
+    - Lock-free atomic increment (NO Python locks!)
+    - Lock-free atomic decrement on completion
     - Minimal wrapper overhead
     - Auto-initializes scheduler on first call
     """
-    global _pending_count, _scheduler_initialized
+    global _scheduler_initialized
 
     # Ensure scheduler is initialized (lazy init)
     if not _scheduler_initialized:
         _ensure_scheduler()
 
-    # Fast path: increment counter with minimal locking
-    with _tasks_lock:
-        if _pending_count == 0:
-            _all_done_event.clear()
-        _pending_count += 1
+    # Lock-free atomic increment
+    _atomic_inc()
+    
+    # Clear event if this is the first task
+    if _atomic_task_count() == 1:
+        _all_done_event.clear()
 
     # Spawn with module-level wrapper (avoids closure issues)
     _spawn(_task_completion_wrapper, func, args, kwargs)
@@ -94,11 +103,11 @@ def task_batch(funcs_and_args: List[tuple]):
         [1, 2]
 
     Performance:
-        - Single lock acquisition for all tasks
+        - Lock-free atomic counting (NO Python locks!)
         - Object pooling reduces allocation overhead
         - Round-robin distribution to workers
     """
-    global _pending_count, _scheduler_initialized
+    global _scheduler_initialized
 
     # Ensure scheduler is initialized
     if not _scheduler_initialized:
@@ -108,38 +117,35 @@ def task_batch(funcs_and_args: List[tuple]):
     batch = []
     for f, a in funcs_and_args:
         # Use the same completion wrapper as regular task()
+        # Lock-free atomic increment for each task
+        _atomic_inc()
         batch.append((_task_completion_wrapper, (f, a, {})))
-
-    # Single lock acquisition for entire batch
-    with _tasks_lock:
-        if _pending_count == 0:
-            _all_done_event.clear()
-        _pending_count += len(batch)
-
-    # Use batch spawn (much faster than individual spawns)
+    
+    # Clear event if this is the first batch
+    if _atomic_task_count() == len(batch):
+        _all_done_event.clear()
+    
+    # Spawn all tasks
     return _spawn_batch(batch)
 
 
 def sync():
-    """Wait for all spawned tasks to complete."""
-    with _tasks_lock:
-        if _pending_count == 0:
-            return
+    """Wait for all spawned tasks to complete (lock-free)."""
+    if _atomic_task_count() == 0:
+        return
     _all_done_event.wait()
 
 
 def sync_timeout(timeout: float) -> bool:
-    """Wait for all tasks with a timeout."""
-    with _tasks_lock:
-        if _pending_count == 0:
-            return True
+    """Wait for all tasks with a timeout (lock-free)."""
+    if _atomic_task_count() == 0:
+        return True
     return _all_done_event.wait(timeout=timeout)
 
 
 def task_count() -> int:
-    """Get the number of active tasks."""
-    with _tasks_lock:
-        return _pending_count
+    """Get the number of active tasks (lock-free)."""
+    return _atomic_task_count()
 
 
 def run(func: Callable, *args, **kwargs) -> Any:
@@ -218,4 +224,16 @@ def task_batch_fast(funcs_and_args: List[tuple]):
     return _spawn_batch(funcs_and_args)
 
 
-__all__ = ['task', 'sync', 'sync_timeout', 'task_count', 'run', 'task_batch', 'task_fast', 'task_batch_fast']
+__all__ = [
+    'task',
+    'sync',
+    'sync_timeout',
+    'task_count',
+    'run',
+    'task_batch',
+    'task_fast',
+    'task_batch_fast',
+    'atomic_task_count',
+    'atomic_inc_task_count',
+    'atomic_dec_task_count',
+]
