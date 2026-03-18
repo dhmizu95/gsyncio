@@ -80,6 +80,8 @@ cdef extern from "scheduler.h":
         size_t max_fibers
         size_t stack_size
         int work_stealing
+        int backend
+        size_t io_uring_entries
     
     ctypedef struct scheduler_stats_t:
         uint64_t total_fibers_created
@@ -363,15 +365,18 @@ cdef class WaitGroup:
 def init_scheduler(size_t num_workers=0, size_t max_fibers=1000000, int work_stealing=1):
     """Initialize the gsyncio scheduler"""
     cdef scheduler_config_t config
-    config.num_workers = num_workers if num_workers > 0 else 0  # 0 = auto-detect
+    # Use 0 to trigger auto-detection in C code
+    config.num_workers = num_workers
     config.max_fibers = max_fibers
-    config.stack_size = 8192  # 8KB default
+    config.stack_size = 2048  # 2KB default (like Go)
     config.work_stealing = work_stealing
+    config.backend = 0
+    config.io_uring_entries = 256
     
     if scheduler_init(&config) != 0:
         raise RuntimeError("Failed to initialize scheduler")
     
-    fiber_init()
+    # fiber_init is called inside scheduler_init
 
 def shutdown_scheduler(int wait=1):
     """Shutdown the gsyncio scheduler"""
@@ -408,12 +413,16 @@ def spawn(func, *args):
     global _fiber_wrapper_func, _fiber_wrapper_args
     
     # Check if scheduler is initialized and has workers
-    if scheduler_num_workers() > 0:
-        _fiber_wrapper_func = func
-        _fiber_wrapper_args = args
-        fid = scheduler_spawn(_c_fiber_entry, NULL)
-        if fid > 0:
-            return fid
+    try:
+        nw = num_workers()
+        if nw > 0:
+            _fiber_wrapper_func = func
+            _fiber_wrapper_args = args
+            fid = scheduler_spawn(_c_fiber_entry, NULL)
+            if fid > 0:
+                return fid
+    except:
+        pass
     
     # Fallback to lightweight thread
     import threading
