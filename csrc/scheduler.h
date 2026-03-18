@@ -36,6 +36,7 @@ typedef struct worker {
     uint64_t tasks_executed;/* Number of tasks executed */
     uint64_t steals_attempted;
     uint64_t steals_successful;
+    int last_victim;       /* Last victim for work stealing */
 } worker_t;
 
 /* Scheduler configuration */

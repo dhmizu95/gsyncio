@@ -50,6 +50,7 @@ C_SOURCES = [
     str(CSRC_DIR / 'channel.c'),
     str(CSRC_DIR / 'waitgroup.c'),
     str(CSRC_DIR / 'select.c'),
+    str(CSRC_DIR / 'evloop.c'),
 ]
 
 # Compiler flags
