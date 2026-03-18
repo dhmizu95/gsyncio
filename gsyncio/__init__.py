@@ -125,71 +125,6 @@ from .future import (
 Future = _Future
 ensure_future = _ensure_future
 
-# Monkey-patching for asyncio compatibility
-def install():
-    """
-    Install gsyncio as the default event loop policy.
-    
-    This replaces asyncio's event loop with gsyncio's fiber-based
-    implementation, providing better performance for asyncio-based
-    code without any code changes.
-    
-    Usage:
-        import gsyncio
-        gsyncio.install()
-        
-        import asyncio
-        
-        async def main():
-            await asyncio.sleep(1)
-            return "done"
-        
-        result = asyncio.run(main())
-    """
-    import asyncio
-    
-    class GsyncioEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
-        """Event loop policy that uses gsyncio"""
-        
-        def new_event_loop(self):
-            # TODO: Full implementation would return gsyncio's event loop
-            # Currently returns standard asyncio loop for compatibility
-            # Use parent class to avoid recursion
-            return super().new_event_loop()
-    
-    asyncio.set_event_loop_policy(GsyncioEventLoopPolicy())
-    
-    # Store original functions for restoration
-    if not hasattr(asyncio, '_gsyncio_original_run'):
-        setattr(asyncio, '_gsyncio_original_run', asyncio.run)
-    
-    return True
-
-
-def uninstall():
-    """
-    Restore the default asyncio event loop policy.
-    """
-    import asyncio
-    
-    if hasattr(asyncio, '_gsyncio_original_run'):
-        asyncio.run = getattr(asyncio, '_gsyncio_original_run')
-        delattr(asyncio, '_gsyncio_original_run')
-    
-    asyncio.set_event_loop_policy(None)
-
-
-def is_installed() -> bool:
-    """
-    Check if gsyncio is installed as the event loop policy.
-    
-    Returns:
-        True if gsyncio is installed
-    """
-    import asyncio
-    policy = asyncio.get_event_loop_policy()
-    return policy.__class__.__name__ == 'GsyncioEventLoopPolicy'
-
 
 # Public API
 __all__ = [
@@ -254,9 +189,4 @@ __all__ = [
     
     # Future utilities
     'is_future',
-    
-    # Monkey-patching
-    'install',
-    'uninstall',
-    'is_installed',
 ]

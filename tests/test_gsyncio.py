@@ -319,29 +319,5 @@ class TestScheduler:
         assert n > 0
 
 
-class TestMonkeyPatch:
-    """Tests for asyncio monkey-patching"""
-    
-    def test_install_uninstall(self):
-        """Test install and uninstall"""
-        import asyncio
-        
-        # Store original
-        original_policy = asyncio.get_event_loop_policy()
-        
-        try:
-            # Install
-            gs.install()
-            assert gs.is_installed()
-            
-            # Uninstall
-            gs.uninstall()
-            assert not gs.is_installed()
-        
-        finally:
-            # Restore
-            asyncio.set_event_loop_policy(original_policy)
-
-
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
