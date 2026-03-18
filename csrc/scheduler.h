@@ -12,42 +12,137 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <sys/socket.h>
+
+#ifdef __linux__
+#include "io_uring.h"
+#include "evloop.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Double-ended queue (deque) for work-stealing */
+typedef enum {
+    SCHEDULER_BACKEND_DEFAULT = 0,
+    SCHEDULER_BACKEND_EPOLL = 1,
+    SCHEDULER_BACKEND_IOURING = 2
+} scheduler_backend_t;
+
+typedef enum {
+    IO_OP_READ = 0,
+    IO_OP_WRITE = 1,
+    IO_OP_ACCEPT = 2,
+    IO_OP_CONNECT = 3,
+    IO_OP_POLL_ADD = 4,
+    IO_OP_SEND = 5,
+    IO_OP_RECV = 6,
+    IO_OP_TIMEOUT = 7
+} io_operation_type_t;
+
+typedef struct io_request io_request_t;
+
+typedef void (*io_completion_callback_t)(io_request_t *req, int64_t result);
+
+struct io_request {
+    fiber_t *fiber;
+    int fd;
+    io_operation_type_t op;
+    void *buf;
+    const void *write_buf;
+    size_t len;
+    int64_t offset;
+    struct sockaddr *addr;
+    socklen_t addrlen;
+    uint64_t user_data;
+    io_completion_callback_t completion;
+    void *completion_arg;
+    int64_t result;
+    bool completed;
+    io_request_t *next;
+};
+
+typedef struct io_poller {
+    int fd;
+    uint32_t events;
+    fiber_t *waiting_fiber;
+    struct io_poller *next;
+} io_poller_t;
+
+typedef struct io_uring_submission io_uring_submission_t;
+
+struct io_uring_submission {
+    uint64_t user_data;
+    io_operation_type_t op;
+    int fd;
+    void *buf;
+    size_t len;
+    int64_t offset;
+    fiber_t *fiber;
+    io_uring_submission_t *next;
+};
+
+typedef struct timer_node timer_node_t;
+
+struct timer_node {
+    uint64_t deadline_ns;
+    fiber_t *fiber;
+    timer_node_t *next;
+    bool active;
+};
+
+typedef struct pending_io pending_io_t;
+
+struct pending_io {
+    int fd;
+    uint32_t events;
+    fiber_t *fiber;
+    pending_io_t *next;
+};
+
+typedef struct io_bucket {
+    pending_io_t *head;
+    pending_io_t *tail;
+    int count;
+} io_bucket_t;
+
+#define FD_TABLE_SIZE 65536
+
+typedef struct {
+    fiber_t *fiber;
+    uint32_t events;
+    bool active;
+} fd_entry_t;
+
 typedef struct deque {
     fiber_t** data;
     size_t capacity;
-    size_t top;     /* Index for local push/pop (LIFO) */
-    size_t bottom;  /* Index for steal (FIFO from other end) */
+    size_t top;
+    size_t bottom;
 } deque_t;
 
-/* Worker thread state */
 typedef struct worker {
-    int id;                 /* Worker ID */
-    deque_t* deque;         /* Local work deque */
-    fiber_t* current_fiber; /* Currently executing fiber */
-    bool running;           /* Is worker running */
-    bool stopped;           /* Should worker stop */
-    pthread_t thread;       /* Thread handle */
-    uint64_t tasks_executed;/* Number of tasks executed */
+    int id;
+    deque_t* deque;
+    fiber_t* current_fiber;
+    bool running;
+    bool stopped;
+    pthread_t thread;
+    uint64_t tasks_executed;
     uint64_t steals_attempted;
     uint64_t steals_successful;
-    int last_victim;       /* Last victim for work stealing */
+    int last_victim;
 } worker_t;
 
-/* Scheduler configuration */
 typedef struct scheduler_config {
-    size_t num_workers;     /* Number of worker threads (default: CPU cores) */
-    size_t max_fibers;      /* Maximum concurrent fibers */
-    size_t stack_size;      /* Default fiber stack size */
-    bool work_stealing;     /* Enable work stealing */
+    size_t num_workers;
+    size_t max_fibers;
+    size_t stack_size;
+    bool work_stealing;
+    scheduler_backend_t backend;
+    size_t io_uring_entries;
 } scheduler_config_t;
 
-/* Scheduler statistics */
 typedef struct scheduler_stats {
     uint64_t total_fibers_created;
     uint64_t total_fibers_completed;
@@ -55,128 +150,87 @@ typedef struct scheduler_stats {
     uint64_t total_work_steals;
     uint64_t current_active_fibers;
     uint64_t current_ready_fibers;
+    uint64_t total_io_submitted;
+    uint64_t total_io_completed;
 } scheduler_stats_t;
 
-/* Main scheduler structure */
 typedef struct scheduler {
-    worker_t* workers;          /* Array of worker threads */
-    size_t num_workers;         /* Number of workers */
-    size_t next_worker;         /* Round-robin index for new tasks */
+    worker_t* workers;
+    size_t num_workers;
+    size_t next_worker;
     
-    fiber_t* ready_queue;       /* Global ready queue (fallback) */
-    fiber_t* blocked_queue;     /* Blocked fibers (I/O, channels, etc.) */
+    fiber_t* ready_queue;
+    fiber_t* blocked_queue;
     
-    scheduler_config_t config;  /* Configuration */
-    scheduler_stats_t stats;    /* Statistics */
+    scheduler_config_t config;
+    scheduler_stats_t stats;
     
-    bool running;               /* Is scheduler running */
-    bool initialized;           /* Is scheduler initialized */
+    bool running;
+    bool initialized;
     
-    /* Synchronization */
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     
-    /* Fiber pool for reuse */
     void* fiber_pool;
+    
+    scheduler_backend_t backend;
+    
+#ifdef __linux__
+    io_uring_t io_uring_ring;
+    bool io_uring_enabled;
+    io_uring_submission_t *pending_submissions;
+    pthread_mutex_t io_uring_mutex;
+#endif
+    
+    fd_entry_t *fd_table;
+    size_t fd_table_size;
+    
+    io_poller_t *pollers;
+    pthread_mutex_t pollers_mutex;
+    
+    timer_node_t *timers;
+    pthread_mutex_t timers_mutex;
+    
+    uint64_t current_time_ns;
 } scheduler_t;
 
-/* Global scheduler instance */
 extern scheduler_t* g_scheduler;
 
-/* Scheduler API */
-
-/**
- * Initialize the scheduler
- * @param config Configuration (NULL for defaults)
- * @return 0 on success, -1 on error
- */
 int scheduler_init(scheduler_config_t* config);
-
-/**
- * Shutdown the scheduler
- * @param wait_for_completion Wait for all fibers to complete
- */
 void scheduler_shutdown(bool wait_for_completion);
-
-/**
- * Get the global scheduler instance
- * @return Scheduler instance
- */
 scheduler_t* scheduler_get(void);
 
-/**
- * Spawn a new fiber/task
- * @param entry Entry point function
- * @param user_data User data
- * @return Fiber ID, or 0 on error
- */
 uint64_t scheduler_spawn(void (*entry)(void*), void* user_data);
-
-/**
- * Schedule a fiber for execution
- * @param f Fiber to schedule
- * @param worker_id Target worker (-1 for any)
- */
 void scheduler_schedule(fiber_t* f, int worker_id);
 
-/**
- * Block the current fiber
- * @param reason Block reason (I/O, channel, etc.)
- */
 void scheduler_block(void* reason);
-
-/**
- * Unblock a fiber
- * @param f Fiber to unblock
- */
 void scheduler_unblock(fiber_t* f);
-
-/**
- * Yield the current fiber
- */
 void scheduler_yield(void);
-
-/**
- * Wait for a fiber to complete
- * @param f Fiber to wait for
- */
 void scheduler_wait(fiber_t* f);
-
-/**
- * Wait for all fibers to complete
- */
 void scheduler_wait_all(void);
 
-/**
- * Get scheduler statistics
- * @param stats Output statistics
- */
 void scheduler_get_stats(scheduler_stats_t* stats);
-
-/**
- * Get current worker ID
- * @return Worker ID, or -1 if not in worker context
- */
 int scheduler_current_worker(void);
-
-/**
- * Get number of worker threads
- * @return Number of workers
- */
 size_t scheduler_num_workers(void);
 
-/**
- * Run the scheduler main loop (called from main thread)
- */
 void scheduler_run(void);
-
-/**
- * Stop the scheduler
- */
 void scheduler_stop(void);
+
+void scheduler_set_backend(scheduler_backend_t backend);
+scheduler_backend_t scheduler_get_backend(void);
+
+int scheduler_submit_io(io_request_t *req);
+int scheduler_wait_io(int fd, uint32_t events, int64_t timeout_ns);
+void scheduler_wake_io(int fd, uint32_t events);
+
+int scheduler_add_timer(uint64_t deadline_ns, fiber_t *fiber);
+void scheduler_cancel_timer(fiber_t *fiber);
+
+int scheduler_register_fd(int fd, fiber_t *fiber, uint32_t events);
+void scheduler_unregister_fd(int fd);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* SCHEDULER_H */
+#endif
