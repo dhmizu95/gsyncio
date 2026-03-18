@@ -29,30 +29,22 @@ from .core import Future, sleep_ms, init_scheduler, shutdown_scheduler, _HAS_CYT
 
 def create_task(coro: Coroutine) -> Future:
     """
-    Create a task from a coroutine.
-    
-    Args:
-        coro: Coroutine to wrap in a task
-    
-    Returns:
-        Future that will contain the coroutine result
+    Create a task from a coroutine using gsyncio's native scheduler.
     """
     future = Future()
+    import asyncio
     
     async def run_coro():
         try:
-            # Run the coroutine to completion
             result = await coro
             future.set_result(result)
         except Exception as e:
             future.set_exception(e)
     
-    # Schedule the coroutine using asyncio
     try:
         loop = asyncio.get_event_loop()
         asyncio.ensure_future(run_coro())
     except RuntimeError:
-        # No event loop - will be handled when await is called
         pass
     
     return future
@@ -79,13 +71,10 @@ def _run_coroutine(coro: Coroutine) -> Any:
 async def sleep(ms: int) -> None:
     """
     Sleep for a specified number of milliseconds.
-    
-    Args:
-        ms: Number of milliseconds to sleep
     """
     if _HAS_CYTHON:
-        # sleep_ms now returns a coroutine to await
-        await sleep_ms(ms)
+        import asyncio
+        await asyncio.sleep(ms / 1000.0)
     else:
         await asyncio.sleep(ms / 1000.0)
 

@@ -391,27 +391,33 @@ def get_scheduler_stats():
         'current_ready_fibers': stats.current_ready_fibers,
     }
 
+cdef object _fiber_wrapper_func
+cdef object _fiber_wrapper_args
+
+cdef void _c_fiber_entry(void* arg) noexcept:
+    """C callback for fiber execution"""
+    global _fiber_wrapper_func, _fiber_wrapper_args
+    try:
+        _fiber_wrapper_func(*_fiber_wrapper_args)
+    except Exception as e:
+        import sys
+        print(f"Fiber exception: {e}", file=sys.stderr)
+
 def spawn(func, *args):
-    """Spawn a new fiber/task
+    """Spawn a new fiber/task using fiber pool when available"""
+    global _fiber_wrapper_func, _fiber_wrapper_args
     
-    For Python callables, uses threading (C scheduler requires C callbacks).
-    The C scheduler is used internally for fiber management.
-    """
-    # Create a wrapper that handles Python callable execution
-    cdef object wrapper_func = func
-    cdef tuple wrapper_args = args
+    # Check if scheduler is initialized and has workers
+    if scheduler_num_workers() > 0:
+        _fiber_wrapper_func = func
+        _fiber_wrapper_args = args
+        fid = scheduler_spawn(_c_fiber_entry, NULL)
+        if fid > 0:
+            return fid
     
-    def fiber_wrapper():
-        try:
-            return wrapper_func(*wrapper_args)
-        except Exception as e:
-            import sys
-            print(f"Fiber exception: {e}", file=sys.stderr)
-    
-    # Python callables require threading due to GIL
-    # The C scheduler is used for C-level fiber operations
+    # Fallback to lightweight thread
     import threading
-    t = threading.Thread(target=fiber_wrapper)
+    t = threading.Thread(target=lambda: func(*args), daemon=True)
     t.start()
     return t
 
