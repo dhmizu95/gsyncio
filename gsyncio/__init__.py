@@ -55,6 +55,7 @@ from .core import (
     shutdown_scheduler,
     get_scheduler_stats,
     spawn,
+    spawn_direct,
     spawn_batch,
     spawn_batch_fast,
     spawn_batch_ultra_fast,
@@ -76,6 +77,7 @@ from .core import (
 # Import task/sync model
 from .task import (
     task,
+    task_direct,
     sync,
     sync_timeout,
     task_count,
@@ -162,6 +164,7 @@ __all__ = [
     'shutdown_scheduler',
     'get_scheduler_stats',
     'spawn',
+    'spawn_direct',
     'spawn_batch',
     'spawn_batch_fast',
     'spawn_batch_ultra_fast',
@@ -182,6 +185,7 @@ __all__ = [
     
     # Task/Sync model
     'task',
+    'task_direct',
     'sync',
     'sync_timeout',
     'task_count',

@@ -22,6 +22,7 @@ try:
         shutdown_scheduler,
         get_scheduler_stats,
         spawn,
+        spawn_direct,
         spawn_batch,
         spawn_batch_fast,
         spawn_batch_ultra_fast,

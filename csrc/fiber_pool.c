@@ -20,7 +20,7 @@
 #define FIBER_POOL_INITIAL_SIZE 4096     /* Pre-allocate 4K fibers */
 #define FIBER_POOL_GROWTH_FACTOR 2
 #define FIBER_POOL_MAX_SIZE (1024 * 1024)  /* 1M fibers */
-#define FIBER_POOL_LAZY_STACK 1         /* Lazy stack allocation */
+#define FIBER_POOL_LAZY_STACK 0         /* Pre-allocate stacks at pool creation */
 
 /* ============================================ */
 /* Fiber Pool Implementation                   */
@@ -156,8 +156,18 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool) {
     fiber_t* fiber = pool->free_list[pool->available];
     pool->allocated++;
     
-    /* Reset fiber state */
+    /* Reset fiber state (preserve pre-allocated stack) */
+    void* saved_stack_base = fiber->stack_base;
+    size_t saved_stack_capacity = fiber->stack_capacity;
+    char* saved_stack_ptr = fiber->stack_ptr;
+    
     memset(fiber, 0, sizeof(fiber_t));
+    
+    /* Restore pre-allocated stack */
+    fiber->stack_base = saved_stack_base;
+    fiber->stack_capacity = saved_stack_capacity;
+    fiber->stack_ptr = saved_stack_ptr;
+    
     fiber->id = pool->allocated;  /* Unique ID */
     fiber->pool = pool;
     fiber->state = FIBER_NEW;
@@ -173,6 +183,17 @@ void fiber_pool_free(fiber_pool_t* pool, fiber_t* fiber) {
     }
     
     pthread_mutex_lock(&pool->mutex);
+    
+    /* Reset fiber state for reuse (keep pre-allocated stack) */
+    fiber->state = FIBER_NEW;
+    fiber->func = NULL;
+    fiber->arg = NULL;
+    fiber->result = NULL;
+    fiber->parent = NULL;
+    fiber->next_ready = NULL;
+    fiber->prev_ready = NULL;
+    fiber->affinity = 0;
+    fiber->waiting_on = NULL;
     
     /* Return to free list */
     pool->free_list[pool->available] = fiber;
