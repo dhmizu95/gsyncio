@@ -25,7 +25,62 @@
 #include "io_uring.h"
 #endif
 
+/* Fast sleep threshold: use spin-wait for sleeps under this value (1ms) */
+#define FAST_SLEEP_THRESHOLD_NS 1000000ULL
+
+/* Spin count before yielding in fast sleep */
+#define FAST_SLEEP_SPIN_COUNT 1000
+
 scheduler_t* g_scheduler = NULL;
+
+/* Pre-allocated timer pool for lock-free timer allocation */
+typedef struct timer_pool {
+    timer_node_t* nodes;
+    _Atomic timer_node_t* free_list;
+    size_t capacity;
+} timer_pool_t;
+
+static timer_pool_t g_timer_pool;
+
+static void timer_pool_init(size_t capacity) {
+    g_timer_pool.capacity = capacity;
+    g_timer_pool.nodes = (timer_node_t*)calloc(capacity, sizeof(timer_node_t));
+    atomic_store(&g_timer_pool.free_list, NULL);
+    
+    /* Pre-populate free list */
+    for (size_t i = 0; i < capacity; i++) {
+        atomic_store(&g_timer_pool.nodes[i].next, atomic_load(&g_timer_pool.free_list));
+        atomic_store(&g_timer_pool.free_list, &g_timer_pool.nodes[i]);
+    }
+}
+
+static timer_node_t* timer_pool_alloc(void) {
+    timer_node_t* node = atomic_load(&g_timer_pool.free_list);
+    while (node != NULL) {
+        timer_node_t* next = atomic_load(&node->next);
+        if (atomic_compare_exchange_weak(&g_timer_pool.free_list, &node, next)) {
+            return node;
+        }
+        node = atomic_load(&g_timer_pool.free_list);
+    }
+    /* Pool exhausted - fall back to malloc */
+    return (timer_node_t*)malloc(sizeof(timer_node_t));
+}
+
+static void timer_pool_free(timer_node_t* node) {
+    if (!node) return;
+    
+    /* Check if node is from pool */
+    if (node >= g_timer_pool.nodes && node < g_timer_pool.nodes + g_timer_pool.capacity) {
+        atomic_store(&node->next, atomic_load(&g_timer_pool.free_list));
+        while (!atomic_compare_exchange_weak(&g_timer_pool.free_list, 
+            &(timer_node_t*){atomic_load(&g_timer_pool.free_list)}, node)) {
+            /* spin */
+        }
+    } else {
+        free(node);
+    }
+}
 
 /* ============================================ */
 /* Lock-Free Atomic Operations Implementation  */
@@ -207,7 +262,7 @@ static void process_timers(scheduler_t *sched) {
     while (node) {
         if (node->active && node->deadline_ns <= now) {
             /* Timer expired - wake the fiber */
-            *prev = node->next;
+            *prev = atomic_load(&node->next);
 
             node->fiber->state = FIBER_READY;
             node->fiber->waiting_on = NULL;
@@ -216,13 +271,13 @@ static void process_timers(scheduler_t *sched) {
             scheduler_schedule(node->fiber, -1);
 
             timer_node_t *to_free = node;
-            node = node->next;
-            free(to_free);
+            node = atomic_load(&node->next);
+            timer_pool_free(to_free);
 
             sched->stats.total_context_switches++;
         } else {
             prev = &node->next;
-            node = node->next;
+            node = atomic_load(&node->next);
         }
     }
 
@@ -235,17 +290,34 @@ static void process_timers(scheduler_t *sched) {
 
 /**
  * Native sleep - puts current fiber to sleep for specified nanoseconds
- * This is much faster than asyncio-based sleep (target: <10 µs overhead)
+ * 
+ * Optimizations:
+ * - Fast spin-wait for short sleeps (<1ms) - avoids context switch overhead
+ * - Pre-allocated timer pool - avoids malloc in hot path
+ * - Proper fiber yielding - fiber actually sleeps until timer expires
  */
 void scheduler_sleep_ns(uint64_t ns) {
     fiber_t* current = fiber_current();
     if (!current) {
         return;  /* Not in fiber context - return immediately */
     }
-
+    
+    /* Fast path: spin-wait for short sleeps */
+    if (ns < FAST_SLEEP_THRESHOLD_NS) {
+        uint64_t deadline = get_time_ns() + ns;
+        for (int i = 0; i < FAST_SLEEP_SPIN_COUNT; i++) {
+            if (get_time_ns() >= deadline) {
+                return;  /* Sleep completed */
+            }
+            __asm__ __volatile__("" ::: "memory");
+        }
+        /* Fall through to timer-based sleep if spin didn't complete */
+    }
+    
+    /* Slow path: use timer and yield */
     uint64_t deadline = get_time_ns() + ns;
 
-    timer_node_t* node = (timer_node_t*)malloc(sizeof(timer_node_t));
+    timer_node_t* node = timer_pool_alloc();
     if (!node) {
         /* Fallback - just yield if we can't allocate timer */
         fiber_yield();
@@ -255,19 +327,20 @@ void scheduler_sleep_ns(uint64_t ns) {
     node->deadline_ns = deadline;
     node->fiber = current;
     node->active = true;
-    node->next = NULL;
+    atomic_store(&node->next, NULL);
 
     /* Mark fiber as waiting and add timer */
     current->state = FIBER_WAITING;
     current->waiting_on = node;
 
+    /* Add to timer list (lock-free push) */
     pthread_mutex_lock(&g_scheduler->timers_mutex);
-    node->next = g_scheduler->timers;
+    atomic_store(&node->next, g_scheduler->timers);
     g_scheduler->timers = node;
     pthread_mutex_unlock(&g_scheduler->timers_mutex);
 
-    /* Fiber is now waiting for timer.
-     * Worker will pick a different fiber on next iteration. */
+    /* CRITICAL: Actually yield the fiber to the scheduler */
+    fiber_yield();
 }
 
 static void* worker_thread(void* arg) {
@@ -606,6 +679,9 @@ int scheduler_init(scheduler_config_t* config) {
 
     sched->fiber_pool = fiber_pool_create(sched->config.max_fibers);
     
+    /* Initialize timer pool for fast sleep allocation */
+    timer_pool_init(8192);  /* Support up to 8192 concurrent timers */
+    
     sched->ready_queue = NULL;
     sched->blocked_queue = NULL;
     
@@ -712,6 +788,20 @@ void scheduler_shutdown(bool wait_for_completion) {
         }
     }
 #endif
+    
+    /* Clean up remaining timers */
+    timer_node_t* node = sched->timers;
+    while (node) {
+        timer_node_t* next = atomic_load(&node->next);
+        timer_pool_free(node);
+        node = next;
+    }
+    
+    /* Free timer pool nodes array */
+    if (g_timer_pool.nodes) {
+        free(g_timer_pool.nodes);
+        g_timer_pool.nodes = NULL;
+    }
     
     fiber_pool_destroy(sched->fiber_pool);
     worker_manager_shutdown(&sched->worker_manager);
