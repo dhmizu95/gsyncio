@@ -779,8 +779,9 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
     scheduler_atomic_inc_fibers_spawned();
     scheduler_atomic_inc_task_count();
 
-    int worker_id = g_scheduler->next_worker % g_scheduler->num_workers;
-    g_scheduler->next_worker++;
+    /* Atomic round-robin worker selection */
+    size_t worker_idx = atomic_fetch_add(&g_scheduler->next_worker, 1) % g_scheduler->num_workers;
+    int worker_id = (int)worker_idx;
 
     scheduler_schedule(f, worker_id);
 
@@ -929,8 +930,9 @@ void scheduler_spawn_batch_submit(spawn_batch_t* batch) {
         fiber_t* f = batch->fibers[i];
         if (!f) continue;
         
-        int worker_id = sched->next_worker % sched->num_workers;
-        sched->next_worker++;
+        /* Atomic round-robin worker selection */
+        size_t worker_idx = atomic_fetch_add(&sched->next_worker, 1) % sched->num_workers;
+        int worker_id = (int)worker_idx;
         
         worker_t* w = &sched->workers[worker_id];
         push_local(w, f);

@@ -22,11 +22,12 @@ extern "C" {
 
 typedef struct fiber_pool {
     fiber_t* fibers;           /* Array of fiber control blocks */
-    fiber_t** free_list;       /* Free list for O(1) allocation */
+    _Atomic(void*) free_list;  /* Lock-free free list head */
+    void* _nodes;              /* Node array for lock-free list */
     size_t capacity;           /* Total capacity */
-    size_t available;          /* Available fibers */
-    size_t allocated;          /* Currently allocated */
-    pthread_mutex_t mutex;     /* Thread safety */
+    _Atomic size_t available;   /* Available fibers (atomic) */
+    _Atomic size_t allocated;   /* Currently allocated (atomic) */
+    pthread_mutex_t mutex;     /* Mutex for pool growth only */
 } fiber_pool_t;
 
 /* ============================================ */

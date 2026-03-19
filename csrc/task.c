@@ -577,9 +577,9 @@ size_t task_batch_fast_spawn_nogil(task_batch_fast_t* batch, task_registry_t* re
 
         g_scheduler->stats.total_fibers_created++;
 
-        /* Schedule fiber */
-        int worker_id = g_scheduler->next_worker % g_scheduler->num_workers;
-        g_scheduler->next_worker++;
+        /* Schedule fiber with atomic round-robin */
+        size_t worker_idx = atomic_fetch_add(&g_scheduler->next_worker, 1) % g_scheduler->num_workers;
+        int worker_id = (int)worker_idx;
         scheduler_schedule(f, worker_id);
 
         /* Store fiber ID if requested */

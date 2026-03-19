@@ -190,7 +190,7 @@ int scheduler_atomic_all_tasks_complete(void);
 typedef struct scheduler {
     worker_t* workers;
     size_t num_workers;
-    size_t next_worker;
+    _Atomic size_t next_worker;  /* Atomic round-robin worker selection */
 
     fiber_t* ready_queue;
     fiber_t* blocked_queue;

@@ -27,7 +27,7 @@ def benchmark_task_spawn(num_tasks=1000):
         elapsed = time.time() - start
         return elapsed
 
-    gsyncio.init_scheduler()
+    gsyncio.init_scheduler(num_workers=4, max_fibers=100000)
     elapsed = main()
     gsyncio.shutdown_scheduler(wait=True)
 
@@ -53,7 +53,7 @@ def benchmark_gsyncio_sleep(num_tasks=100):
         elapsed = time.time() - start
         return elapsed
     
-    gsyncio.init_scheduler()
+    gsyncio.init_scheduler(num_workers=4, max_fibers=100000)
     elapsed = main()
     gsyncio.shutdown_scheduler(wait=True)
     
@@ -84,7 +84,7 @@ def benchmark_waitgroup(num_workers=10):
         elapsed = time.time() - start
         return elapsed, counter[0]
 
-    gsyncio.init_scheduler()
+    gsyncio.init_scheduler(num_workers=4, max_fibers=100000)
     elapsed, count = run_benchmark()
     gsyncio.shutdown_scheduler(wait=True)
 
@@ -111,7 +111,7 @@ def benchmark_context_switch(num_yields=10000):
         elapsed = time.time() - start
         return elapsed
 
-    gsyncio.init_scheduler()
+    gsyncio.init_scheduler(num_workers=4, max_fibers=100000)
     elapsed = run_benchmark()
     gsyncio.shutdown_scheduler(wait=True)
     
