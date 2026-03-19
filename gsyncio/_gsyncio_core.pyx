@@ -693,7 +693,7 @@ cdef void _c_task_entry(void* arg) noexcept nogil:
 
 cdef void _c_fiber_entry(void* arg) noexcept nogil:
     """C callback for fiber entry - arg is a Python tuple (func, args)
-    
+
     Optimized for performance - minimal overhead in hot path.
     """
     if arg != NULL:
@@ -724,7 +724,7 @@ cdef size_t _PAYLOAD_POOL_MAX_SIZE = 1024
 import threading
 cdef object _payload_pool_lock = threading.Lock()  # Lock for protecting payload pool access
 
-def init_scheduler(size_t num_workers=0, size_t max_fibers=1000000, int work_stealing=1):
+def init_scheduler(size_t num_workers=0, size_t max_fibers=65536, int work_stealing=1):
     """Initialize the gsyncio scheduler"""
     global _task_registry
     cdef scheduler_config_t config
@@ -879,7 +879,7 @@ def spawn_batch(funcs_and_args):
     Example:
         >>> spawn_batch([(func1, (arg1,)), (func2, (arg2,))])
         [1, 2]
-    
+
     Note: Due to Python's GIL, batch-spawned tasks may not all complete.
           For reliable execution, use individual spawn() calls.
     """

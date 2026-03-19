@@ -144,6 +144,13 @@ void fiber_resume(fiber_t* fiber);
 fiber_t* fiber_current(void);
 
 /**
+ * Add fiber to tracking table
+ * @param f Fiber to add
+ * @return 0 on success, -1 on failure
+ */
+int fiber_table_add(fiber_t* f);
+
+/**
  * Switch to another fiber
  * @param from Fiber to switch from
  * @param to Fiber to switch to

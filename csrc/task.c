@@ -96,13 +96,13 @@ void task_wrapper(void* arg) {
     /* Mark task as completed - atomic increment */
     if (wrapper->registry) {
         task_registry_t* reg = wrapper->registry;
-        
+
         /* Atomic increment of completion count */
-        uint64_t completed = atomic_fetch_add(&reg->completion_count, 1) + 1;
-        
+        atomic_fetch_add(&reg->completion_count, 1);
+
         /* Atomic decrement of active count */
         uint64_t active = atomic_fetch_sub(&reg->active_count, 1) - 1;
-        
+
         /* If last task, wake up waiters */
         if (active == 0) {
             pthread_mutex_lock(&reg->mutex);
@@ -311,14 +311,6 @@ void task_sync(task_registry_t* reg) {
     pthread_mutex_lock(&reg->mutex);
 
     /* Check inside mutex to avoid race condition */
-    if (atomic_load(&reg->active_count) == 0) {
-        pthread_mutex_unlock(&reg->mutex);
-        return;
-    }
-
-    /* Reset all_done flag for this wait cycle */
-    reg->all_done = 0;
-
     while (atomic_load(&reg->active_count) > 0) {
         reg->waiters++;
         pthread_cond_wait(&reg->cond, &reg->mutex);
@@ -338,14 +330,6 @@ int task_sync_timeout(task_registry_t* reg, uint64_t timeout_ns) {
     pthread_mutex_lock(&reg->mutex);
 
     /* Check inside mutex to avoid race condition */
-    if (atomic_load(&reg->active_count) == 0) {
-        pthread_mutex_unlock(&reg->mutex);
-        return 0;
-    }
-
-    /* Reset all_done flag for this wait cycle */
-    reg->all_done = 0;
-
     while (atomic_load(&reg->active_count) > 0) {
         uint64_t now = get_time_ns();
         if (now >= deadline) {

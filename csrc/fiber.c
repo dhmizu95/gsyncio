@@ -31,7 +31,7 @@ static int fiber_table_resize(size_t new_capacity) {
     return 0;
 }
 
-static int fiber_table_add(fiber_t* f) {
+int fiber_table_add(fiber_t* f) {
     if (!f) return -1;
     
     pthread_mutex_lock(&g_fiber_table_mutex);

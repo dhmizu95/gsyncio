@@ -51,9 +51,17 @@ try:
         get_worker_utilization,
         get_recommended_workers,
     )
+    # Import _gsyncio_core module to access _task_registry dynamically
+    from . import _gsyncio_core as __gsyncio_core
+    _task_registry = property(lambda self: __gsyncio_core._task_registry)
+    def _get_task_registry():
+        return __gsyncio_core._task_registry
     _HAS_CYTHON = True
 except ImportError:
     _HAS_CYTHON = False
+    _task_registry = None
+    def _get_task_registry():
+        return None
     # Pure Python fallback implementations
     class Future:
         """Pure Python Future implementation"""
@@ -412,6 +420,7 @@ __all__ = [
     'shutdown_scheduler',
     'get_scheduler_stats',
     'spawn',
+    'spawn_direct',
     'spawn_batch',
     'spawn_batch_fast',
     'spawn_batch_ultra_fast',
@@ -421,5 +430,10 @@ __all__ = [
     'current_fiber_id',
     'yield_execution',
     'num_workers',
+    'sync',
+    'sync_timeout',
+    'task_count',
+    'task_completed_count',
+    'run',
     '_HAS_CYTHON',
 ]

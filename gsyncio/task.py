@@ -21,6 +21,9 @@ from .core import (
     _HAS_CYTHON,
     atomic_task_count as _atomic_task_count,
     atomic_all_tasks_complete as _atomic_all_tasks_complete,
+    sync as _c_sync,
+    sync_timeout as _c_sync_timeout,
+    _get_task_registry as _get_task_registry,
 )
 from .async_ import _run_coroutine
 
@@ -92,34 +95,34 @@ def task_with_wrapper(func: Callable, *args, **kwargs):
 
 def task(func, *args, **kwargs):
     """Spawn task(s) - optimized default for fire-and-forget parallelism.
-    
+
     This function automatically handles both single tasks and batch spawning:
     - For a single function call: spawns one task (uses batch path internally)
     - For multiple tasks: uses batch spawning for 5-10x better performance
-    
+
     Performance:
         - Lock-free atomic counting in C (NO Python overhead!)
         - Object pooling reduces allocation overhead
         - Round-robin distribution to workers
         - Auto-initializes scheduler on first call
-    
+
     Also supports async functions - they will be run to completion.
-    
+
     Args:
         func: Either:
             - A callable to spawn (single task)
             - A list of (func, args) tuples for batch spawning
         *args: Arguments to pass to func (if single callable)
         **kwargs: Keyword arguments (for single callable)
-    
+
     Returns:
         For single task: True
         For batch: List of fiber IDs
-    
+
     Example (single task):
         >>> task(worker, 1000)
         True
-    
+
     Example (batch):
         >>> task([(func1, (arg1,)), (func2, (arg2,))])
         [1, 2]
@@ -130,21 +133,18 @@ def task(func, *args, **kwargs):
     if not _scheduler_initialized:
         _ensure_scheduler()
 
-    # Clear event if count is 0 before spawning (C will increment)
-    if _atomic_task_count() == 0:
-        _all_done_event.clear()
+    # Get task registry
+    registry = _get_task_registry()
 
     # Check if this is a batch call (list of tuples) or single task
     # Single task: task(worker, 1000) -> func=worker, args=(1000,)
     # Batch call: task([(func, (args,)), ...]) -> func=list
     if isinstance(func, list) and len(func) > 0:
-        # Batch spawning - prepare wrapped functions
-        batch = [(_task_completion_wrapper, (f, a, {})) for f, a in func]
-        return _spawn_batch(batch)
+        # Batch spawning via TaskRegistry (proper counting)
+        return registry.spawn_batch([(f, a) for f, a in func])
     else:
-        # Single task - use batch path for consistency (also faster)
-        batch = [(_task_completion_wrapper, (func, args, kwargs))]
-        _spawn_batch(batch)
+        # Single task via TaskRegistry (proper counting)
+        registry.spawn(func, *args, **kwargs)
         return True
 
 
@@ -187,19 +187,25 @@ def task_batch(funcs_and_args: List[tuple]):
 
 
 def sync():
-    """Wait for all spawned tasks to complete (lock-free, C counting)."""
-    # Poll atomic count from C and wait on event
-    while not _atomic_all_tasks_complete():
-        _all_done_event.wait(timeout=0.001)
+    """Wait for all spawned tasks to complete (uses C pthread_cond_wait)."""
+    # Use C sync which properly releases GIL via pthread_cond_wait
+    if _HAS_CYTHON:
+        _c_sync()
+    else:
+        # Fallback for pure Python
+        import select
+        while not _atomic_all_tasks_complete():
+            select.select([], [], [], 0.001)
 
 
 def sync_timeout(timeout: float) -> bool:
     """Wait for all tasks with a timeout (lock-free, C counting)."""
     import time
+    import select
     deadline = time.time() + timeout
     while not _atomic_all_tasks_complete() and time.time() < deadline:
         remaining = deadline - time.time()
-        _all_done_event.wait(timeout=min(0.001, remaining))
+        select.select([], [], [], min(0.001, remaining))
     return _atomic_all_tasks_complete()
 
 

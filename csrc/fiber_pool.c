@@ -153,6 +153,8 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool) {
             fiber->pool = pool;
             fiber->state = FIBER_NEW;
             
+            /* Note: Not adding to fiber table - pool fibers are tracked separately */
+            
             atomic_fetch_sub(&pool->available, 1);
             
             return fiber;
