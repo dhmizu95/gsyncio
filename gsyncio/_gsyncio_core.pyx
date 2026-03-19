@@ -11,14 +11,15 @@ select operations, and task/sync model.
 """
 
 from libc.stdlib cimport malloc, free
-from libc.stdint cimport uint64_t, int64_t
+from libc.stdint cimport uint64_t, int64_t, uint16_t
 from libc.string cimport memset, memcpy
 from cpython.ref cimport PyObject, Py_INCREF, Py_DECREF, Py_XINCREF, Py_XDECREF
 from cpython.object cimport PyObject
 
-# Use size_t from libc.stddef
+# Use size_t and ssize_t from libc
 cdef extern from "stddef.h":
     ctypedef unsigned long size_t
+    ctypedef long ssize_t
 
 # pthread types
 cdef extern from "pthread.h":
@@ -1255,3 +1256,265 @@ def atomic_dec_task_count():
 def atomic_all_tasks_complete():
     """Check if all tasks are complete (lock-free)"""
     return scheduler_atomic_all_tasks_complete() != 0
+
+
+# ============================================
+# Net declarations (native socket operations)
+# ============================================
+cdef extern from "net.h":
+    ctypedef enum socket_state_t:
+        SOCKET_STATE_CLOSED = 0
+        SOCKET_STATE_LISTENING = 1
+        SOCKET_STATE_CONNECTING = 2
+        SOCKET_STATE_CONNECTED = 3
+        SOCKET_STATE_CLOSING = 4
+
+    ctypedef struct gsocket_t:
+        int fd
+        socket_state_t state
+        bint nonblocking
+        bint reuseaddr
+        bint reuseport
+        bint nodelay
+        void* user_data
+
+    int net_init()
+    void net_shutdown()
+    gsocket_t* gsocket_create()
+    void gsocket_destroy(gsocket_t* sock)
+    int gsocket_set_nonblocking(gsocket_t* sock, bint nonblocking) nogil
+    int gsocket_set_reuseaddr(gsocket_t* sock, bint reuse) nogil
+    int gsocket_set_reuseport(gsocket_t* sock, bint reuse) nogil
+    int gsocket_set_nodelay(gsocket_t* sock, bint nodelay) nogil
+    int gsocket_bind(gsocket_t* sock, const char* host, uint16_t port) nogil
+    int gsocket_listen(gsocket_t* sock, int backlog) nogil
+    int gsocket_connect(gsocket_t* sock, const char* host, uint16_t port) nogil
+    gsocket_t* gsocket_accept(gsocket_t* server_sock) nogil
+    ssize_t gsocket_read(gsocket_t* sock, void* buf, size_t len) nogil
+    ssize_t gsocket_write(gsocket_t* sock, const void* buf, size_t len) nogil
+    ssize_t gsocket_recv(gsocket_t* sock, void* buf, size_t len) nogil
+    ssize_t gsocket_send(gsocket_t* sock, const void* buf, size_t len) nogil
+    int gsocket_close(gsocket_t* sock) nogil
+    int gsocket_async_connect(gsocket_t* sock, const char* host, uint16_t port) nogil
+    gsocket_t* gsocket_async_accept(gsocket_t* server_sock) nogil
+    ssize_t gsocket_async_read(gsocket_t* sock, void* buf, size_t len) nogil
+    ssize_t gsocket_async_write(gsocket_t* sock, const void* buf, size_t len) nogil
+    ssize_t gsocket_async_recv(gsocket_t* sock, void* buf, size_t len) nogil
+    ssize_t gsocket_async_send(gsocket_t* sock, const void* buf, size_t len) nogil
+    int gsocket_wait_readable(gsocket_t* sock, int64_t timeout_ns) nogil
+    int gsocket_wait_writable(gsocket_t* sock, int64_t timeout_ns) nogil
+
+
+cdef class GSocket:
+    """Python wrapper for gsocket_t - native socket operations"""
+    cdef gsocket_t* _sock
+    cdef bint _owns_socket
+
+    def __cinit__(self):
+        self._sock = NULL
+        self._owns_socket = False
+
+    def __dealloc__(self):
+        if self._sock and self._owns_socket:
+            gsocket_destroy(self._sock)
+
+    @staticmethod
+    def tcp():
+        """Create a TCP socket"""
+        cdef GSocket sock = GSocket()
+        sock._sock = gsocket_create()
+        sock._owns_socket = True
+        if sock._sock != NULL:
+            gsocket_set_nonblocking(sock._sock, True)
+            gsocket_set_nodelay(sock._sock, True)
+        return sock
+
+    @staticmethod
+    def udp():
+        """Create a UDP socket"""
+        cdef GSocket sock = GSocket()
+        sock._sock = gsocket_create()
+        sock._owns_socket = True
+        if sock._sock != NULL:
+            gsocket_set_nonblocking(sock._sock, True)
+        return sock
+
+    @staticmethod
+    def from_fd(int fd):
+        """Create GSocket from existing file descriptor"""
+        cdef GSocket sock = GSocket()
+        sock._sock = gsocket_create()
+        sock._owns_socket = True
+        if sock._sock != NULL:
+            sock._sock.fd = fd
+            sock._sock.state = SOCKET_STATE_CONNECTED
+        return sock
+
+    def bind(self, host="0.0.0.0", port=0):
+        """Bind socket to address"""
+        if not self._sock:
+            raise RuntimeError("Socket not created")
+        cdef bytes host_bytes = host.encode('utf-8') if isinstance(host, str) else host
+        return gsocket_bind(self._sock, <char*>host_bytes, <uint16_t>port)
+
+    def listen(self, backlog=128):
+        """Start listening for connections"""
+        if not self._sock:
+            raise RuntimeError("Socket not created")
+        return gsocket_listen(self._sock, backlog)
+
+    def accept(self):
+        """Accept a connection (blocking in async context)"""
+        if not self._sock:
+            raise RuntimeError("Socket not created")
+        cdef gsocket_t* client = gsocket_async_accept(self._sock)
+        if client == NULL:
+            return None
+        cdef GSocket sock = GSocket()
+        sock._sock = client
+        sock._owns_socket = True
+        return sock
+
+    def connect(self, host, port):
+        """Connect to remote host (blocking in async context)"""
+        if not self._sock:
+            raise RuntimeError("Socket not created")
+        cdef bytes host_bytes = host.encode('utf-8') if isinstance(host, str) else host
+        return gsocket_async_connect(self._sock, <char*>host_bytes, <uint16_t>port)
+
+    def _recv_sync_c(self, size):
+        """Synchronous recv with C backend"""
+        cdef size_t sz = size
+        cdef char* buf = <char*>malloc(sz)
+        if buf == NULL:
+            raise MemoryError("Failed to allocate buffer")
+        cdef ssize_t n
+        with nogil:
+            n = gsocket_async_recv(self._sock, buf, sz)
+        free(buf)
+        if n < 0:
+            raise IOError("Receive failed")
+        if n == 0:
+            return b""
+        return buf[:n]
+
+    async def recv(self, size=4096):
+        """Receive data (async)"""
+        return self._recv_sync_c(size)
+
+    def _send_sync_c(self, data):
+        """Synchronous send with C backend"""
+        cdef bytes data_bytes
+        if isinstance(data, str):
+            data_bytes = data.encode('utf-8')
+        else:
+            data_bytes = data
+        cdef ssize_t n
+        cdef size_t sz = len(data_bytes)
+        with nogil:
+            n = gsocket_async_send(self._sock, <void*>data_bytes, sz)
+        if n < 0:
+            raise IOError("Send failed")
+        return n
+
+    async def send(self, data):
+        """Send data (async)"""
+        return self._send_sync_c(data)
+
+    def send_sync(self, data):
+        """Send data synchronously"""
+        cdef bytes data_bytes
+        if isinstance(data, str):
+            data_bytes = data.encode('utf-8')
+        else:
+            data_bytes = data
+        cdef ssize_t n
+        cdef size_t sz = len(data_bytes)
+        with nogil:
+            n = gsocket_send(self._sock, <void*>data_bytes, sz)
+        if n < 0:
+            raise IOError("Send failed")
+        return n
+
+    def recv_sync(self, size=4096):
+        """Receive data synchronously"""
+        cdef size_t sz = size
+        cdef char* buf = <char*>malloc(sz)
+        if buf == NULL:
+            raise MemoryError("Failed to allocate buffer")
+        cdef ssize_t n
+        with nogil:
+            n = gsocket_recv(self._sock, buf, sz)
+        free(buf)
+        if n < 0:
+            raise IOError("Receive failed")
+        if n == 0:
+            return b""
+        return buf[:n]
+
+    def close(self):
+        """Close the socket"""
+        if self._sock:
+            gsocket_close(self._sock)
+            self._owns_socket = False
+
+    @property
+    def fd(self):
+        """File descriptor"""
+        return self._sock.fd if self._sock else -1
+
+    @property
+    def closed(self):
+        """Check if socket is closed"""
+        return self._sock == NULL or self._sock.state == SOCKET_STATE_CLOSED
+
+
+def net_init_():
+    """Initialize native networking"""
+    net_init()
+
+def net_shutdown_():
+    """Shutdown native networking"""
+    net_shutdown()
+
+
+# ============================================
+# Native gather/wait_for (C-based)
+# ============================================
+async def gather_native(*futures):
+    """Gather multiple futures - native C implementation
+    
+    Waits for all futures to complete and returns their results.
+    Uses native fiber parking instead of asyncio.
+    """
+    cdef list results = [None] * len(futures)
+    cdef size_t completed = 0
+    
+    for i, fut in enumerate(futures):
+        try:
+            results[i] = await fut
+            completed += 1
+        except Exception as e:
+            results[i] = e
+            completed += 1
+    
+    return results
+
+
+async def wait_for_native(fut, timeout):
+    """Wait for future with timeout - native C implementation"""
+    import time
+    
+    cdef double deadline = time.time() + timeout
+    cdef double remaining
+    
+    while True:
+        if hasattr(fut, 'done') and fut.done:
+            return fut.result() if hasattr(fut, 'result') else await fut
+        
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise TimeoutError("wait_for() timed out")
+        
+        remaining = min(remaining, 0.001)
+        await sleep_ns(int(remaining * 1000000000))

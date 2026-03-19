@@ -1,78 +1,161 @@
 """
-gsyncio.net - Native socket operations (fallback to asyncio)
+gsyncio.net - Native socket operations using C backend
 
-This module provides socket operations. Currently uses asyncio as fallback.
+This module provides high-performance socket operations using gsyncio's
+native C implementation with fiber-aware async I/O.
 """
 
-import asyncio
+from ._gsyncio_core import GSocket
+from .core import _HAS_CYTHON
+from ._gsyncio_core import (
+    net_init_ as _net_init,
+    net_shutdown_ as _net_shutdown,
+)
 
-
-async def connect(host: str, port: int):
-    """Connect to a host:port"""
-    reader, writer = await asyncio.open_connection(host, port)
-    return Socket(reader, writer)
-
-
-async def listen(host: str = "0.0.0.0", port: int = 8080, backlog: int = 128):
-    """Create a listening socket"""
-    server = await asyncio.start_server(
-        lambda r, w: None, host, port, reuse_address=True
-    )
-    return ServerSocket(server)
-
-
-async def accept(server_sock):
-    """Accept a connection"""
-    reader, writer = await server_sock._server.serve_forever.__self__.wait_connection()
-    return Socket(reader, writer)
-
-
-async def recv(sock, n: int = 4096) -> bytes:
-    """Receive data from socket"""
-    return await sock._reader.read(n)
-
-
-async def send(sock, data: bytes) -> int:
-    """Send data to socket"""
-    sock._writer.write(data)
-    await sock._writer.drain()
-    return len(data)
+if _HAS_CYTHON:
+    _net_init()
 
 
 class Socket:
-    """Socket wrapper"""
-    def __init__(self, reader, writer):
+    """High-performance socket wrapper using native C backend"""
+    def __init__(self, reader=None, writer=None, sock=None):
         self._reader = reader
         self._writer = writer
-    
+        self._sock = sock
+
+    @classmethod
+    def create_tcp(cls, host="0.0.0.0", port=0):
+        """Create a TCP socket connected to host:port"""
+        sock = GSocket.tcp()
+        if host and port:
+            sock.connect(host, port)
+        return cls(sock=sock)
+
+    @classmethod
+    def create_server(cls, host="0.0.0.0", port=8080, backlog=128):
+        """Create a listening TCP server socket"""
+        sock = GSocket.tcp()
+        sock.bind(host, port)
+        sock.listen(backlog)
+        return ServerSocket(sock)
+
     @property
     def fd(self):
-        return self._writer.get_extra_info('socket').fileno()
-    
+        """File descriptor"""
+        return self._sock.fd if self._sock else -1
+
+    @property
+    def closed(self):
+        """Check if socket is closed"""
+        return self._sock.closed if self._sock else True
+
+    async def accept(self):
+        """Accept a connection (async)"""
+        client = await self._sock.accept()
+        if client:
+            return Socket(sock=client), None
+        return None, None
+
+    async def connect(self, host, port):
+        """Connect to remote host (async)"""
+        self._sock.connect(host, port)
+        return self
+
+    async def recv(self, n=4096):
+        """Receive data from socket (async)"""
+        return await self._sock.recv(n)
+
+    async def send(self, data):
+        """Send data to socket (async)"""
+        return await self._sock.send(data)
+
+    def send_nowait(self, data):
+        """Send data without blocking"""
+        return self._sock.send_sync(data)
+
+    def recv_nowait(self, n=4096):
+        """Receive data without blocking"""
+        return self._sock.recv_sync(n)
+
     def close(self):
-        self._writer.close()
+        """Close the socket"""
+        if self._sock:
+            self._sock.close()
 
 
 class ServerSocket:
-    def __init__(self, server):
-        self._server = server
-    
+    """TCP server socket wrapper"""
+    def __init__(self, sock):
+        self._sock = sock
+        self._closed = False
+
+    @property
+    def fd(self):
+        return self._sock.fd if self._sock else -1
+
+    @property
+    def closed(self):
+        return self._closed or (self._sock.closed if self._sock else True)
+
+    async def accept(self):
+        """Accept a connection (async)"""
+        client = await self._sock.accept()
+        if client:
+            return Socket(sock=client), None
+        return None, None
+
     def close(self):
-        self._server.close()
+        """Close the server socket"""
+        self._closed = True
+        if self._sock:
+            self._sock.close()
+
+
+async def connect(host: str, port: int):
+    """Connect to a remote host (async)"""
+    sock = GSocket.tcp()
+    sock.connect(host, port)
+    return Socket(sock=sock)
+
+
+async def listen(host: str = "0.0.0.0", port: int = 8080, backlog: int = 128):
+    """Create a listening socket (async)"""
+    sock = GSocket.tcp()
+    sock.bind(host, port)
+    sock.listen(backlog)
+    return ServerSocket(sock)
+
+
+async def accept(server_sock):
+    """Accept a connection from server socket (async)"""
+    return await server_sock.accept()
+
+
+async def recv(sock, n: int = 4096) -> bytes:
+    """Receive data from socket (async)"""
+    return await sock.recv(n)
+
+
+async def send(sock, data: bytes) -> int:
+    """Send data to socket (async)"""
+    return await sock.send(data)
 
 
 def init():
     """Initialize native networking"""
-    pass
+    if _HAS_CYTHON:
+        _net_init()
 
 
 def shutdown():
     """Shutdown native networking"""
-    pass
+    if _HAS_CYTHON:
+        _net_shutdown()
 
 
 __all__ = [
     'Socket',
+    'ServerSocket',
     'connect',
     'listen',
     'accept',
