@@ -61,16 +61,17 @@ def _ensure_scheduler():
             pass  # Scheduler may already be initialized
 
 
-def task(func: Callable, *args, **kwargs):
-    """Spawn a new task - optimized with lock-free counting in C.
+def task_with_wrapper(func: Callable, *args, **kwargs):
+    """Spawn a new task with Python wrapper - for async function support.
 
-    Performance optimizations:
-    - Lock-free atomic counting in C (NO Python overhead!)
-    - Lock-free atomic decrement on completion (in C)
-    - Minimal wrapper overhead
-    - Auto-initializes scheduler on first call
+    This is the legacy task() function that includes:
+    - _task_completion_wrapper for completion tracking
+    - inspect.iscoroutine() checks for async function support
     
-    Also supports async functions - they will be run to completion.
+    Note: This has more overhead than task_direct(). Use task_direct() for
+    maximum performance with sync-only functions.
+    
+    For new code, prefer using task() which auto-batches for better performance.
     """
     global _scheduler_initialized
 
@@ -89,8 +90,69 @@ def task(func: Callable, *args, **kwargs):
     return True
 
 
+def task(func, *args, **kwargs):
+    """Spawn task(s) - optimized default for fire-and-forget parallelism.
+    
+    This function automatically handles both single tasks and batch spawning:
+    - For a single function call: spawns one task (uses batch path internally)
+    - For multiple tasks: uses batch spawning for 5-10x better performance
+    
+    Performance:
+        - Lock-free atomic counting in C (NO Python overhead!)
+        - Object pooling reduces allocation overhead
+        - Round-robin distribution to workers
+        - Auto-initializes scheduler on first call
+    
+    Also supports async functions - they will be run to completion.
+    
+    Args:
+        func: Either:
+            - A callable to spawn (single task)
+            - A list of (func, args) tuples for batch spawning
+        *args: Arguments to pass to func (if single callable)
+        **kwargs: Keyword arguments (for single callable)
+    
+    Returns:
+        For single task: True
+        For batch: List of fiber IDs
+    
+    Example (single task):
+        >>> task(worker, 1000)
+        True
+    
+    Example (batch):
+        >>> task([(func1, (arg1,)), (func2, (arg2,))])
+        [1, 2]
+    """
+    global _scheduler_initialized
+
+    # Ensure scheduler is initialized
+    if not _scheduler_initialized:
+        _ensure_scheduler()
+
+    # Clear event if count is 0 before spawning (C will increment)
+    if _atomic_task_count() == 0:
+        _all_done_event.clear()
+
+    # Check if this is a batch call (list of tuples) or single task
+    # Single task: task(worker, 1000) -> func=worker, args=(1000,)
+    # Batch call: task([(func, (args,)), ...]) -> func=list
+    if isinstance(func, list) and len(func) > 0:
+        # Batch spawning - prepare wrapped functions
+        batch = [(_task_completion_wrapper, (f, a, {})) for f, a in func]
+        return _spawn_batch(batch)
+    else:
+        # Single task - use batch path for consistency (also faster)
+        batch = [(_task_completion_wrapper, (func, args, kwargs))]
+        _spawn_batch(batch)
+        return True
+
+
 def task_batch(funcs_and_args: List[tuple]):
     """Spawn multiple tasks in a batch - 5-10x faster than individual spawns.
+
+    Note: This is now an alias for task() when called with a list.
+    Prefer using task([(func, args), ...]) for the same functionality.
 
     Args:
         funcs_and_args: List of (func, args) tuples
@@ -262,6 +324,7 @@ def task_batch_fast(funcs_and_args):
 
 __all__ = [
     'task',
+    'task_with_wrapper',
     'task_direct',
     'sync',
     'sync_timeout',

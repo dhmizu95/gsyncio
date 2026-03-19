@@ -141,10 +141,11 @@ Key observations:
 4. asyncio is highly optimized for single-threaded coroutine spawning
 
 Recommendations:
-- Use task() when you need sync() support
+- Use task() for best performance (auto-batches)
+- Use task_with_wrapper() for async function support
 - Use task_fast() for maximum spawn rate (fire-and-forget)
 - Use spawn() directly for lowest-level control
-- Use task_batch() for spawning many tasks at once
+- Use task_batch() for explicit batch spawning
 """)
 
 

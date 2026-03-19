@@ -77,6 +77,7 @@ from .core import (
 # Import task/sync model
 from .task import (
     task,
+    task_with_wrapper,
     task_direct,
     sync,
     sync_timeout,
@@ -185,6 +186,7 @@ __all__ = [
     
     # Task/Sync model
     'task',
+    'task_with_wrapper',
     'task_direct',
     'sync',
     'sync_timeout',
