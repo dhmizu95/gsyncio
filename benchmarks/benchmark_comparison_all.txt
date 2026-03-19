@@ -7,26 +7,26 @@ Go: Unknown
 Results (in milliseconds):
 ------------------------------------------------------------
 Task Spawn (1000):
-  asyncio: 3.32ms
-  gsyncio: 228.08ms
-  Go:      0.43ms
-  vs Go:   asyncio=7.6x, gsyncio=524.3x
+  asyncio: 37.22ms
+  gsyncio: 0.00ms
+  Go:      10.00ms
+  vs Go:   asyncio=3.7x, gsyncio=N/A
 
 Sleep (100):
-  asyncio: 1.79ms
-  gsyncio: 26.70ms
-  Go:      1.00ms
-  vs Go:   asyncio=1.8x, gsyncio=26.7x
+  asyncio: 12.53ms
+  gsyncio: 0.00ms
+  Go:      2.00ms
+  vs Go:   asyncio=6.3x, gsyncio=N/A
 
 WaitGroup (10×100):
-  asyncio: 0.31ms
-  gsyncio: 2.97ms
-  Go:      0.12ms
-  vs Go:   asyncio=2.6x, gsyncio=24.5x
+  asyncio: 0.94ms
+  gsyncio: 0.00ms
+  Go:      0.04ms
+  vs Go:   asyncio=25.4x, gsyncio=N/A
 
 Context Switch (10000):
-  asyncio: 8.64ms
-  gsyncio: 3.87ms
-  Go:      1.00ms
-  vs Go:   asyncio=8.6x, gsyncio=3.9x
+  asyncio: 86.16ms
+  gsyncio: 0.00ms
+  Go:      4.00ms
+  vs Go:   asyncio=21.5x, gsyncio=N/A
 
