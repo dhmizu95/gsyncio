@@ -42,6 +42,7 @@ try:
         atomic_task_count,
         atomic_inc_task_count,
         atomic_dec_task_count,
+        atomic_all_tasks_complete,
         # Worker management
         check_worker_scaling,
         set_auto_scaling,
@@ -395,6 +396,11 @@ except ImportError:
         with _atomic_lock:
             _atomic_counter -= 1
             return _atomic_counter
+
+    def atomic_all_tasks_complete():
+        """Check if all tasks are complete (pure Python - uses lock)"""
+        with _atomic_lock:
+            return _atomic_counter == 0
 
 
 __all__ = [

@@ -173,33 +173,19 @@ typedef struct spawn_batch {
 /* Lock-Free Task Counting (C11 atomics)       */
 /* ============================================ */
 
+/* Forward declaration */
+typedef struct scheduler scheduler_t;
+
 /* g_scheduler is declared in scheduler.c */
+extern scheduler_t* g_scheduler;
 
-/**
- * Atomically increment task count (lock-free)
- */
-static inline uint64_t scheduler_atomic_inc_task_count(void);
-
-/**
- * Atomically decrement task count (lock-free)
- * Returns the new value
- */
-static inline uint64_t scheduler_atomic_dec_task_count(void);
-
-/**
- * Get current task count (lock-free)
- */
-static inline uint64_t scheduler_atomic_get_task_count(void);
-
-/**
- * Atomically increment fibers spawned (lock-free)
- */
-static inline uint64_t scheduler_atomic_inc_fibers_spawned(void);
-
-/**
- * Atomically increment fibers completed (lock-free)
- */
-static inline uint64_t scheduler_atomic_inc_fibers_completed(void);
+/* Atomic operations - implemented in scheduler.c */
+uint64_t scheduler_atomic_inc_task_count(void);
+uint64_t scheduler_atomic_dec_task_count(void);
+uint64_t scheduler_atomic_get_task_count(void);
+uint64_t scheduler_atomic_inc_fibers_spawned(void);
+uint64_t scheduler_atomic_inc_fibers_completed(void);
+int scheduler_atomic_all_tasks_complete(void);
 
 typedef struct scheduler {
     worker_t* workers;

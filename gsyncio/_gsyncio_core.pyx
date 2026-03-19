@@ -1197,6 +1197,7 @@ cdef extern from "scheduler.h":
     uint64_t scheduler_atomic_get_task_count() nogil
     uint64_t scheduler_atomic_inc_fibers_spawned() nogil
     uint64_t scheduler_atomic_inc_fibers_completed() nogil
+    int scheduler_atomic_all_tasks_complete() nogil
 
 def atomic_task_count():
     """Get current task count (lock-free, thread-safe)"""
@@ -1209,3 +1210,7 @@ def atomic_inc_task_count():
 def atomic_dec_task_count():
     """Atomically decrement task count (lock-free)"""
     return scheduler_atomic_dec_task_count()
+
+def atomic_all_tasks_complete():
+    """Check if all tasks are complete (lock-free)"""
+    return scheduler_atomic_all_tasks_complete() != 0

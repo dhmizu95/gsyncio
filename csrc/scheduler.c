@@ -56,6 +56,11 @@ uint64_t scheduler_atomic_inc_fibers_completed(void) {
     return __atomic_add_fetch(&g_scheduler->stats.atomic_fibers_completed, 1, __ATOMIC_SEQ_CST);
 }
 
+int scheduler_atomic_all_tasks_complete(void) {
+    if (!g_scheduler) return 1;
+    return __atomic_load_n(&g_scheduler->stats.atomic_task_count, __ATOMIC_SEQ_CST) == 0 ? 1 : 0;
+}
+
 static void* worker_thread(void* arg);
 static fiber_t* steal_from_worker(worker_t* thief, int victim_id);
 static void push_local(worker_t* w, fiber_t* f);
@@ -770,7 +775,7 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
         return 0;
     }
 
-    /* Lock-free atomic increment */
+    /* Lock-free atomic increment for both spawn tracking AND task count */
     scheduler_atomic_inc_fibers_spawned();
     scheduler_atomic_inc_task_count();
 
