@@ -1018,22 +1018,25 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
             if (!f->stack_base) {
                 size_t stack_size = g_scheduler->config.stack_size > 0 ?
                     g_scheduler->config.stack_size : FIBER_DEFAULT_STACK_SIZE;
-                f->stack_base = mmap(
-                    NULL,
-                    stack_size + 4096,
-                    PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS,
-                    -1,
-                    0
-                );
+                size_t alloc_size = stack_size;
+#if FIBER_USE_GUARD_PAGES == 1
+                alloc_size += 4096;
+#endif
+                f->stack_base = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                
                 if (f->stack_base == MAP_FAILED) {
                     fiber_pool_free((fiber_pool_t*)g_scheduler->fiber_pool, f);
                     return 0;
                 }
+                
+#if FIBER_USE_GUARD_PAGES == 1
                 mprotect(f->stack_base, 4096, PROT_NONE);
+                f->stack_ptr = (char*)f->stack_base + stack_size + 4096;
+#else
+                f->stack_ptr = (char*)f->stack_base + stack_size;
+#endif
                 f->stack_size = stack_size;
                 f->stack_capacity = stack_size;
-                f->stack_ptr = (char*)f->stack_base + stack_size + 4096;
             }
         }
     }
@@ -1161,22 +1164,25 @@ int scheduler_spawn_batch_add(spawn_batch_t* batch, void (*entry)(void*), void* 
             if (!f->stack_base) {
                 size_t stack_size = g_scheduler->config.stack_size > 0 ? 
                     g_scheduler->config.stack_size : FIBER_DEFAULT_STACK_SIZE;
-                f->stack_base = mmap(
-                    NULL,
-                    stack_size + 4096,
-                    PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS,
-                    -1,
-                    0
-                );
+                size_t alloc_size = stack_size;
+#if FIBER_USE_GUARD_PAGES == 1
+                alloc_size += 4096;
+#endif
+                f->stack_base = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                
                 if (f->stack_base == MAP_FAILED) {
                     fiber_pool_free((fiber_pool_t*)g_scheduler->fiber_pool, f);
                     return -1;
                 }
+                
+#if FIBER_USE_GUARD_PAGES == 1
                 mprotect(f->stack_base, 4096, PROT_NONE);
+                f->stack_ptr = (char*)f->stack_base + stack_size + 4096;
+#else
+                f->stack_ptr = (char*)f->stack_base + stack_size;
+#endif
                 f->stack_size = stack_size;
                 f->stack_capacity = stack_size;
-                f->stack_ptr = (char*)f->stack_base + stack_size + 4096;
             }
         }
     }

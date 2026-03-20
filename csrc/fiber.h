@@ -25,7 +25,7 @@ extern "C" {
 #define FIBER_MAX_STACK_SIZE 65536      /* 64KB max stack */
 #define FIBER_STACK_GROW_STEP 4096      /* Grow by 4KB */
 #define FIBER_DEFAULT_STACK_SIZE 2048   /* 2KB default - like Go goroutines */
-#define FIBER_USE_GUARD_PAGES 1         /* Enable guard pages for memory safety */
+#define FIBER_USE_GUARD_PAGES 0         /* Disable guard pages to reach 1M+ system limit */
 #define FIBER_POOL_LAZY_ALLOC 1         /* Lazy stack allocation for memory efficiency */
 
 /* ============================================ */

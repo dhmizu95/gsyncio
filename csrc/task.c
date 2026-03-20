@@ -86,25 +86,27 @@ typedef struct task_wrapper_arg {
 } task_wrapper_arg_t;
 
 /* Global task wrapper pool for 10M scale */
-static _Atomic(task_wrapper_arg_t*) g_wrapper_pool = NULL;
+static task_wrapper_arg_t* g_wrapper_pool = NULL;
+static pthread_mutex_t g_wrapper_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static task_wrapper_arg_t* wrapper_alloc(void) {
-    task_wrapper_arg_t* head = atomic_load(&g_wrapper_pool);
-    while (head != NULL) {
-        task_wrapper_arg_t* next = head->next;
-        if (atomic_compare_exchange_weak(&g_wrapper_pool, &head, next)) {
-            return head;
-        }
+    pthread_mutex_lock(&g_wrapper_pool_mutex);
+    task_wrapper_arg_t* node = g_wrapper_pool;
+    if (node) {
+        g_wrapper_pool = node->next;
+        pthread_mutex_unlock(&g_wrapper_pool_mutex);
+        return node;
     }
+    pthread_mutex_unlock(&g_wrapper_pool_mutex);
     return (task_wrapper_arg_t*)calloc(1, sizeof(task_wrapper_arg_t));
 }
 
 static void wrapper_free(task_wrapper_arg_t* wrapper) {
     if (!wrapper) return;
-    task_wrapper_arg_t* head = atomic_load(&g_wrapper_pool);
-    do {
-        wrapper->next = head;
-    } while (!atomic_compare_exchange_weak(&g_wrapper_pool, &head, wrapper));
+    pthread_mutex_lock(&g_wrapper_pool_mutex);
+    wrapper->next = g_wrapper_pool;
+    g_wrapper_pool = wrapper;
+    pthread_mutex_unlock(&g_wrapper_pool_mutex);
 }
 
 void task_wrapper(void* arg) {

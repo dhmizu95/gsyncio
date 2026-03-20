@@ -21,6 +21,23 @@ static size_t g_fiber_table_capacity = 0;
 static size_t g_fiber_table_count = 0;
 static pthread_mutex_t g_fiber_table_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static uint64_t hash_id(uint64_t id) {
+    id = (id ^ (id >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    id = (id ^ (id >> 27)) * 0x94d049bb133111ebULL;
+    id = id ^ (id >> 31);
+    return id;
+}
+
+static void fiber_table_insert_no_lock(fiber_t* f) {
+    uint64_t h = hash_id(f->id);
+    size_t idx = h % g_fiber_table_capacity;
+    while (g_fiber_table[idx] && g_fiber_table[idx] != (fiber_t*)-1) {
+        idx = (idx + 1) % g_fiber_table_capacity;
+    }
+    g_fiber_table[idx] = f;
+    g_fiber_table_count++;
+}
+
 static int fiber_table_resize(size_t new_capacity) {
     fiber_t** old_table = g_fiber_table;
     size_t old_capacity = g_fiber_table_capacity;
@@ -36,19 +53,12 @@ static int fiber_table_resize(size_t new_capacity) {
     if (old_table) {
         for (size_t i = 0; i < old_capacity; i++) {
             if (old_table[i] && old_table[i] != (fiber_t*)-1) {
-                fiber_table_add(old_table[i]);
+                fiber_table_insert_no_lock(old_table[i]);
             }
         }
         free(old_table);
     }
     return 0;
-}
-
-static uint64_t hash_id(uint64_t id) {
-    id = (id ^ (id >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    id = (id ^ (id >> 27)) * 0x94d049bb133111ebULL;
-    id = id ^ (id >> 31);
-    return id;
 }
 
 int fiber_table_add(fiber_t* f) {

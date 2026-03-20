@@ -62,7 +62,7 @@ void fiber_pool_destroy(fiber_pool_t* pool) {
     if (!pool) return;
     
     pthread_mutex_lock(&pool->mutex);
-    fiber_t* f = (fiber_t*)atomic_load(&pool->free_list);
+    fiber_t* f = pool->free_list; // Replaced atomic_load
     while (f) {
         fiber_t* next = f->next_ready;
         if (f->stack_base) {
@@ -144,8 +144,8 @@ void fiber_pool_free(fiber_pool_t* pool, fiber_t* fiber) {
     fiber->affinity = 0;
     fiber->waiting_on = NULL;
     
-    fiber->next_ready = (fiber_t*)atomic_load(&pool->free_list);
-    atomic_store(&pool->free_list, fiber);
+    fiber->next_ready = (fiber_t*)pool->free_list;
+    pool->free_list = fiber;
     
     atomic_fetch_add(&pool->available, 1);
     atomic_fetch_sub(&pool->allocated, 1);
