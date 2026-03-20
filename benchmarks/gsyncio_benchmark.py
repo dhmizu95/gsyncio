@@ -297,39 +297,39 @@ def run_all_gsyncio_benchmarks():
     
     # Task/Sync model benchmarks
     print("\n=== Task/Sync Model ===")
-    for num_tasks in [100, 1000, 10000]:
+    for num_tasks in [100, 1000, 10000, 100000, 1000000, 10000000]:
         key = f"gsyncio_task_spawn_{num_tasks}"
         results[key] = benchmark_gsyncio_task_spawn(num_tasks)
         print(f"Task spawn ({num_tasks} tasks): {results[key]:.4f}s")
-    
-    for num_tasks in [100, 1000, 10000]:
+
+    for num_tasks in [100, 1000, 10000, 100000, 1000000, 10000000]:
         key = f"gsyncio_task_batch_{num_tasks}"
         results[key] = benchmark_gsyncio_task_batch(num_tasks)
         print(f"Task batch ({num_tasks} tasks): {results[key]:.4f}s")
-    
-    for num_tasks in [100, 1000, 10000]:
+
+    for num_tasks in [100, 1000, 10000, 100000, 1000000, 10000000]:
         key = f"gsyncio_task_fast_{num_tasks}"
         results[key] = benchmark_gsyncio_task_fast(num_tasks)
         print(f"Task fast ({num_tasks} tasks): {results[key]:.4f}s")
-    
-    for num_tasks in [100, 1000, 10000]:
+
+    for num_tasks in [100, 1000, 10000, 100000, 1000000, 10000000]:
         key = f"gsyncio_task_batch_fast_{num_tasks}"
         results[key] = benchmark_gsyncio_task_batch_fast(num_tasks)
         print(f"Task batch fast ({num_tasks} tasks): {results[key]:.4f}s")
-    
+
     # Async/Await model benchmarks
     print("\n=== Async/Await Model ===")
-    for num_tasks in [100, 1000, 5000]:
+    for num_tasks in [100, 1000, 5000, 50000, 100000, 1000000]:
         key = f"gsyncio_async_spawn_{num_tasks}"
         results[key] = benchmark_gsyncio_async_spawn(num_tasks)
         print(f"Async spawn ({num_tasks} tasks): {results[key]:.4f}s")
-    
-    for num_tasks in [100, 1000, 10000]:
+
+    for num_tasks in [100, 1000, 10000, 100000, 1000000]:
         key = f"gsyncio_async_sleep_{num_tasks}"
         results[key] = benchmark_gsyncio_async_sleep(num_tasks)
         print(f"Async sleep ({num_tasks} tasks): {results[key]:.4f}s")
-    
-    for num_tasks in [100, 1000, 5000]:
+
+    for num_tasks in [100, 1000, 5000, 50000, 100000]:
         key = f"gsyncio_async_gather_{num_tasks}"
         results[key] = benchmark_gsyncio_async_gather(num_tasks)
         print(f"Async gather ({num_tasks} tasks): {results[key]:.4f}s")

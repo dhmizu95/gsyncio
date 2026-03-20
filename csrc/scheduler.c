@@ -119,6 +119,72 @@ int scheduler_atomic_all_tasks_complete(void) {
     return __atomic_load_n(&g_scheduler->stats.atomic_task_count, __ATOMIC_SEQ_CST) == 0 ? 1 : 0;
 }
 
+/* ============================================ */
+/* Sharded Counter Implementation (Low Contention) */
+/* ============================================ */
+
+/* Forward declaration for get_time_ns */
+static uint64_t get_time_ns(void);
+
+/* Recalculate total from shards */
+static void sharded_counter_recalc(sharded_counter_t* sc) {
+    uint64_t total = 0;
+    for (int i = 0; i < NUM_SHARDS; i++) {
+        total += atomic_load(&sc->counts[i]);
+    }
+    atomic_store(&sc->total, total);
+    sc->last_update = get_time_ns();
+}
+
+/* Get total with lazy recalculation (call periodically, not on every access) */
+uint64_t sharded_counter_get_total(sharded_counter_t* sc) {
+    uint64_t cached = atomic_load(&sc->total);
+    
+    /* If we have a recent cached value, use it */
+    if (cached > 0) {
+        uint64_t now = get_time_ns();
+        /* Cache is valid for 1 second */
+        if (now - sc->last_update < 1000000000ULL) {
+            return cached;
+        }
+    }
+    
+    /* Recalculate */
+    sharded_counter_recalc(sc);
+    return atomic_load(&sc->total);
+}
+
+/* Sharded task count operations - use worker_id for low contention */
+uint64_t scheduler_sharded_inc_task_count(uint32_t worker_id) {
+    if (!g_scheduler) return 0;
+    return sharded_counter_inc(&g_scheduler->sharded_task_count, worker_id);
+}
+
+uint64_t scheduler_sharded_dec_task_count(uint32_t worker_id) {
+    if (!g_scheduler) return 0;
+    return sharded_counter_dec(&g_scheduler->sharded_task_count, worker_id);
+}
+
+uint64_t scheduler_sharded_get_task_count(void) {
+    if (!g_scheduler) return 0;
+    return sharded_counter_get_total(&g_scheduler->sharded_task_count);
+}
+
+/* Thread-local worker ID storage */
+static __thread int t_current_worker_id = -1;
+
+void scheduler_set_current_worker_id(int worker_id) {
+    t_current_worker_id = worker_id;
+}
+
+uint32_t scheduler_get_current_worker_id(void) {
+    if (t_current_worker_id < 0) {
+        /* Not in a worker thread, use hash of thread ID as fallback */
+        return (uint32_t)(pthread_self() % NUM_SHARDS);
+    }
+    return (uint32_t)t_current_worker_id;
+}
+
 static void* worker_thread(void* arg);
 static fiber_t* steal_from_worker(worker_t* thief, int victim_id);
 static void push_local(worker_t* w, fiber_t* f);
@@ -350,6 +416,9 @@ static void* worker_thread(void* arg) {
     worker_t* w = (worker_t*)arg;
     scheduler_t* sched = g_scheduler;
 
+    /* Set thread-local worker ID for sharded counter operations */
+    scheduler_set_current_worker_id(w->id);
+
     // Warmup - do a quick spin to avoid cold-start latency
     for (int i = 0; i < 1000; i++) {
         __asm__ __volatile__("" ::: "memory");
@@ -404,7 +473,8 @@ static void* worker_thread(void* arg) {
 
                         /* Lock-free atomic increment */
                         scheduler_atomic_inc_fibers_completed();
-                        scheduler_atomic_dec_task_count();
+                        /* Sharded counter decrement - uses thread-local worker_id for low contention */
+                        scheduler_sharded_dec_task_count(scheduler_get_current_worker_id());
 
                         if (f->parent) {
                             scheduler_schedule(f->parent, -1);
@@ -623,7 +693,7 @@ int scheduler_init(scheduler_config_t* config) {
         }
     } else {
         sched->config.num_workers = get_num_cpus();
-        sched->config.max_fibers = 65536;  /* Reduced from 1000000 for memory efficiency */
+        sched->config.max_fibers = 10000000;  /* 10M fibers for high concurrency */
         sched->config.stack_size = FIBER_DEFAULT_STACK_SIZE;
         sched->config.work_stealing = true;
         sched->config.backend = SCHEDULER_BACKEND_DEFAULT;
@@ -662,7 +732,7 @@ int scheduler_init(scheduler_config_t* config) {
             return -1;
         }
 
-        if (deque_init(w->deque, 1024) != 0) {
+        if (deque_init(w->deque, 65536) != 0) {  /* 64K initial capacity per worker */
             free(w->deque);
             for (size_t j = 0; j < i; j++) {
                 if (sched->workers[j].deque) {
@@ -682,10 +752,14 @@ int scheduler_init(scheduler_config_t* config) {
     /* Initialize worker manager */
     worker_manager_init(&sched->worker_manager, sched->num_workers);
 
-    sched->fiber_pool = fiber_pool_create(sched->config.max_fibers);
+    /* Initialize sharded counters for low-contention task counting */
+    sharded_counter_init(&sched->sharded_task_count);
+    sharded_counter_init(&sched->sharded_completion_count);
+
+    sched->fiber_pool = fiber_pool_create(65536);  /* Start with 64K fibers, grow on demand */
 
     /* Initialize timer pool for fast sleep allocation */
-    timer_pool_init(8192);  /* Support up to 8192 concurrent timers */
+    timer_pool_init(65536);  /* Start with 64K timers, grow on demand */
 
     sched->ready_queue = NULL;
     sched->blocked_queue = NULL;
@@ -870,13 +944,15 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
         return 0;
     }
 
-    /* Lock-free atomic increment for both spawn tracking AND task count */
+    /* Lock-free atomic increment for spawn tracking */
     scheduler_atomic_inc_fibers_spawned();
-    scheduler_atomic_inc_task_count();
 
     /* Atomic round-robin worker selection */
     size_t worker_idx = atomic_fetch_add(&g_scheduler->next_worker, 1) % g_scheduler->num_workers;
     int worker_id = (int)worker_idx;
+
+    /* Sharded counter increment - uses worker_id for low contention */
+    scheduler_sharded_inc_task_count((uint32_t)worker_id);
 
     scheduler_schedule(f, worker_id);
 

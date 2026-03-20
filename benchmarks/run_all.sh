@@ -118,13 +118,13 @@ async def simple_task(n):
 iterations = 3
 results = []
 
-for num_tasks in [100, 1000, 10000]:
+for num_tasks in [100, 1000, 10000, 100000, 1000000]:
     times = []
     for _ in range(iterations):
         async def run_tasks():
             tasks = [asyncio.create_task(simple_task(100)) for _ in range(num_tasks)]
             return await asyncio.gather(*tasks)
-        
+
         start = time.perf_counter()
         asyncio.run(run_tasks())
         end = time.perf_counter()
@@ -134,13 +134,13 @@ for num_tasks in [100, 1000, 10000]:
     results.append((f'asyncio_task_spawn_{num_tasks}', avg))
 
 # Sleep benchmarks
-for num_tasks in [100, 1000, 10000]:
+for num_tasks in [100, 1000, 10000, 100000, 1000000]:
     times = []
     for _ in range(iterations):
         async def run_sleep():
             tasks = [asyncio.create_task(asyncio.sleep(0.01)) for _ in range(num_tasks)]
             return await asyncio.gather(*tasks)
-        
+
         start = time.perf_counter()
         asyncio.run(run_sleep())
         end = time.perf_counter()
@@ -190,8 +190,8 @@ results = []
 
 # Test if task works without segfault
 try:
-    # Task spawn benchmarks
-    for num_tasks in [100, 1000, 10000]:
+    # Task spawn benchmarks - scaled to 10M
+    for num_tasks in [100, 1000, 10000, 100000, 1000000, 10000000]:
         times = []
         for _ in range(iterations):
             for _ in range(num_tasks):
@@ -206,9 +206,9 @@ try:
 except Exception as e:
     print(f"Error in task spawn: {e}", file=sys.stderr)
 
-# Task fast benchmarks
+# Task fast benchmarks - scaled to 10M
 try:
-    for num_tasks in [100, 1000, 10000]:
+    for num_tasks in [100, 1000, 10000, 100000, 1000000, 10000000]:
         times = []
         for _ in range(iterations):
             start = time.perf_counter()
@@ -223,9 +223,9 @@ try:
 except Exception as e:
     print(f"Error in task fast: {e}", file=sys.stderr)
 
-# Task batch benchmarks
+# Task batch benchmarks - scaled to 10M
 try:
-    for num_tasks in [100, 1000, 10000]:
+    for num_tasks in [100, 1000, 10000, 100000, 1000000, 10000000]:
         times = []
         for _ in range(iterations):
             tasks = [(simple_task, (100,)) for _ in range(num_tasks)]
@@ -260,19 +260,34 @@ if echo "$GSYNCIO_OUTPUT" | grep -q "gsyncio_task"; then
         GSNPCIO_FAST_100=$(python3 -c "import json; d=json.load(open('/tmp/gsyncio_results.json')); print([x[1] for x in d if 'gsyncio_task_fast_100' in x[0]][0])" 2>/dev/null || echo "0")
         GSNPCIO_FAST_1000=$(python3 -c "import json; d=json.load(open('/tmp/gsyncio_results.json')); print([x[1] for x in d if 'gsyncio_task_fast_1000' in x[0]][0])" 2>/dev/null || echo "0")
         GSNPCIO_FAST_10000=$(python3 -c "import json; d=json.load(open('/tmp/gsyncio_results.json')); print([x[1] for x in d if 'gsyncio_task_fast_10000' in x[0]][0])" 2>/dev/null || echo "0")
+        GSNPCIO_FAST_100000=$(python3 -c "import json; d=json.load(open('/tmp/gsyncio_results.json')); print([x[1] for x in d if 'gsyncio_task_fast_100000' in x[0]][0])" 2>/dev/null || echo "0")
+        GSNPCIO_FAST_1000000=$(python3 -c "import json; d=json.load(open('/tmp/gsyncio_results.json')); print([x[1] for x in d if 'gsyncio_task_fast_1000000' in x[0]][0])" 2>/dev/null || echo "0")
+        GSNPCIO_FAST_10000000=$(python3 -c "import json; d=json.load(open('/tmp/gsyncio_results.json')); print([x[1] for x in d if 'gsyncio_task_fast_10000000' in x[0]][0])" 2>/dev/null || echo "0")
         GSNPCIO_BATCH_100=$(python3 -c "import json; d=json.load(open('/tmp/gsyncio_results.json')); print([x[1] for x in d if 'gsyncio_task_batch_100' in x[0]][0])" 2>/dev/null || echo "0")
         GSNPCIO_BATCH_1000=$(python3 -c "import json; d=json.load(open('/tmp/gsyncio_results.json')); print([x[1] for x in d if 'gsyncio_task_batch_1000' in x[0]][0])" 2>/dev/null || echo "0")
         GSNPCIO_BATCH_10000=$(python3 -c "import json; d=json.load(open('/tmp/gsyncio_results.json')); print([x[1] for x in d if 'gsyncio_task_batch_10000' in x[0]][0])" 2>/dev/null || echo "0")
+        GSNPCIO_BATCH_100000=$(python3 -c "import json; d=json.load(open('/tmp/gsyncio_results.json')); print([x[1] for x in d if 'gsyncio_task_batch_100000' in x[0]][0])" 2>/dev/null || echo "0")
+        GSNPCIO_BATCH_1000000=$(python3 -c "import json; d=json.load(open('/tmp/gsyncio_results.json')); print([x[1] for x in d if 'gsyncio_task_batch_1000000' in x[0]][0])" 2>/dev/null || echo "0")
+        GSNPCIO_BATCH_10000000=$(python3 -c "import json; d=json.load(open('/tmp/gsyncio_results.json')); print([x[1] for x in d if 'gsyncio_task_batch_10000000' in x[0]][0])" 2>/dev/null || echo "0")
     else
         GSNPCIO_SPAWN_100=0
         GSNPCIO_SPAWN_1000=0
         GSNPCIO_SPAWN_10000=0
+        GSNPCIO_SPAWN_100000=0
+        GSNPCIO_SPAWN_1000000=0
+        GSNPCIO_SPAWN_10000000=0
         GSNPCIO_FAST_100=0
         GSNPCIO_FAST_1000=0
         GSNPCIO_FAST_10000=0
+        GSNPCIO_FAST_100000=0
+        GSNPCIO_FAST_1000000=0
+        GSNPCIO_FAST_10000000=0
         GSNPCIO_BATCH_100=0
         GSNPCIO_BATCH_1000=0
         GSNPCIO_BATCH_10000=0
+        GSNPCIO_BATCH_100000=0
+        GSNPCIO_BATCH_1000000=0
+        GSNPCIO_BATCH_10000000=0
     fi
 
     cat >> "$REPORT_FILE" << EOF
@@ -280,8 +295,11 @@ if echo "$GSYNCIO_OUTPUT" | grep -q "gsyncio_task"; then
 | Tasks | task() | task_fast() | task_batch() |
 |-------|--------|-------------|-------------|
 | 100   | ${GSNPCIO_SPAWN_100}s | ${GSNPCIO_FAST_100}s | ${GSNPCIO_BATCH_100}s |
-| 1000  | ${GSNPCIO_SPAWN_1000}s | ${GSNPCIO_FAST_1000}s | ${GSNPCIO_BATCH_1000}s |
-| 10000 | ${GSNPCIO_SPAWN_10000}s | ${GSNPCIO_FAST_10000}s | ${GSNPCIO_BATCH_10000}s |
+| 1,000  | ${GSNPCIO_SPAWN_1000}s | ${GSNPCIO_FAST_1000}s | ${GSNPCIO_BATCH_1000}s |
+| 10,000 | ${GSNPCIO_SPAWN_10000}s | ${GSNPCIO_FAST_10000}s | ${GSNPCIO_BATCH_10000}s |
+| 100,000 | ${GSNPCIO_SPAWN_100000}s | ${GSNPCIO_FAST_100000}s | ${GSNPCIO_BATCH_100000}s |
+| 1,000,000 | ${GSNPCIO_SPAWN_1000000}s | ${GSNPCIO_FAST_1000000}s | ${GSNPCIO_BATCH_1000000}s |
+| 10,000,000 | ${GSNPCIO_SPAWN_10000000}s | ${GSNPCIO_FAST_10000000}s | ${GSNPCIO_BATCH_10000000}s |
 
 EOF
 else
@@ -319,7 +337,7 @@ results = []
 
 # Async spawn benchmarks
 try:
-    for num_tasks in [100, 1000, 5000]:
+    for num_tasks in [100, 1000, 5000, 50000, 100000, 1000000]:
         times = []
         for _ in range(iterations):
             async def run():
@@ -337,7 +355,7 @@ except Exception as e:
 
 # Async sleep benchmarks
 try:
-    for num_tasks in [100, 1000, 10000]:
+    for num_tasks in [100, 1000, 10000, 100000, 1000000]:
         times = []
         for _ in range(iterations):
             async def run():

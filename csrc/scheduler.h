@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
 
 #ifdef __linux__
@@ -108,7 +109,7 @@ typedef struct io_bucket {
     int count;
 } io_bucket_t;
 
-#define FD_TABLE_SIZE 65536
+#define FD_TABLE_SIZE 1048576  /* 1M file descriptors for high concurrency */
 
 typedef struct {
     fiber_t *fiber;
@@ -162,6 +163,42 @@ typedef struct scheduler_stats {
     _Atomic uint64_t atomic_task_count;
 } scheduler_stats_t;
 
+/* ============================================ */
+/* Sharded Counter for Low-Contention Counting   */
+/* ============================================ */
+
+#define NUM_SHARDS 64
+
+typedef struct {
+    _Atomic uint64_t counts[NUM_SHARDS];  /* Per-worker shards */
+    _Atomic uint64_t total;               /* Cached total (updated lazily) */
+    uint64_t last_update;                 /* Timestamp of last total update */
+} sharded_counter_t;
+
+/* Initialize sharded counter */
+static inline void sharded_counter_init(sharded_counter_t* sc) {
+    for (int i = 0; i < NUM_SHARDS; i++) {
+        atomic_store(&sc->counts[i], 0);
+    }
+    atomic_store(&sc->total, 0);
+    sc->last_update = 0;
+}
+
+/* Increment shard - O(1) with worker_id */
+static inline uint64_t sharded_counter_inc(sharded_counter_t* sc, uint32_t worker_id) {
+    uint32_t shard = worker_id % NUM_SHARDS;
+    return atomic_fetch_add(&sc->counts[shard], 1) + 1;
+}
+
+/* Decrement shard - O(1) with worker_id */
+static inline uint64_t sharded_counter_dec(sharded_counter_t* sc, uint32_t worker_id) {
+    uint32_t shard = worker_id % NUM_SHARDS;
+    return atomic_fetch_sub(&sc->counts[shard], 1) - 1;
+}
+
+/* Get total - recalculates if stale */
+uint64_t sharded_counter_get_total(sharded_counter_t* sc);
+
 /* Batch scheduling support */
 typedef struct spawn_batch {
     fiber_t** fibers;
@@ -187,6 +224,14 @@ uint64_t scheduler_atomic_inc_fibers_spawned(void);
 uint64_t scheduler_atomic_inc_fibers_completed(void);
 int scheduler_atomic_all_tasks_complete(void);
 
+/* Sharded atomic operations (low contention) */
+uint64_t scheduler_sharded_inc_task_count(uint32_t worker_id);
+uint64_t scheduler_sharded_dec_task_count(uint32_t worker_id);
+uint64_t scheduler_sharded_get_task_count(void);
+
+/* Get current worker ID (thread-local) */
+uint32_t scheduler_get_current_worker_id(void);
+
 typedef struct scheduler {
     worker_t* workers;
     size_t num_workers;
@@ -197,6 +242,10 @@ typedef struct scheduler {
 
     scheduler_config_t config;
     scheduler_stats_t stats;
+
+    /* Sharded task counters for low-contention counting */
+    sharded_counter_t sharded_task_count;
+    sharded_counter_t sharded_completion_count;
 
     bool running;
     bool initialized;

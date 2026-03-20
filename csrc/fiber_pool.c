@@ -17,10 +17,10 @@
 /* Configuration                               */
 /* ============================================ */
 
-#define FIBER_POOL_INITIAL_SIZE 4096     /* Pre-allocate 4K fibers */
+#define FIBER_POOL_INITIAL_SIZE 65536      /* Pre-allocate 64K fibers */
 #define FIBER_POOL_GROWTH_FACTOR 2
-#define FIBER_POOL_MAX_SIZE (1024 * 1024)  /* 1M fibers */
-#define FIBER_POOL_LAZY_STACK 0         /* Pre-allocate stacks at pool creation */
+#define FIBER_POOL_MAX_SIZE (10 * 1024 * 1024)  /* 10M fibers */
+#define FIBER_POOL_LAZY_STACK 1            /* Lazy stack allocation for memory efficiency */
 
 /* Lock-free free list node */
 typedef struct free_node {

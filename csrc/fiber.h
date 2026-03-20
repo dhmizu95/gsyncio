@@ -21,11 +21,12 @@ extern "C" {
 /* Configuration                                */
 /* ============================================ */
 
-#define FIBER_INITIAL_STACK_SIZE 1024   /* 1KB initial stack - minimal for most tasks */
-#define FIBER_MAX_STACK_SIZE 32768     /* 32KB max stack */
-#define FIBER_STACK_GROW_STEP 2048      /* Grow by 2KB */
-#define FIBER_DEFAULT_STACK_SIZE 2048   /* 2KB default - like Go goroutines */
+#define FIBER_INITIAL_STACK_SIZE 512    /* 512B initial stack - minimal for most tasks */
+#define FIBER_MAX_STACK_SIZE 65536      /* 64KB max stack - like Go goroutines */
+#define FIBER_STACK_GROW_STEP 4096      /* Grow by 4KB */
+#define FIBER_DEFAULT_STACK_SIZE 1024   /* 1KB default - optimized for high concurrency */
 #define FIBER_USE_GUARD_PAGES 1         /* Enable guard pages for memory safety */
+#define FIBER_POOL_LAZY_ALLOC 1         /* Lazy stack allocation for memory efficiency */
 
 /* ============================================ */
 /* Fiber States                                */

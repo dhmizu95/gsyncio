@@ -11,7 +11,7 @@ select operations, and task/sync model.
 """
 
 from libc.stdlib cimport malloc, free
-from libc.stdint cimport uint64_t, int64_t, uint16_t
+from libc.stdint cimport uint64_t, int64_t, uint16_t, uint32_t
 from libc.string cimport memset, memcpy
 from cpython.ref cimport PyObject, Py_INCREF, Py_DECREF, Py_XINCREF, Py_XDECREF
 from cpython.object cimport PyObject
@@ -1240,10 +1240,15 @@ cdef extern from "scheduler.h":
     uint64_t scheduler_atomic_inc_fibers_spawned() nogil
     uint64_t scheduler_atomic_inc_fibers_completed() nogil
     int scheduler_atomic_all_tasks_complete() nogil
+    # Sharded counter functions (low contention)
+    uint64_t scheduler_sharded_inc_task_count(uint32_t worker_id) nogil
+    uint64_t scheduler_sharded_dec_task_count(uint32_t worker_id) nogil
+    uint64_t scheduler_sharded_get_task_count() nogil
+    uint32_t scheduler_get_current_worker_id() nogil
 
 def atomic_task_count():
-    """Get current task count (lock-free, thread-safe)"""
-    return scheduler_atomic_get_task_count()
+    """Get current task count using sharded counters (low contention, thread-safe)"""
+    return scheduler_sharded_get_task_count()
 
 def atomic_inc_task_count():
     """Atomically increment task count (lock-free)"""
@@ -1254,8 +1259,8 @@ def atomic_dec_task_count():
     return scheduler_atomic_dec_task_count()
 
 def atomic_all_tasks_complete():
-    """Check if all tasks are complete (lock-free)"""
-    return scheduler_atomic_all_tasks_complete() != 0
+    """Check if all tasks are complete (uses sharded counter)"""
+    return scheduler_sharded_get_task_count() == 0
 
 
 # ============================================
