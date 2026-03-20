@@ -1358,50 +1358,60 @@ void scheduler_wait_all(void) {
 
     /* Wait using atomic task count - this is the authoritative count */
     uint64_t spin_count = 0;
+    uint64_t last_task_count = 0;
+    uint64_t stuck_count = 0;
+    
     while (scheduler_atomic_get_task_count() > 0) {
-        /* First check if any workers are actually running */
-        bool any_running = false;
-        for (size_t i = 0; i < sched->num_workers; i++) {
-            if (atomic_load(&sched->workers[i].running) && 
-                !atomic_load(&sched->workers[i].stopped)) {
-                any_running = true;
-                break;
-            }
-        }
+        uint64_t current_count = scheduler_atomic_get_task_count();
         
-        if (!any_running) {
-            /* Workers not running - use scheduler_run on main thread */
-            fiber_t* f = NULL;
-            
-            /* Check global queue */
-            pthread_mutex_lock(&sched->mutex);
-            f = sched->ready_queue;
-            if (f) {
-                sched->ready_queue = f->next_ready;
-            }
-            pthread_mutex_unlock(&sched->mutex);
-            
-            if (f && (f->state == FIBER_NEW || f->state == FIBER_READY)) {
-                /* Execute fiber directly on main thread */
-                if (f->state == FIBER_NEW) {
-                    if (setjmp(f->context) == 0) {
-                        f->state = FIBER_RUNNING;
-                        f->func(f->arg);
-                        f->state = FIBER_COMPLETED;
-                        scheduler_atomic_dec_task_count();
-                        
-                        if (f->pool) {
-                            fiber_pool_free(f->pool, f);
-                        } else {
-                            fiber_free(f);
+        /* Check if we're stuck (task count not decreasing) */
+        if (current_count == last_task_count) {
+            stuck_count++;
+            /* After 100 tries with same count, force process global queue */
+            if (stuck_count > 100) {
+                fiber_t* f = NULL;
+                
+                /* Lock and try to get from global queue */
+                pthread_mutex_lock(&sched->mutex);
+                f = sched->ready_queue;
+                if (f) {
+                    sched->ready_queue = f->next_ready;
+                }
+                pthread_mutex_unlock(&sched->mutex);
+                
+                if (f) {
+                    /* Try to execute it */
+                    fiber_state_t expected = f->state;
+                    if (expected == FIBER_NEW || expected == FIBER_READY) {
+                        if (__atomic_compare_exchange_n(&f->state, &expected, FIBER_RUNNING,
+                                                      false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+                            /* Execute fiber */
+                            if (expected == FIBER_NEW) {
+                                if (setjmp(f->context) == 0) {
+                                    f->func(f->arg);
+                                }
+                            } else {
+                                longjmp(f->context, 1);
+                            }
+                            
+                            /* Mark complete and decrement */
+                            f->state = FIBER_COMPLETED;
+                            scheduler_atomic_dec_task_count();
+                            
+                            /* Free fiber */
+                            if (f->pool) {
+                                fiber_pool_free(f->pool, f);
+                            } else {
+                                fiber_free(f);
+                            }
                         }
                     }
                 }
-                continue;
+                stuck_count = 0;
             }
-            
-            /* No work on global queue either - break to avoid infinite loop */
-            break;
+        } else {
+            last_task_count = current_count;
+            stuck_count = 0;
         }
         
         /* Yield to allow workers to run */
