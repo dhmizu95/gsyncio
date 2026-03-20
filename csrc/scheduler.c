@@ -9,6 +9,7 @@
 
 #include "scheduler.h"
 #include "fiber_pool.h"
+#include "fiber.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -20,10 +21,96 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <sched.h>
+#include <signal.h>
+#include <execinfo.h>
+#include <stdlib.h>
 
 #ifdef __linux__
 #include "io_uring.h"
 #endif
+
+/* ============================================ */
+/* Debug Logging Infrastructure                 */
+/* ============================================ */
+
+/* Enable debug logging via GSYNCIO_DEBUG environment variable */
+static int g_debug_enabled = -1;
+
+static void init_debug_flag(void) {
+    if (g_debug_enabled == -1) {
+        const char* env = getenv("GSYNCIO_DEBUG");
+        g_debug_enabled = (env && strcmp(env, "1") == 0) ? 1 : 0;
+    }
+}
+
+#define DEBUG_LOG(fmt, ...) do { \
+    if (g_debug_enabled == -1) init_debug_flag(); \
+    if (g_debug_enabled) { \
+        fprintf(stderr, "[DEBUG %s:%d] " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); \
+        fflush(stderr); \
+    } \
+} while(0)
+
+#define DEBUG_LOG_FIBER(msg, fiber) do { \
+    if (g_debug_enabled == -1) init_debug_flag(); \
+    if (g_debug_enabled) { \
+        fprintf(stderr, "[DEBUG %s:%d] Fiber %lu: " msg " (state=%d, stack=%p)\n", \
+            __FILE__, __LINE__, \
+            (fiber) ? (unsigned long)(fiber)->id : 0, \
+            (fiber) ? (int)(fiber)->state : -1, \
+            (fiber) ? (fiber)->stack_base : NULL); \
+        fflush(stderr); \
+    } \
+} while(0)
+
+/* ============================================ */
+/* Segfault Handler with Stack Trace           */
+/* ============================================ */
+
+static void sigsegv_handler(int sig, siginfo_t* info, void* context) {
+    (void)context;
+    
+    fprintf(stderr, "\n========================================\n");
+    fprintf(stderr, "FATAL: Segmentation fault (signal %d)\n", sig);
+    fprintf(stderr, "Fault address: %p\n", info->si_addr);
+    fprintf(stderr, "========================================\n");
+    
+    /* Print stack trace */
+    void* buffer[64];
+    int n = backtrace(buffer, 64);
+    fprintf(stderr, "Stack trace (%d frames):\n", n);
+    backtrace_symbols_fd(buffer, n, 2);
+    
+    /* Print scheduler stats if available */
+    if (g_scheduler) {
+        scheduler_t* s = (scheduler_t*)g_scheduler;
+        fprintf(stderr, "\nScheduler stats:\n");
+        fprintf(stderr, "  Active tasks: %lu\n", (unsigned long)s->stats.atomic_task_count);
+        fprintf(stderr, "  Total fibers completed: %lu\n", (unsigned long)s->stats.total_fibers_completed);
+    }
+    
+    fprintf(stderr, "========================================\n");
+    fflush(stderr);
+    
+    _exit(1);
+}
+
+static void install_crash_handler(void) {
+    static int installed = 0;
+    if (installed) return;
+    
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = sigsegv_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    
+    installed = 1;
+    DEBUG_LOG("Crash handler installed");
+}
 
 /* Fast sleep threshold: use spin-wait for sleeps under this value (1ms) */
 #define FAST_SLEEP_THRESHOLD_NS 1000000ULL
@@ -486,9 +573,19 @@ static void* worker_thread(void* arg) {
             w->current_fiber = f;
             w->tasks_executed++;
 
+            DEBUG_LOG_FIBER("Executing fiber", f);
+            
+            /* Check for NULL stack - potential crash source */
+            if (!f->stack_base && !f->stack_ptr) {
+                fprintf(stderr, "[ERROR] Worker %d: Fiber %lu has NULL stack! (state=%d, pool=%p)\n",
+                        w->id, (unsigned long)f->id, (int)f->state, f->pool);
+                fflush(stderr);
+            }
+
             if (f->state == FIBER_RUNNING) {
                 if (expected_state == FIBER_NEW) {
                     /* First time running this fiber */
+                    DEBUG_LOG("Worker %d: Running NEW fiber %lu", w->id, (unsigned long)f->id);
                     if (setjmp(f->context) == 0) {
                         f->func(f->arg);
                         
@@ -506,6 +603,8 @@ static void* worker_thread(void* arg) {
                             scheduler_schedule(f->parent, -1);
                         }
 
+                        DEBUG_LOG_FIBER("Freeing fiber", f);
+                        
                         if (f->pool) {
                             fiber_pool_free(f->pool, f);
                         } else {
@@ -513,6 +612,8 @@ static void* worker_thread(void* arg) {
                         }
 
                         w->current_fiber = NULL;
+                        
+                        DEBUG_LOG("Worker %d: Task count now %lu", w->id, (unsigned long)atomic_load(&g_scheduler->stats.atomic_task_count));
                         
                         /* Yield to allow other workers to acquire GIL */
                         sched_yield();
@@ -717,6 +818,11 @@ static int get_random_victim(worker_t* w) {
 }
 
 int scheduler_init(scheduler_config_t* config) {
+    /* Install crash handler first */
+    install_crash_handler();
+    
+    DEBUG_LOG("Scheduler initialization starting...");
+    
     if (g_scheduler) {
         return -1;
     }
@@ -800,6 +906,7 @@ int scheduler_init(scheduler_config_t* config) {
 
     /* Start with 8K fibers - grows on demand to 10M */
     sched->fiber_pool = fiber_pool_create(8192);
+    DEBUG_LOG("Fiber pool created: capacity=%zu", fiber_pool_capacity(sched->fiber_pool));
 
     /* Initialize timer pool - start with 8K timers */
     timer_pool_init(8192);

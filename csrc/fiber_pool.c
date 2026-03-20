@@ -12,6 +12,25 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <sys/mman.h>
+#include <stdio.h>
+
+/* Debug logging - controlled by GSYNCIO_DEBUG env var */
+static int g_debug_enabled = -1;
+
+static void init_debug_flag(void) {
+    if (g_debug_enabled == -1) {
+        const char* env = getenv("GSYNCIO_DEBUG");
+        g_debug_enabled = (env && strcmp(env, "1") == 0) ? 1 : 0;
+    }
+}
+
+#define DEBUG_LOG(fmt, ...) do { \
+    if (g_debug_enabled == -1) init_debug_flag(); \
+    if (g_debug_enabled) { \
+        fprintf(stderr, "[FIBER_POOL DEBUG %s:%d] " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); \
+        fflush(stderr); \
+    } \
+} while(0)
 
 /* ============================================ */
 /* Configuration                               */
@@ -20,7 +39,7 @@
 #define FIBER_POOL_INITIAL_SIZE 8192       /* Pre-allocate 8K fibers (balanced) */
 #define FIBER_POOL_GROWTH_FACTOR 2
 #define FIBER_POOL_MAX_SIZE (10 * 1024 * 1024)  /* 10M fibers max */
-#define FIBER_POOL_LAZY_STACK 1            /* Lazy stack allocation for memory efficiency */
+#define FIBER_POOL_LAZY_STACK 0            /* Eager stack allocation - required for correct operation */
 
 /* Lock-free free list node */
 typedef struct free_node {
@@ -128,6 +147,9 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool) {
         return NULL;
     }
     
+    DEBUG_LOG("Allocating fiber from pool, available=%zu", 
+              atomic_load(&pool->available));
+    
     /* Fast path: lock-free pop from free list */
     free_node_t* head = atomic_load(&pool->free_list);
     
@@ -156,6 +178,10 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool) {
             /* Note: Not adding to fiber table - pool fibers are tracked separately */
             
             atomic_fetch_sub(&pool->available, 1);
+            
+            DEBUG_LOG("Fiber %lu allocated: stack_base=%p, stack_ptr=%p, stack_cap=%zu",
+                      (unsigned long)fiber->id, fiber->stack_base, 
+                      fiber->stack_ptr, fiber->stack_capacity);
             
             return fiber;
         }
@@ -243,6 +269,9 @@ void fiber_pool_free(fiber_pool_t* pool, fiber_t* fiber) {
     if (!pool || !fiber) {
         return;
     }
+    
+    DEBUG_LOG("Freeing fiber %lu back to pool, available=%zu",
+              (unsigned long)fiber->id, atomic_load(&pool->available));
     
     /* Reset fiber state for reuse (keep pre-allocated stack) */
     fiber->state = FIBER_NEW;
