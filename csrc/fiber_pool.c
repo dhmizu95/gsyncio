@@ -39,7 +39,7 @@ static void init_debug_flag(void) {
 #define FIBER_POOL_INITIAL_SIZE 8192       /* Pre-allocate 8K fibers (balanced) */
 #define FIBER_POOL_GROWTH_FACTOR 2
 #define FIBER_POOL_MAX_SIZE (10 * 1024 * 1024)  /* 10M fibers max */
-#define FIBER_POOL_LAZY_STACK 0            /* Eager stack allocation - required for correct operation */
+#define FIBER_POOL_LAZY_STACK 1            /* Lazy stack allocation - allocate on first use */
 
 /* Lock-free free list node */
 typedef struct free_node {
@@ -83,12 +83,15 @@ fiber_pool_t* fiber_pool_create(size_t initial_size) {
     
     /* Initialize lock-free free list */
     atomic_store(&pool->free_list, NULL);
-    
-    /* Pre-allocate stacks for all fibers and push to free list */
+
+    /* Initialize fibers and push to free list */
+    /* With lazy stack, stacks are allocated on first use */
     for (size_t i = 0; i < pool->capacity; i++) {
         pool->fibers[i].id = i;
         pool->fibers[i].pool = pool;
+        
 #if FIBER_POOL_LAZY_STACK == 0
+        /* Eager allocation: pre-allocate stack now */
         pool->fibers[i].stack_base = mmap(
             NULL,
             FIBER_DEFAULT_STACK_SIZE + 4096,
@@ -102,7 +105,13 @@ fiber_pool_t* fiber_pool_create(size_t initial_size) {
             pool->fibers[i].stack_capacity = FIBER_DEFAULT_STACK_SIZE;
             pool->fibers[i].stack_ptr = (char*)pool->fibers[i].stack_base + FIBER_DEFAULT_STACK_SIZE + 4096;
         }
+#else
+        /* Lazy allocation: initialize to NULL, allocate on first use */
+        pool->fibers[i].stack_base = NULL;
+        pool->fibers[i].stack_capacity = 0;
+        pool->fibers[i].stack_ptr = NULL;
 #endif
+        
         /* Push to lock-free free list */
         nodes[i].fiber = &pool->fibers[i];
         atomic_store(&nodes[i].next, atomic_load(&pool->free_list));
@@ -124,18 +133,18 @@ void fiber_pool_destroy(fiber_pool_t* pool) {
     if (!pool) {
         return;
     }
-    
+
     pthread_mutex_destroy(&pool->mutex);
-    
-    /* Free stacks */
-#if FIBER_POOL_LAZY_STACK == 0
+
+    /* Free stacks - with lazy allocation, only free non-NULL stacks */
     for (size_t i = 0; i < pool->capacity; i++) {
-        if (pool->fibers[i].stack_base != NULL && pool->fibers[i].stack_base != MAP_FAILED) {
-            munmap(pool->fibers[i].stack_base, pool->fibers[i].stack_capacity + 4096);
+        if (pool->fibers[i].stack_base != NULL && 
+            pool->fibers[i].stack_base != MAP_FAILED) {
+            munmap(pool->fibers[i].stack_base, 
+                   pool->fibers[i].stack_capacity + 4096);
         }
     }
-#endif
-    
+
     free(pool->_nodes);
     free(pool->fibers);
     free(pool);
@@ -158,19 +167,49 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool) {
         if (atomic_compare_exchange_weak(&pool->free_list, &head, next)) {
             /* Successfully popped */
             fiber_t* fiber = head->fiber;
-            
-            /* Reset fiber state (keep pre-allocated stack) */
+
+            /* Save stack info before reset (for lazy allocation) */
             void* saved_stack_base = fiber->stack_base;
             size_t saved_stack_capacity = fiber->stack_capacity;
             char* saved_stack_ptr = fiber->stack_ptr;
             
+            /* Reset fiber state */
             memset(fiber, 0, sizeof(fiber_t));
-            
-            /* Restore pre-allocated stack */
+
+            /* Restore or allocate stack */
+#if FIBER_POOL_LAZY_STACK == 0
+            /* Eager: restore pre-allocated stack */
             fiber->stack_base = saved_stack_base;
             fiber->stack_capacity = saved_stack_capacity;
             fiber->stack_ptr = saved_stack_ptr;
-            
+#else
+            /* Lazy: allocate stack on first use if not already allocated */
+            if (!saved_stack_base) {
+                /* First use - allocate stack now */
+                fiber->stack_base = mmap(
+                    NULL,
+                    FIBER_DEFAULT_STACK_SIZE + 4096,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    -1,
+                    0
+                );
+                if (fiber->stack_base != MAP_FAILED) {
+                    mprotect(fiber->stack_base, 4096, PROT_NONE);
+                    fiber->stack_capacity = FIBER_DEFAULT_STACK_SIZE;
+                    fiber->stack_ptr = (char*)fiber->stack_base + FIBER_DEFAULT_STACK_SIZE + 4096;
+                } else {
+                    DEBUG_LOG("Failed to allocate stack for fiber %lu", 
+                              (unsigned long)(atomic_load(&pool->allocated) + 1));
+                }
+            } else {
+                /* Restore previously allocated stack */
+                fiber->stack_base = saved_stack_base;
+                fiber->stack_capacity = saved_stack_capacity;
+                fiber->stack_ptr = saved_stack_ptr;
+            }
+#endif
+
             fiber->id = atomic_fetch_add(&pool->allocated, 1) + 1;  /* Unique ID */
             fiber->pool = pool;
             fiber->state = FIBER_NEW;
@@ -233,7 +272,9 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool) {
         size_t idx = old_capacity + i;
         pool->fibers[idx].id = idx;
         pool->fibers[idx].pool = pool;
+        
 #if FIBER_POOL_LAZY_STACK == 0
+        /* Eager: allocate stack now */
         pool->fibers[idx].stack_base = mmap(
             NULL,
             FIBER_DEFAULT_STACK_SIZE + 4096,
@@ -247,7 +288,13 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool) {
             pool->fibers[idx].stack_capacity = FIBER_DEFAULT_STACK_SIZE;
             pool->fibers[idx].stack_ptr = (char*)pool->fibers[idx].stack_base + FIBER_DEFAULT_STACK_SIZE + 4096;
         }
+#else
+        /* Lazy: initialize to NULL, allocate on first use */
+        pool->fibers[idx].stack_base = NULL;
+        pool->fibers[idx].stack_capacity = 0;
+        pool->fibers[idx].stack_ptr = NULL;
 #endif
+        
         /* Add to lock-free free list (push) */
         free_node_t* node = &new_nodes[idx];
         node->fiber = &pool->fibers[idx];
