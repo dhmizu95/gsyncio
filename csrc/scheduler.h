@@ -243,7 +243,7 @@ typedef struct scheduler {
     size_t num_workers;
     _Atomic size_t next_worker;  /* Atomic round-robin worker selection */
 
-    fiber_t* ready_queue;
+    _Atomic(fiber_t*) ready_queue;
     fiber_t* blocked_queue;
 
     scheduler_config_t config;

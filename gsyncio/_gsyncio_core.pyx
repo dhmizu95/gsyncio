@@ -385,8 +385,21 @@ cdef class Future:
 
     def __await__(self):
         """Make future awaitable"""
-        if not future_is_done(self._future):
-            future_await(self._future)
+        cdef fiber_t* current = fiber_current()
+        if current:
+            # On a gsyncio fiber - use native await (fast path)
+            if not future_is_done(self._future):
+                future_await(self._future)
+            return self.result()
+        else:
+            # In an asyncio context - yield until done
+            return self._asyncio_await().__await__()
+
+    async def _asyncio_await(self):
+        import asyncio
+        while not future_is_done(self._future):
+            # Yield to the event loop
+            await asyncio.sleep(0.001)
         return self.result()
 
 
@@ -1133,9 +1146,8 @@ def task_batch():
 
 def sync():
     """Wait for all tasks to complete"""
-    global _task_registry
-    if _task_registry:
-        _task_registry.sync()
+    with nogil:
+        scheduler_wait_all()
 
 
 def sync_timeout(float timeout_s):

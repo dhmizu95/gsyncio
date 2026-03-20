@@ -21,13 +21,11 @@ extern "C" {
 /* ============================================ */
 
 typedef struct fiber_pool {
-    fiber_t* fibers;           /* Array of fiber control blocks */
-    _Atomic(void*) free_list;  /* Lock-free free list head */
-    void* _nodes;              /* Node array for lock-free list */
-    size_t capacity;           /* Total capacity */
-    _Atomic size_t available;   /* Available fibers (atomic) */
-    _Atomic size_t allocated;   /* Currently allocated (atomic) */
-    pthread_mutex_t mutex;     /* Mutex for pool growth only */
+    _Atomic(void*) free_list;  /* Linked list of available fibers (reusing fiber->next_ready) */
+    size_t capacity;           /* Total fibers created across all segments */
+    _Atomic size_t available;   /* Available fibers in the free list */
+    _Atomic size_t allocated;   /* Currently handed out fibers */
+    pthread_mutex_t mutex;     /* Mutex for growth and freelist protection */
 } fiber_pool_t;
 
 /* ============================================ */

@@ -22,13 +22,33 @@ static size_t g_fiber_table_count = 0;
 static pthread_mutex_t g_fiber_table_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int fiber_table_resize(size_t new_capacity) {
-    fiber_t** new_table = realloc(g_fiber_table, new_capacity * sizeof(fiber_t*));
-    if (!new_table) {
+    fiber_t** old_table = g_fiber_table;
+    size_t old_capacity = g_fiber_table_capacity;
+    
+    g_fiber_table = (fiber_t**)calloc(new_capacity, sizeof(fiber_t*));
+    if (!g_fiber_table) {
+        g_fiber_table = old_table;
         return -1;
     }
-    g_fiber_table = new_table;
     g_fiber_table_capacity = new_capacity;
+    g_fiber_table_count = 0;
+    
+    if (old_table) {
+        for (size_t i = 0; i < old_capacity; i++) {
+            if (old_table[i] && old_table[i] != (fiber_t*)-1) {
+                fiber_table_add(old_table[i]);
+            }
+        }
+        free(old_table);
+    }
     return 0;
+}
+
+static uint64_t hash_id(uint64_t id) {
+    id = (id ^ (id >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    id = (id ^ (id >> 27)) * 0x94d049bb133111ebULL;
+    id = id ^ (id >> 31);
+    return id;
 }
 
 int fiber_table_add(fiber_t* f) {
@@ -36,29 +56,45 @@ int fiber_table_add(fiber_t* f) {
     
     pthread_mutex_lock(&g_fiber_table_mutex);
     
-    if (g_fiber_table_count >= g_fiber_table_capacity) {
-        size_t new_capacity = g_fiber_table_capacity == 0 ? 256 : g_fiber_table_capacity * 2;
+    if (g_fiber_table_count * 2 >= g_fiber_table_capacity) {
+        size_t new_capacity = g_fiber_table_capacity == 0 ? 1024 : g_fiber_table_capacity * 2;
         if (fiber_table_resize(new_capacity) != 0) {
             pthread_mutex_unlock(&g_fiber_table_mutex);
             return -1;
         }
     }
     
-    g_fiber_table[g_fiber_table_count++] = f;
+    uint64_t h = hash_id(f->id);
+    size_t idx = h % g_fiber_table_capacity;
+    
+    while (g_fiber_table[idx] && g_fiber_table[idx] != (fiber_t*)-1) {
+        idx = (idx + 1) % g_fiber_table_capacity;
+    }
+    
+    g_fiber_table[idx] = f;
+    g_fiber_table_count++;
+    
     pthread_mutex_unlock(&g_fiber_table_mutex);
     return 0;
 }
 
 static void fiber_table_remove(fiber_t* f) {
-    if (!f) return;
+    if (!f || !g_fiber_table_capacity) return;
     
     pthread_mutex_lock(&g_fiber_table_mutex);
     
-    for (size_t i = 0; i < g_fiber_table_count; i++) {
-        if (g_fiber_table[i] == f) {
-            g_fiber_table[i] = g_fiber_table[--g_fiber_table_count];
+    uint64_t h = hash_id(f->id);
+    size_t idx = h % g_fiber_table_capacity;
+    size_t start_idx = idx;
+    
+    while (g_fiber_table[idx]) {
+        if (g_fiber_table[idx] == f) {
+            g_fiber_table[idx] = (fiber_t*)-1;  /* Tombstone */
+            g_fiber_table_count--;
             break;
         }
+        idx = (idx + 1) % g_fiber_table_capacity;
+        if (idx == start_idx) break;
     }
     
     pthread_mutex_unlock(&g_fiber_table_mutex);
@@ -233,16 +269,15 @@ void fiber_yield(void) {
         return;
     }
 
-    /* Mark as ready (not waiting - we want to run again) */
-    current->state = FIBER_READY;
+    /* Only mark as ready and reschedule if not intentionally waiting/parked */
+    if (current->state != FIBER_WAITING) {
+        current->state = FIBER_READY;
 
-    /* Add back to scheduler queue */
-    if (g_scheduler) {
-        scheduler_schedule(current, -1);
+        /* Add back to scheduler queue */
+        if (g_scheduler) {
+            scheduler_schedule(current, -1);
+        }
     }
-
-    /* Worker will pick next fiber - no explicit jump needed */
-    /* The worker loop continues to the next iteration */
 }
 
 void fiber_resume(fiber_t* fiber) {
@@ -308,14 +343,22 @@ bool fiber_is_parked(fiber_t* fiber) {
 }
 
 fiber_t* fiber_get_by_id(uint64_t id) {
+    if (!g_fiber_table_capacity) return NULL;
+    
     pthread_mutex_lock(&g_fiber_table_mutex);
     
-    for (size_t i = 0; i < g_fiber_table_count; i++) {
-        if (g_fiber_table[i] && g_fiber_table[i]->id == id) {
-            fiber_t* f = g_fiber_table[i];
+    uint64_t h = hash_id(id);
+    size_t idx = h % g_fiber_table_capacity;
+    size_t start_idx = idx;
+    
+    while (g_fiber_table[idx]) {
+        if (g_fiber_table[idx] != (fiber_t*)-1 && g_fiber_table[idx]->id == id) {
+            fiber_t* f = g_fiber_table[idx];
             pthread_mutex_unlock(&g_fiber_table_mutex);
             return f;
         }
+        idx = (idx + 1) % g_fiber_table_capacity;
+        if (idx == start_idx) break;
     }
     
     pthread_mutex_unlock(&g_fiber_table_mutex);

@@ -77,13 +77,35 @@ void task_registry_destroy(task_registry_t* reg) {
     free(reg);
 }
 
-/* Internal task wrapper that tracks completion */
 typedef struct task_wrapper_arg {
     void (*func)(void*);
     void* arg;
     task_registry_t* registry;
     uint64_t task_id;
+    struct task_wrapper_arg* next;  /* For pooling */
 } task_wrapper_arg_t;
+
+/* Global task wrapper pool for 10M scale */
+static _Atomic(task_wrapper_arg_t*) g_wrapper_pool = NULL;
+
+static task_wrapper_arg_t* wrapper_alloc(void) {
+    task_wrapper_arg_t* head = atomic_load(&g_wrapper_pool);
+    while (head != NULL) {
+        task_wrapper_arg_t* next = head->next;
+        if (atomic_compare_exchange_weak(&g_wrapper_pool, &head, next)) {
+            return head;
+        }
+    }
+    return (task_wrapper_arg_t*)calloc(1, sizeof(task_wrapper_arg_t));
+}
+
+static void wrapper_free(task_wrapper_arg_t* wrapper) {
+    if (!wrapper) return;
+    task_wrapper_arg_t* head = atomic_load(&g_wrapper_pool);
+    do {
+        wrapper->next = head;
+    } while (!atomic_compare_exchange_weak(&g_wrapper_pool, &head, wrapper));
+}
 
 void task_wrapper(void* arg) {
     task_wrapper_arg_t* wrapper = (task_wrapper_arg_t*)arg;
@@ -113,8 +135,8 @@ void task_wrapper(void* arg) {
         }
     }
 
-    /* Free wrapper */
-    free(wrapper);
+    /* Free wrapper and return to pool */
+    wrapper_free(wrapper);
 }
 
 task_handle_t* task_spawn(task_registry_t* reg, void (*func)(void*), void* arg) {
@@ -122,11 +144,12 @@ task_handle_t* task_spawn(task_registry_t* reg, void (*func)(void*), void* arg) 
         return NULL;
     }
 
-    /* Create wrapper */
-    task_wrapper_arg_t* wrapper = (task_wrapper_arg_t*)calloc(1, sizeof(task_wrapper_arg_t));
+    /* Create wrapper from pool */
+    task_wrapper_arg_t* wrapper = wrapper_alloc();
     if (!wrapper) {
         return NULL;
     }
+    memset(wrapper, 0, sizeof(task_wrapper_arg_t));
 
     wrapper->func = func;
     wrapper->arg = arg;
@@ -257,13 +280,14 @@ int task_batch_spawn(task_batch_t* batch, task_registry_t* reg) {
 
     /* Spawn all fibers */
     for (size_t i = 0; i < batch->count; i++) {
-        /* Create wrapper */
-        task_wrapper_arg_t* wrapper = (task_wrapper_arg_t*)calloc(1, sizeof(task_wrapper_arg_t));
+        /* Create wrapper from pool */
+        task_wrapper_arg_t* wrapper = wrapper_alloc();
         if (!wrapper) {
             /* Rollback on failure */
             atomic_fetch_sub(&reg->active_count, batch->count - i);
             return -1;
         }
+        memset(wrapper, 0, sizeof(task_wrapper_arg_t));
 
         wrapper->func = batch->funcs[i];
         wrapper->arg = batch->args[i];
@@ -506,13 +530,14 @@ size_t task_batch_fast_spawn_nogil(task_batch_fast_t* batch, task_registry_t* re
 
     /* Spawn all fibers - NO GIL needed here */
     for (size_t i = 0; i < batch->count; i++) {
-        /* Create minimal wrapper */
-        task_wrapper_arg_t* wrapper = (task_wrapper_arg_t*)calloc(1, sizeof(task_wrapper_arg_t));
+        /* Create minimal wrapper from pool */
+        task_wrapper_arg_t* wrapper = wrapper_alloc();
         if (!wrapper) {
             /* Continue on failure - best effort batch spawn */
             atomic_fetch_sub(&reg->active_count, 1);
             continue;
         }
+        memset(wrapper, 0, sizeof(task_wrapper_arg_t));
 
         wrapper->func = batch->funcs[i];
         wrapper->arg = batch->args[i];
@@ -565,6 +590,10 @@ size_t task_batch_fast_spawn_nogil(task_batch_fast_t* batch, task_registry_t* re
             continue;
         }
 
+        /* Update global scheduler stats (Authoritative for scheduler_wait_all) */
+        __atomic_add_fetch(&g_scheduler->stats.atomic_task_count, 1, __ATOMIC_SEQ_CST);
+        __atomic_add_fetch(&g_scheduler->stats.atomic_fibers_spawned, 1, __ATOMIC_SEQ_CST);
+        
         g_scheduler->stats.total_fibers_created++;
 
         /* Schedule fiber with atomic round-robin */

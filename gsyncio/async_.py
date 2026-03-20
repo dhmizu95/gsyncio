@@ -78,9 +78,16 @@ async def sleep(ms: int) -> None:
     Uses native gsyncio timer when in fiber context (fast path).
     Falls back to asyncio.sleep when in asyncio context.
     """
-    if _HAS_CYTHON:
+    from .core import current_fiber_id
+    
+    if _HAS_CYTHON and current_fiber_id() != 0:
+        # We are on a gsyncio fiber - use native sleep
         sleep_ns(ms * 1000000)
+        # Yield to allow other fibers to run (sleep_ns already yields, but this
+        # makes the function a coroutine as expected)
+        await asyncio.sleep(0)
     else:
+        # Fallback to standard asyncio sleep
         await asyncio.sleep(ms / 1000.0)
 
 

@@ -1,10 +1,4 @@
-/**
- * future.c - Future implementation for gsyncio
- * 
- * A Future represents a value that will be available in the future.
- * Used for async/await operations.
- */
-
+#include <Python.h>
 #include "future.h"
 #include "fiber.h"
 #include <stdlib.h>
@@ -153,7 +147,15 @@ void* future_result(future_t* f) {
     pthread_mutex_lock(&f->mutex);
     
     while (f->state == FUTURE_PENDING) {
+        #ifdef Py_BEGIN_ALLOW_THREADS
+        Py_BEGIN_ALLOW_THREADS
+        #endif
+        
         pthread_cond_wait(&f->cond, &f->mutex);
+        
+        #ifdef Py_END_ALLOW_THREADS
+        Py_END_ALLOW_THREADS
+        #endif
     }
     
     void* result = f->result;

@@ -156,25 +156,27 @@ class Future:
                 self.add_callback(on_done)
                 yield from async_fut
             except RuntimeError:
-                # No running event loop - we're in sync context
-                # Use threading.Event for blocking wait
-                import threading
-                event = threading.Event()
+                # No running event loop or not in asyncio context
+                from .core import current_fiber_id, yield_execution
+                
+                if current_fiber_id() != 0:
+                    # We are in a gsyncio fiber context
+                    # Use a busy-wait with yield or a park if we had direct access
+                    # Since we don't have direct fiber_park here conveniently,
+                    # we can use the C future's blocking wait which we just fixed
+                    # to release the GIL, so it's safe-ish, but let's try to be better.
+                    while not self.done:
+                        yield_execution()
+                else:
+                    # Sync context (standard thread)
+                    import threading
+                    event = threading.Event()
+                    def on_done(fut):
+                        event.set()
+                    self.add_callback(on_done)
+                    event.wait()
 
-                def on_done(fut):
-                    event.set()
-
-                self.add_callback(on_done)
-                event.wait()
-
-        # Check for exception using the C future
-        try:
-            exc = self._future.exception()
-            if exc:
-                raise exc
-        except:
-            pass
-            
+        # Return the result (result() will raise any exception)
         return self._future.result()
     
     def __iter__(self):
