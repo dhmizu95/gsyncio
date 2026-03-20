@@ -629,79 +629,45 @@ static void* worker_thread(void* arg) {
 
             w->current_fiber = NULL;
         } else {
-            // No work - process timers and sleep
+            // No work - process timers and yield
             process_timers(sched);
 
-            int found_work = 0;
-
-            // Brief spin before sleeping - check local and global queues
-            for (int spin = 0; spin < 100 && !w->stopped && !found_work; spin++) {
+            // Brief spin before sleeping - check for work
+            fiber_t* spin_fiber = NULL;
+            for (int spin = 0; spin < 100 && !w->stopped; spin++) {
                 __asm__ __volatile__("" ::: "memory");
 
                 // Check local queue first (fast path - no lock needed)
-                f = pop_local(w);
-                if (f) {
-                    found_work = 1;
-                } else {
-                    // Check global queue
-                    pthread_mutex_lock(&sched->mutex);
-                    f = sched->ready_queue;
-                    if (f) {
-                        sched->ready_queue = f->next_ready;
-                        found_work = 1;
-                    }
-                    pthread_mutex_unlock(&sched->mutex);
+                spin_fiber = pop_local(w);
+                if (spin_fiber) {
+                    break;  // Found work
                 }
-            }
 
-            // Execute work if found during spin
-            if (found_work && f) {
-                w->current_fiber = f;
-                w->tasks_executed++;
-
-                if (f->state == FIBER_NEW || f->state == FIBER_READY) {
-                    if (f->state == FIBER_NEW) {
-                        if (setjmp(f->context) == 0) {
-                            f->state = FIBER_RUNNING;
-                            f->func(f->arg);
-                            f->state = FIBER_COMPLETED;
-                            sched->stats.total_fibers_completed++;
-                            
-                            /* Decrement global atomic task count */
-                            scheduler_atomic_dec_task_count();
-                            /* Sharded counter decrement */
-                            scheduler_sharded_dec_task_count(scheduler_get_current_worker_id());
-
-                            if (f->parent) {
-                                scheduler_schedule(f->parent, -1);
-                            }
-
-                            if (f->pool) {
-                                fiber_pool_free(f->pool, f);
-                            } else {
-                                fiber_free(f);
-                            }
-
-                            w->current_fiber = NULL;
-                            
-                            /* Yield to allow other workers to acquire GIL */
-                            sched_yield();
-                            
-                            continue;
-                        }
-                    } else {
-                        f->state = FIBER_RUNNING;
-                        longjmp(f->context, 1);
+                // Check global queue
+                pthread_mutex_lock(&sched->mutex);
+                spin_fiber = sched->ready_queue;
+                if (spin_fiber) {
+                    sched->ready_queue = spin_fiber->next_ready;
+                    /* Verify fiber state before claiming - prevent double execution */
+                    if (spin_fiber->state != FIBER_NEW && spin_fiber->state != FIBER_READY) {
+                        /* Already claimed by another worker */
+                        spin_fiber = NULL;
                     }
                 }
-                w->current_fiber = NULL;
+                pthread_mutex_unlock(&sched->mutex);
+
+                if (spin_fiber) break;  // Found work
             }
 
-            // Sleep with timeout if no work found
-            if (!found_work && !w->stopped) {
+            // If we found work, execute it
+            if (spin_fiber && !w->stopped) {
+                f = spin_fiber;
+                // Fall through to execution code below
+            } else {
+                // Sleep with timeout if no work found
                 /* Yield before sleeping to let other threads run */
                 sched_yield();
-                
+
                 struct timespec ts;
                 ts.tv_sec = 0;
                 ts.tv_nsec = 1000000; // 1ms timeout
@@ -710,6 +676,87 @@ static void* worker_thread(void* arg) {
                 pthread_cond_timedwait(&sched->cond, &sched->mutex, &ts);
                 pthread_mutex_unlock(&sched->mutex);
             }
+        }
+
+        // Execution code - reached either from main if(f) block or from spin loop
+        if (f && !w->stopped) {
+            /* Check fiber state hasn't changed (prevent double execution) */
+            fiber_state_t expected_state = f->state;
+            if (expected_state != FIBER_NEW && expected_state != FIBER_READY) {
+                /* Fiber already being processed by another worker */
+                w->current_fiber = NULL;
+                continue;
+            }
+
+            /* Atomically try to claim the fiber */
+            if (!__atomic_compare_exchange_n(&f->state, &expected_state, FIBER_RUNNING,
+                                              false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+                /* Another worker claimed it first */
+                w->current_fiber = NULL;
+                continue;
+            }
+
+            w->current_fiber = f;
+            w->tasks_executed++;
+
+            DEBUG_LOG_FIBER("Executing fiber", f);
+
+            /* Check for NULL stack - potential crash source */
+            if (!f->stack_base && !f->stack_ptr) {
+                fprintf(stderr, "[ERROR] Worker %d: Fiber %lu has NULL stack! (state=%d, pool=%p)\n",
+                        w->id, (unsigned long)f->id, (int)f->state, f->pool);
+                fflush(stderr);
+                /* Skip this fiber to prevent crash */
+                w->current_fiber = NULL;
+                continue;
+            }
+
+            if (f->state == FIBER_RUNNING) {
+                if (expected_state == FIBER_NEW) {
+                    /* First time running this fiber */
+                    DEBUG_LOG("Worker %d: Running NEW fiber %lu", w->id, (unsigned long)f->id);
+                    if (setjmp(f->context) == 0) {
+                        f->func(f->arg);
+
+                        /* Fiber completed - clean up */
+                        f->state = FIBER_COMPLETED;
+
+                        /* Lock-free atomic increment */
+                        scheduler_atomic_inc_fibers_completed();
+                        /* Decrement global atomic task count - this is what sync() waits on */
+                        scheduler_atomic_dec_task_count();
+                        /* Sharded counter decrement - uses thread-local worker_id for low contention */
+                        scheduler_sharded_dec_task_count(scheduler_get_current_worker_id());
+
+                        if (f->parent) {
+                            scheduler_schedule(f->parent, -1);
+                        }
+
+                        DEBUG_LOG_FIBER("Freeing fiber", f);
+
+                        if (f->pool) {
+                            fiber_pool_free(f->pool, f);
+                        } else {
+                            fiber_free(f);
+                        }
+
+                        w->current_fiber = NULL;
+
+                        DEBUG_LOG("Worker %d: Task count now %lu", w->id, (unsigned long)atomic_load(&g_scheduler->stats.atomic_task_count));
+
+                        /* Yield to allow other workers to acquire GIL */
+                        sched_yield();
+
+                        continue;
+                    }
+                    /* Fiber resumed here after yield */
+                    DEBUG_LOG("Worker %d: Fiber %lu resumed after yield", w->id, (unsigned long)f->id);
+                } else {
+                    /* Resume existing fiber at its yield point */
+                    longjmp(f->context, 1);
+                }
+            }
+            /* w->current_fiber = NULL; unreachable after longjmp */
         }
 
         if (w->stopped) {
@@ -1064,7 +1111,7 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
     if (!g_scheduler || !entry) {
         return 0;
     }
-
+    
     fiber_t* f = NULL;
 
     /* Try fiber pool first for faster allocation */
@@ -1367,46 +1414,10 @@ void scheduler_wait_all(void) {
         /* Check if we're stuck (task count not decreasing) */
         if (current_count == last_task_count) {
             stuck_count++;
-            /* After 100 tries with same count, force process global queue */
-            if (stuck_count > 100) {
-                fiber_t* f = NULL;
-                
-                /* Lock and try to get from global queue */
-                pthread_mutex_lock(&sched->mutex);
-                f = sched->ready_queue;
-                if (f) {
-                    sched->ready_queue = f->next_ready;
-                }
-                pthread_mutex_unlock(&sched->mutex);
-                
-                if (f) {
-                    /* Try to execute it */
-                    fiber_state_t expected = f->state;
-                    if (expected == FIBER_NEW || expected == FIBER_READY) {
-                        if (__atomic_compare_exchange_n(&f->state, &expected, FIBER_RUNNING,
-                                                      false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-                            /* Execute fiber */
-                            if (expected == FIBER_NEW) {
-                                if (setjmp(f->context) == 0) {
-                                    f->func(f->arg);
-                                }
-                            } else {
-                                longjmp(f->context, 1);
-                            }
-                            
-                            /* Mark complete and decrement */
-                            f->state = FIBER_COMPLETED;
-                            scheduler_atomic_dec_task_count();
-                            
-                            /* Free fiber */
-                            if (f->pool) {
-                                fiber_pool_free(f->pool, f);
-                            } else {
-                                fiber_free(f);
-                            }
-                        }
-                    }
-                }
+            /* After many spins with same count, log diagnostic */
+            if (stuck_count > 1000000) {
+                fprintf(stderr, "[gsyncio] scheduler_wait_all: stuck at %lu tasks\n", 
+                        (unsigned long)current_count);
                 stuck_count = 0;
             }
         } else {
@@ -1417,13 +1428,11 @@ void scheduler_wait_all(void) {
         /* Yield to allow workers to run */
         sched_yield();
         
-        /* After many spins, check for stuck state */
+        /* Print diagnostic after many spins */
         spin_count++;
         if (spin_count > 1000000) {
-            /* We've spun for a while - print diagnostic and continue */
             fprintf(stderr, "[gsyncio] scheduler_wait_all: spun %lu times, task_count=%lu\n", 
                     spin_count, scheduler_atomic_get_task_count());
-            sched_yield();
             spin_count = 0;
         }
     }
@@ -1550,10 +1559,23 @@ void scheduler_run(void) {
         }
         
         if (f) {
-            if (f->state == FIBER_NEW || f->state == FIBER_READY) {
-                if (f->state == FIBER_NEW) {
+            /* Check fiber state hasn't changed (prevent double execution) */
+            fiber_state_t expected_state = f->state;
+            if (expected_state != FIBER_NEW && expected_state != FIBER_READY) {
+                /* Fiber already being processed */
+                f = NULL;
+            } else {
+                /* Atomically try to claim the fiber */
+                if (!__atomic_compare_exchange_n(&f->state, &expected_state, FIBER_RUNNING,
+                                                false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+                    /* Another worker claimed it first */
+                    f = NULL;
+                }
+            }
+            
+            if (f && f->state == FIBER_RUNNING) {
+                if (expected_state == FIBER_NEW) {
                     if (setjmp(f->context) == 0) {
-                        f->state = FIBER_RUNNING;
                         f->func(f->arg);
 
                         f->state = FIBER_COMPLETED;
@@ -1572,8 +1594,9 @@ void scheduler_run(void) {
 
                         continue;
                     }
+                    /* Fiber resumed after yield */
                 } else {
-                    f->state = FIBER_RUNNING;
+                    /* Resume existing fiber at its yield point */
                     longjmp(f->context, 1);
                 }
             }
