@@ -5,8 +5,9 @@ import os
 
 def worker(n):
     # Some computation to make the task non-trivial
+    # Increased workload to avoid extreme pool contention
     result = 0
-    for i in range(100):
+    for i in range(1000):
         result += i
     return result
 
