@@ -136,12 +136,48 @@ class Future:
             self._callbacks.remove(cb)
     
     def __await__(self):
-        """Make future awaitable"""
+        """Make future awaitable - supports both sync and async contexts"""
         if not self.done:
-            # In a full implementation, this would park the fiber
-            # For now, just yield control
-            yield
-        return self.result()
+            import asyncio
+            try:
+                # Try to get running loop - if we're in async context
+                loop = asyncio.get_running_loop()
+                # We're in async context - use asyncio Future to wrap our future
+                async_fut = asyncio.Future()
+
+                def on_done(fut):
+                    if not async_fut.done():
+                        try:
+                            result = self._future.result()
+                            async_fut.set_result(result)
+                        except Exception as e:
+                            async_fut.set_exception(e)
+
+                self.add_callback(on_done)
+                yield from async_fut
+            except RuntimeError:
+                # No running event loop or not in asyncio context
+                from .core import current_fiber_id, yield_execution
+                
+                if current_fiber_id() != 0:
+                    # We are in a gsyncio fiber context
+                    # Use a busy-wait with yield or a park if we had direct access
+                    # Since we don't have direct fiber_park here conveniently,
+                    # we can use the C future's blocking wait which we just fixed
+                    # to release the GIL, so it's safe-ish, but let's try to be better.
+                    while not self.done:
+                        yield_execution()
+                else:
+                    # Sync context (standard thread)
+                    import threading
+                    event = threading.Event()
+                    def on_done(fut):
+                        event.set()
+                    self.add_callback(on_done)
+                    event.wait()
+
+        # Return the result (result() will raise any exception)
+        return self._future.result()
     
     def __iter__(self):
         """Make future iterable for yield-from syntax"""

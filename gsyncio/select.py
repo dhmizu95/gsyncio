@@ -1,8 +1,9 @@
 """
-gsyncio.select - Select statement for channel multiplexing
+gsyncio.select - Native C-based select statement for channel multiplexing
 
 This module provides select functionality for multiplexing on
 multiple channel operations (like Go's select statement).
+Uses native C implementation for maximum performance.
 
 Usage:
     import gsyncio as gs
@@ -13,8 +14,8 @@ Usage:
         
         while True:
             result = await gs.select(
-                gs.recv(auth_chan),
-                gs.recv(data_chan),
+                gs.select_recv(auth_chan),
+                gs.select_send(data_chan, "response"),
                 gs.default(lambda: None)
             )
             
@@ -27,13 +28,20 @@ Usage:
 """
 
 from typing import Any, Optional, Callable, List
-from .core import Channel
+from .core import _HAS_CYTHON, Channel as _CChannel
+from ._gsyncio_core import SelectState, Channel
+from .channel import Chan
+
+
+def _get_c_channel(ch):
+    """Get underlying C channel from Chan wrapper or return as-is"""
+    if isinstance(ch, Chan):
+        return ch._channel
+    return ch
 
 
 class SelectCase:
-    """
-    Represents a single case in a select statement.
-    """
+    """Represents a single case in a select statement."""
 
     def __init__(self, channel: Optional[Channel] = None,
                  is_send: bool = False,
@@ -48,11 +56,9 @@ class SelectCase:
 
 
 class SelectResult:
-    """
-    Result of a select operation.
-    """
-    
-    def __init__(self, channel: Optional[Channel] = None,
+    """Result of a select operation."""
+
+    def __init__(self, channel: Optional[Any] = None,
                  value: Any = None,
                  case_index: int = -1,
                  success: bool = False):
@@ -63,173 +69,85 @@ class SelectResult:
 
 
 def recv(channel: Channel) -> SelectCase:
-    """
-    Create a receive case for select.
-    
-    Args:
-        channel: Channel to receive from
-    
-    Returns:
-        SelectCase for receiving
-    """
+    """Create a receive case for select."""
     return SelectCase(channel=channel, is_send=False)
 
 
 def send(channel: Channel, value: Any) -> SelectCase:
-    """
-    Create a send case for select.
-    
-    Args:
-        channel: Channel to send to
-        value: Value to send
-    
-    Returns:
-        SelectCase for sending
-    """
+    """Create a send case for select."""
     return SelectCase(channel=channel, is_send=True, value=value)
 
 
 def default(func: Optional[Callable] = None) -> SelectCase:
-    """
-    Create a default case for select (non-blocking).
-
-    Args:
-        func: Optional function to call if default is selected
-
-    Returns:
-        SelectCase for default
-    """
+    """Create a default case for select (non-blocking)."""
     return SelectCase(is_default=True, func=func)
 
 
 async def select(*cases: SelectCase) -> SelectResult:
-    """
-    Execute a select statement on multiple channel operations.
-    
+    """Execute a select statement on multiple channel operations.
+
+    Uses native C implementation for high performance.
     Blocks until one of the cases can proceed, or returns immediately
     if a default case is present.
-    
-    Args:
-        *cases: Select cases (recv, send, or default)
-    
-    Returns:
-        SelectResult with the result of the selected case
     """
-    import asyncio
-    
     if not cases:
         return SelectResult(success=False)
-    
-    # Check for default case
-    default_case = None
+
+    n = len(cases)
+    sel = SelectState(n)
+    default_idx = -1
+    default_func = None
+
     for i, case in enumerate(cases):
         if case.is_default:
-            default_case = (i, case)
-            break
-    
-    # Try each case non-blocking
-    for i, case in enumerate(cases):
-        if case.is_default:
-            continue
-        
-        if case.channel is None:
-            continue
-        
-        if not case.is_send:
-            # Try receive
-            value = case.channel.recv_nowait()
-            if value is not None or not case.channel.closed:
-                if value is not None:
+            sel.set_default(i)
+            default_idx = i
+            default_func = case.func
+        elif case.channel is not None:
+            c_ch = _get_c_channel(case.channel)
+            if case.is_send:
+                sel.set_send(i, c_ch, case.value)
+            else:
+                sel.set_recv(i, c_ch)
+
+    if _HAS_CYTHON:
+        result = sel.execute()
+        if result and result.get('success'):
+            idx = result.get('case_index', -1)
+            if 0 <= idx < n:
+                selected_case = cases[idx]
+                if selected_case.is_default and selected_case.func:
+                    default_value = selected_case.func()
                     return SelectResult(
-                        channel=case.channel,
-                        value=value,
-                        case_index=i,
+                        channel=None,
+                        value=default_value,
+                        case_index=idx,
                         success=True
                     )
-        else:
-            # Try send
-            if case.channel.send_nowait(case.value):
                 return SelectResult(
-                    channel=case.channel,
-                    value=None,
-                    case_index=i,
+                    channel=selected_case.channel if not selected_case.is_default else None,
+                    value=result.get('value'),
+                    case_index=idx,
                     success=True
                 )
-    
-    # If default case exists, execute it
-    if default_case:
-        i, case = default_case
-        if case.func is not None:
-            result = case.func()
-        else:
-            result = None
-        return SelectResult(
-            channel=None,
-            value=result,
-            case_index=i,
-            success=True
-        )
-    
-    # No case ready - need to wait
-    # Create asyncio events for each channel
-    async def wait_for_case(i: int, case: SelectCase) -> SelectResult:
-        if case.is_default:
+            return SelectResult(success=True, case_index=idx)
+        if default_idx >= 0:
+            if default_func:
+                default_value = default_func()
+                return SelectResult(
+                    channel=None,
+                    value=default_value,
+                    case_index=default_idx,
+                    success=True
+                )
             return SelectResult(
                 channel=None,
-                value=case.func() if case.func else None,
-                case_index=i,
-                success=True
-            )
-        
-        if not case.is_send:
-            # Wait for receive
-            try:
-                value = await case.channel.recv()
-                return SelectResult(
-                    channel=case.channel,
-                    value=value,
-                    case_index=i,
-                    success=True
-                )
-            except StopAsyncIteration:
-                return SelectResult(
-                    channel=case.channel,
-                    value=None,
-                    case_index=i,
-                    success=False
-                )
-        else:
-            # Wait for send
-            await case.channel.send(case.value)
-            return SelectResult(
-                channel=case.channel,
                 value=None,
-                case_index=i,
+                case_index=default_idx,
                 success=True
             )
-    
-    # Wait for first case to complete
-    tasks = [
-        asyncio.create_task(wait_for_case(i, case))
-        for i, case in enumerate(cases)
-    ]
-    
-    done, pending = await asyncio.wait(
-        tasks,
-        return_when=asyncio.FIRST_COMPLETED
-    )
-    
-    # Cancel pending tasks
-    for task in pending:
-        task.cancel()
-    
-    # Get result from first completed task
-    for task in done:
-        try:
-            return task.result()
-        except Exception:
-            continue
-    
+        return SelectResult(success=False)
+
     return SelectResult(success=False)
 
 

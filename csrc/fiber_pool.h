@@ -21,12 +21,11 @@ extern "C" {
 /* ============================================ */
 
 typedef struct fiber_pool {
-    fiber_t* fibers;           /* Array of fiber control blocks */
-    fiber_t** free_list;       /* Free list for O(1) allocation */
-    size_t capacity;           /* Total capacity */
-    size_t available;          /* Available fibers */
-    size_t allocated;          /* Currently allocated */
-    pthread_mutex_t mutex;     /* Thread safety */
+    _Atomic(void*) free_list;  /* Linked list of available fibers (reusing fiber->next_ready) */
+    size_t capacity;           /* Total fibers created across all segments */
+    _Atomic size_t available;   /* Available fibers in the free list */
+    _Atomic size_t allocated;   /* Currently handed out fibers */
+    pthread_mutex_t mutex;     /* Mutex for growth and freelist protection */
 } fiber_pool_t;
 
 /* ============================================ */
@@ -71,6 +70,13 @@ void fiber_pool_free(fiber_pool_t* pool, fiber_t* fiber);
 size_t fiber_pool_available(fiber_pool_t* pool);
 size_t fiber_pool_allocated(fiber_pool_t* pool);
 size_t fiber_pool_capacity(fiber_pool_t* pool);
+
+/**
+ * Verify pool counter consistency
+ * @param pool Pool to verify
+ * @return 1 if consistent, 0 if inconsistent (debug only)
+ */
+int fiber_pool_verify_counters(fiber_pool_t* pool);
 
 #ifdef __cplusplus
 }

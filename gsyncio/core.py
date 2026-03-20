@@ -16,20 +16,52 @@ try:
         Future,
         Channel,
         WaitGroup,
+        TaskRegistry,
+        TaskBatch,
         init_scheduler,
         shutdown_scheduler,
         get_scheduler_stats,
         spawn,
+        spawn_direct,
+        spawn_batch,
+        spawn_batch_fast,
+        spawn_batch_ultra_fast,
         sleep_ns,
         sleep_us,
         sleep_ms,
         current_fiber_id,
         yield_execution,
         num_workers,
+        task,
+        task_batch,
+        sync,
+        sync_timeout,
+        task_count,
+        task_completed_count,
+        run,
+        # Lock-free atomic operations
+        atomic_task_count,
+        atomic_inc_task_count,
+        atomic_dec_task_count,
+        atomic_all_tasks_complete,
+        # Worker management
+        check_worker_scaling,
+        set_auto_scaling,
+        set_energy_efficient_mode,
+        get_worker_utilization,
+        get_recommended_workers,
     )
+    # Import _gsyncio_core module to access _task_registry dynamically
+    from . import _gsyncio_core as __gsyncio_core
+    _task_registry = property(lambda self: __gsyncio_core._task_registry)
+    def _get_task_registry():
+        return __gsyncio_core._task_registry
     _HAS_CYTHON = True
 except ImportError:
     _HAS_CYTHON = False
+    _task_registry = None
+    def _get_task_registry():
+        return None
     # Pure Python fallback implementations
     class Future:
         """Pure Python Future implementation"""
@@ -88,7 +120,7 @@ except ImportError:
                 else:
                     self._callbacks.append(cb)
         
-        def __await__(self):
+        async def __await__(self):
             """Make future awaitable in asyncio context"""
             import asyncio
             if not self._done:
@@ -99,7 +131,7 @@ except ImportError:
                     event.set()
                 
                 self.add_callback(on_done)
-                yield from event.wait().__await__()
+                await event.wait()
             return self.result()
     
     class Channel:
@@ -293,15 +325,91 @@ except ImportError:
     def current_fiber_id():
         """Get current thread ID (fiber ID in pure Python)"""
         return threading.current_thread().ident
-    
+
     def yield_execution():
         """Yield execution (no-op in pure Python)"""
         pass
-    
+
     def num_workers():
         """Get number of CPU cores"""
         import os
         return os.cpu_count() or 1
+    
+    # Worker management (pure Python - no-op implementations)
+    def check_worker_scaling():
+        """Check if worker scaling is needed (no-op in pure Python)"""
+        pass
+    
+    def set_auto_scaling(enabled):
+        """Enable/disable auto-scaling (no-op in pure Python)"""
+        pass
+    
+    def set_energy_efficient_mode(enabled):
+        """Enable energy-efficient mode (no-op in pure Python)"""
+        pass
+    
+    def get_worker_utilization():
+        """Get worker utilization (returns 0 in pure Python)"""
+        return 0.0
+    
+    def get_recommended_workers():
+        """Get recommended workers (returns CPU count in pure Python)"""
+        import os
+        return os.cpu_count() or 1
+    
+    # Batch spawn (pure Python fallback)
+    def spawn_batch(funcs_and_args):
+        """Spawn multiple tasks in batch (pure Python - uses threading)"""
+        import threading
+        results = []
+        for func, args in funcs_and_args:
+            t = threading.Thread(target=func, args=args, daemon=True)
+            t.start()
+            results.append(id(t))  # Return thread ID as fiber ID substitute
+        return results
+    
+    def spawn_batch_fast(funcs_and_args):
+        """Ultra-fast batch spawn (pure Python - no return values)"""
+        import threading
+        for func, args in funcs_and_args:
+            t = threading.Thread(target=func, args=args, daemon=True)
+            t.start()
+
+    def spawn_batch_ultra_fast(funcs_and_args, store_fiber_ids=0):
+        """Ultra-fast batch spawn with GIL release (pure Python fallback)"""
+        import threading
+        for func, args in funcs_and_args:
+            t = threading.Thread(target=func, args=args, daemon=True)
+            t.start()
+        return len(funcs_and_args)
+
+    # Lock-free atomic operations (pure Python fallback - uses simple counter)
+    _atomic_counter = 0
+    _atomic_lock = threading.Lock()
+    
+    def atomic_task_count():
+        """Get current task count (pure Python - uses lock)"""
+        with _atomic_lock:
+            return _atomic_counter
+    
+    def atomic_inc_task_count():
+        """Atomically increment task count (pure Python - uses lock)"""
+        global _atomic_counter
+        with _atomic_lock:
+            _atomic_counter += 1
+            return _atomic_counter
+    
+    def atomic_dec_task_count():
+        """Atomically decrement task count (pure Python - uses lock)"""
+        global _atomic_counter
+        with _atomic_lock:
+            _atomic_counter -= 1
+            return _atomic_counter
+
+    def atomic_all_tasks_complete():
+        """Check if all tasks are complete (pure Python - uses lock)"""
+        with _atomic_lock:
+            return _atomic_counter == 0
 
 
 __all__ = [
@@ -312,11 +420,20 @@ __all__ = [
     'shutdown_scheduler',
     'get_scheduler_stats',
     'spawn',
+    'spawn_direct',
+    'spawn_batch',
+    'spawn_batch_fast',
+    'spawn_batch_ultra_fast',
     'sleep_ns',
     'sleep_us',
     'sleep_ms',
     'current_fiber_id',
     'yield_execution',
     'num_workers',
+    'sync',
+    'sync_timeout',
+    'task_count',
+    'task_completed_count',
+    'run',
     '_HAS_CYTHON',
 ]

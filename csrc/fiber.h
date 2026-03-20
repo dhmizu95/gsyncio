@@ -21,11 +21,12 @@ extern "C" {
 /* Configuration                                */
 /* ============================================ */
 
-#define FIBER_INITIAL_STACK_SIZE 1024   /* 1KB initial stack - minimal for most tasks */
-#define FIBER_MAX_STACK_SIZE 32768     /* 32KB max stack */
-#define FIBER_STACK_GROW_STEP 2048      /* Grow by 2KB */
+#define FIBER_INITIAL_STACK_SIZE 2048   /* 2KB initial stack */
+#define FIBER_MAX_STACK_SIZE 65536      /* 64KB max stack */
+#define FIBER_STACK_GROW_STEP 4096      /* Grow by 4KB */
 #define FIBER_DEFAULT_STACK_SIZE 2048   /* 2KB default - like Go goroutines */
-#define FIBER_USE_GUARD_PAGES 1         /* Enable guard pages for memory safety */
+#define FIBER_USE_GUARD_PAGES 0         /* Disable guard pages to reach 1M+ system limit */
+#define FIBER_POOL_LAZY_ALLOC 1         /* Lazy stack allocation for memory efficiency */
 
 /* ============================================ */
 /* Fiber States                                */
@@ -84,7 +85,6 @@ struct fiber {
 
     /* Context switching */
     jmp_buf context;         /* Saved context for switch */
-    jmp_buf* sched_jump;     /* Jump point for yield return */
 
     /* Async/await support */
     void* waiting_on;           /* What fiber is waiting on (Future, Channel, etc.) */
@@ -143,6 +143,13 @@ void fiber_resume(fiber_t* fiber);
  * @return Current fiber, or NULL if on main thread
  */
 fiber_t* fiber_current(void);
+
+/**
+ * Add fiber to tracking table
+ * @param f Fiber to add
+ * @return 0 on success, -1 on failure
+ */
+int fiber_table_add(fiber_t* f);
 
 /**
  * Switch to another fiber

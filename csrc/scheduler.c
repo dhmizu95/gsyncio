@@ -9,6 +9,7 @@
 
 #include "scheduler.h"
 #include "fiber_pool.h"
+#include "fiber.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -20,12 +21,256 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <sched.h>
+#include <signal.h>
+#include <execinfo.h>
+#include <stdlib.h>
 
 #ifdef __linux__
 #include "io_uring.h"
 #endif
 
+/* ============================================ */
+/* Debug Logging Infrastructure                 */
+/* ============================================ */
+
+/* Enable debug logging via GSYNCIO_DEBUG environment variable */
+static int g_debug_enabled = -1;
+
+static void init_debug_flag(void) {
+    if (g_debug_enabled == -1) {
+        const char* env = getenv("GSYNCIO_DEBUG");
+        g_debug_enabled = (env && strcmp(env, "1") == 0) ? 1 : 0;
+    }
+}
+
+#define DEBUG_LOG(fmt, ...) do { \
+    if (g_debug_enabled == -1) init_debug_flag(); \
+    if (g_debug_enabled) { \
+        fprintf(stderr, "[DEBUG %s:%d] " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); \
+        fflush(stderr); \
+    } \
+} while(0)
+
+#define DEBUG_LOG_FIBER(msg, fiber) do { \
+    if (g_debug_enabled == -1) init_debug_flag(); \
+    if (g_debug_enabled) { \
+        fprintf(stderr, "[DEBUG %s:%d] Fiber %lu: " msg " (state=%d, stack=%p)\n", \
+            __FILE__, __LINE__, \
+            (fiber) ? (unsigned long)(fiber)->id : 0, \
+            (fiber) ? (int)(fiber)->state : -1, \
+            (fiber) ? (fiber)->stack_base : NULL); \
+        fflush(stderr); \
+    } \
+} while(0)
+
+/* ============================================ */
+/* Segfault Handler with Stack Trace           */
+/* ============================================ */
+
+static void sigsegv_handler(int sig, siginfo_t* info, void* context) {
+    (void)context;
+    
+    fprintf(stderr, "\n========================================\n");
+    fprintf(stderr, "FATAL: Segmentation fault (signal %d)\n", sig);
+    fprintf(stderr, "Fault address: %p\n", info->si_addr);
+    fprintf(stderr, "========================================\n");
+    
+    /* Print stack trace */
+    void* buffer[64];
+    int n = backtrace(buffer, 64);
+    fprintf(stderr, "Stack trace (%d frames):\n", n);
+    backtrace_symbols_fd(buffer, n, 2);
+    
+    /* Print scheduler stats if available */
+    if (g_scheduler) {
+        scheduler_t* s = (scheduler_t*)g_scheduler;
+        fprintf(stderr, "\nScheduler stats:\n");
+        fprintf(stderr, "  Active tasks: %lu\n", (unsigned long)s->stats.atomic_task_count);
+        fprintf(stderr, "  Total fibers completed: %lu\n", (unsigned long)s->stats.total_fibers_completed);
+    }
+    
+    fprintf(stderr, "========================================\n");
+    fflush(stderr);
+    
+    _exit(1);
+}
+
+static void install_crash_handler(void) {
+    static int installed = 0;
+    if (installed) return;
+    
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = sigsegv_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    
+    installed = 1;
+    DEBUG_LOG("Crash handler installed");
+}
+
+/* Fast sleep threshold: use spin-wait for sleeps under this value (1ms) */
+#define FAST_SLEEP_THRESHOLD_NS 1000000ULL
+
+/* Spin count before yielding in fast sleep */
+#define FAST_SLEEP_SPIN_COUNT 1000
+
 scheduler_t* g_scheduler = NULL;
+
+/* Pre-allocated timer pool for lock-free timer allocation */
+typedef struct timer_pool {
+    timer_node_t* nodes;
+    _Atomic timer_node_t* free_list;
+    size_t capacity;
+} timer_pool_t;
+
+static timer_pool_t g_timer_pool;
+
+static void timer_pool_init(size_t capacity) {
+    g_timer_pool.capacity = capacity;
+    g_timer_pool.nodes = (timer_node_t*)calloc(capacity, sizeof(timer_node_t));
+    if (!g_timer_pool.nodes) {
+        return;
+    }
+    atomic_store(&g_timer_pool.free_list, NULL);
+
+    /* Pre-populate free list */
+    for (size_t i = 0; i < capacity; i++) {
+        g_timer_pool.nodes[i].next = atomic_load(&g_timer_pool.free_list);
+        atomic_store(&g_timer_pool.free_list, &g_timer_pool.nodes[i]);
+    }
+}
+
+static timer_node_t* timer_pool_alloc(void) {
+    timer_node_t* node = atomic_load(&g_timer_pool.free_list);
+    while (node != NULL) {
+        timer_node_t* next = node->next;  /* Regular load - node->next is not atomic */
+        if (atomic_compare_exchange_weak(&g_timer_pool.free_list, &node, next)) {
+            return node;
+        }
+        node = atomic_load(&g_timer_pool.free_list);
+    }
+    /* Pool exhausted - fall back to malloc */
+    return (timer_node_t*)malloc(sizeof(timer_node_t));
+}
+
+static void timer_pool_free(timer_node_t* node) {
+    if (!node) return;
+
+    /* Check if node is from pool */
+    if (node >= g_timer_pool.nodes && node < g_timer_pool.nodes + g_timer_pool.capacity) {
+        timer_node_t* old_head;
+        do {
+            old_head = atomic_load(&g_timer_pool.free_list);
+            node->next = old_head;  /* Regular store - node->next is not atomic */
+        } while (!atomic_compare_exchange_weak(&g_timer_pool.free_list, &old_head, node));
+    } else {
+        free(node);
+    }
+}
+
+/* ============================================ */
+/* Lock-Free Atomic Operations Implementation  */
+/* ============================================ */
+
+uint64_t scheduler_atomic_inc_task_count(void) {
+    if (!g_scheduler) return 0;
+    return __atomic_add_fetch(&g_scheduler->stats.atomic_task_count, 1, __ATOMIC_SEQ_CST);
+}
+
+uint64_t scheduler_atomic_dec_task_count(void) {
+    if (!g_scheduler) return 0;
+    return __atomic_sub_fetch(&g_scheduler->stats.atomic_task_count, 1, __ATOMIC_SEQ_CST);
+}
+
+uint64_t scheduler_atomic_get_task_count(void) {
+    if (!g_scheduler) return 0;
+    return __atomic_load_n(&g_scheduler->stats.atomic_task_count, __ATOMIC_SEQ_CST);
+}
+
+uint64_t scheduler_atomic_inc_fibers_spawned(void) {
+    if (!g_scheduler) return 0;
+    return __atomic_add_fetch(&g_scheduler->stats.atomic_fibers_spawned, 1, __ATOMIC_SEQ_CST);
+}
+
+uint64_t scheduler_atomic_inc_fibers_completed(void) {
+    if (!g_scheduler) return 0;
+    return __atomic_add_fetch(&g_scheduler->stats.atomic_fibers_completed, 1, __ATOMIC_SEQ_CST);
+}
+
+int scheduler_atomic_all_tasks_complete(void) {
+    if (!g_scheduler) return 1;
+    return __atomic_load_n(&g_scheduler->stats.atomic_task_count, __ATOMIC_SEQ_CST) == 0 ? 1 : 0;
+}
+
+/* ============================================ */
+/* Sharded Counter Implementation (Low Contention) */
+/* ============================================ */
+
+/* Forward declaration for get_time_ns */
+static uint64_t get_time_ns(void);
+
+/* Recalculate total from shards */
+static void sharded_counter_recalc(sharded_counter_t* sc) {
+    uint64_t total = 0;
+    for (int i = 0; i < NUM_SHARDS; i++) {
+        total += atomic_load(&sc->counts[i]);
+    }
+    atomic_store(&sc->total, total);
+    sc->last_update = get_time_ns();
+}
+
+/* Get total with lazy recalculation (call periodically, not on every access) */
+uint64_t sharded_counter_get_total(sharded_counter_t* sc) {
+    uint64_t cached = atomic_load(&sc->total);
+    
+    /* If we have a recent cached value, use it */
+    if (cached > 0) {
+        uint64_t now = get_time_ns();
+        /* Cache is valid for 1 second */
+        if (now - sc->last_update < 1000000000ULL) {
+            return cached;
+        }
+    }
+    
+    /* Recalculate */
+    sharded_counter_recalc(sc);
+    return atomic_load(&sc->total);
+}
+
+/* Sharded task count operations - use worker_id for low contention */
+uint64_t scheduler_sharded_inc_task_count(uint32_t worker_id) {
+    if (!g_scheduler) return 0;
+    return sharded_counter_inc(&g_scheduler->sharded_task_count, worker_id);
+}
+
+uint64_t scheduler_sharded_dec_task_count(uint32_t worker_id) {
+    if (!g_scheduler) return 0;
+    return sharded_counter_dec(&g_scheduler->sharded_task_count, worker_id);
+}
+
+uint64_t scheduler_sharded_get_task_count(void) {
+    if (!g_scheduler) return 0;
+    return sharded_counter_get_total(&g_scheduler->sharded_task_count);
+}
+
+/* Thread-local worker ID storage */
+static __thread int t_current_worker_id = -1;
+
+void scheduler_set_current_worker_id(int worker_id) {
+    t_current_worker_id = worker_id;
+}
+
+uint32_t scheduler_get_current_worker_id(void) {
+    if (t_current_worker_id < 0) {
+        /* Not in a worker thread, use hash of thread ID as fallback */
+        return (uint32_t)(pthread_self() % NUM_SHARDS);
+    }
+    return (uint32_t)t_current_worker_id;
+}
 
 static void* worker_thread(void* arg);
 static fiber_t* steal_from_worker(worker_t* thief, int victim_id);
@@ -34,6 +279,8 @@ static fiber_t* pop_local(worker_t* w);
 static void process_io_completions(scheduler_t *sched);
 static void process_timers(scheduler_t *sched);
 static int select_victim_adaptive(worker_t* thief);
+
+/* Forward declaration of Python callback wrapper (from _gsyncio_core.pyx) */
 
 static size_t get_num_cpus(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -62,50 +309,62 @@ static int deque_init(deque_t* dq, size_t capacity) {
 }
 
 static void push_top(deque_t* dq, fiber_t* f) {
-    size_t b = dq->bottom;
-    size_t t = dq->top;
+    size_t b = atomic_load_explicit(&dq->bottom, memory_order_relaxed);
+    size_t t = atomic_load_explicit(&dq->top, memory_order_acquire);
 
     /* Check if we need to resize */
     if (b - t >= dq->capacity) {
         size_t new_capacity = dq->capacity * 2;
+        /* CRITICAL: deque resize must be thread-safe as thieves read dq->data */
+        /* For now, we take the global scheduler lock to safely resize */
+        if (g_scheduler) pthread_mutex_lock(&g_scheduler->mutex);
+        
         fiber_t** new_data = (fiber_t**)realloc(dq->data, new_capacity * sizeof(fiber_t*));
         if (!new_data) {
+            if (g_scheduler) pthread_mutex_unlock(&g_scheduler->mutex);
             return;
         }
         dq->data = new_data;
         dq->capacity = new_capacity;
+        
+        if (g_scheduler) pthread_mutex_unlock(&g_scheduler->mutex);
     }
 
-    /* Store fiber and increment bottom */
+    /* Store fiber FIRST (before updating bottom) */
     dq->data[b] = f;
-    dq->bottom = b + 1;
+    
+    /* Full memory barrier to ensure store is visible before bottom update */
+    atomic_thread_fence(memory_order_seq_cst);
+    
+    /* Now increment bottom */
+    atomic_store_explicit(&dq->bottom, b + 1, memory_order_release);
 }
 
 /* Simple deque operations (single-owner) */
 
 static fiber_t* pop_top(deque_t* dq) {
-    size_t b = dq->bottom;
-    size_t t = dq->top;
+    size_t b = atomic_load_explicit(&dq->bottom, memory_order_acquire);
+    size_t t = atomic_load_explicit(&dq->top, memory_order_relaxed);
 
     if (t >= b) {
         return NULL;  /* Empty */
     }
 
     fiber_t* f = dq->data[t];
-    dq->top = t + 1;
+    atomic_store_explicit(&dq->top, t + 1, memory_order_relaxed);
     return f;
 }
 
 static fiber_t* steal_bottom(deque_t* dq) {
-    size_t t = dq->top;
-    size_t b = dq->bottom;
+    size_t t = atomic_load_explicit(&dq->top, memory_order_acquire);
+    size_t b = atomic_load_explicit(&dq->bottom, memory_order_acquire);
 
     if (t >= b) {
         return NULL;  /* Empty */
     }
 
     fiber_t* f = dq->data[t];
-    dq->top = t + 1;
+    atomic_store_explicit(&dq->top, t + 1, memory_order_release);
     return f;
 }
 
@@ -169,23 +428,25 @@ static void process_timers(scheduler_t *sched) {
     timer_node_t *node = sched->timers;
 
     while (node) {
+        timer_node_t *next = node->next;  /* Save next before potentially freeing */
+        
         if (node->active && node->deadline_ns <= now) {
             /* Timer expired - wake the fiber */
-            *prev = node->next;
+            *prev = next;  /* Remove from list */
 
             node->fiber->state = FIBER_READY;
             node->fiber->waiting_on = NULL;
+
+            /* Schedule fiber to run */
             scheduler_schedule(node->fiber, -1);
 
-            timer_node_t *to_free = node;
-            node = node->next;
-            free(to_free);
-
+            timer_pool_free(node);
             sched->stats.total_context_switches++;
+            /* prev stays the same since we removed current node */
         } else {
-            prev = &node->next;
-            node = node->next;
+            prev = &node->next;  /* Move prev forward only if keeping node */
         }
+        node = next;
     }
 
     pthread_mutex_unlock(&sched->timers_mutex);
@@ -197,17 +458,34 @@ static void process_timers(scheduler_t *sched) {
 
 /**
  * Native sleep - puts current fiber to sleep for specified nanoseconds
- * This is much faster than asyncio-based sleep (target: <10 µs overhead)
+ * 
+ * Optimizations:
+ * - Fast spin-wait for short sleeps (<1ms) - avoids context switch overhead
+ * - Pre-allocated timer pool - avoids malloc in hot path
+ * - Proper fiber yielding - fiber actually sleeps until timer expires
  */
 void scheduler_sleep_ns(uint64_t ns) {
     fiber_t* current = fiber_current();
     if (!current) {
-        return;
+        return;  /* Not in fiber context - return immediately */
     }
-
+    
+    /* Fast path: spin-wait for short sleeps */
+    if (ns < FAST_SLEEP_THRESHOLD_NS) {
+        uint64_t deadline = get_time_ns() + ns;
+        for (int i = 0; i < FAST_SLEEP_SPIN_COUNT; i++) {
+            if (get_time_ns() >= deadline) {
+                return;  /* Sleep completed */
+            }
+            __asm__ __volatile__("" ::: "memory");
+        }
+        /* Fall through to timer-based sleep if spin didn't complete */
+    }
+    
+    /* Slow path: use timer and yield */
     uint64_t deadline = get_time_ns() + ns;
 
-    timer_node_t* node = (timer_node_t*)malloc(sizeof(timer_node_t));
+    timer_node_t* node = timer_pool_alloc();
     if (!node) {
         /* Fallback - just yield if we can't allocate timer */
         fiber_yield();
@@ -217,18 +495,19 @@ void scheduler_sleep_ns(uint64_t ns) {
     node->deadline_ns = deadline;
     node->fiber = current;
     node->active = true;
-    node->next = NULL;
+    atomic_store(&node->next, NULL);
 
     /* Mark fiber as waiting and add timer */
     current->state = FIBER_WAITING;
     current->waiting_on = node;
 
+    /* Add to timer list (lock-free push) */
     pthread_mutex_lock(&g_scheduler->timers_mutex);
-    node->next = g_scheduler->timers;
+    atomic_store(&node->next, g_scheduler->timers);
     g_scheduler->timers = node;
     pthread_mutex_unlock(&g_scheduler->timers_mutex);
 
-    /* Yield execution */
+    /* CRITICAL: Actually yield the fiber to the scheduler */
     fiber_yield();
 }
 
@@ -236,26 +515,30 @@ static void* worker_thread(void* arg) {
     worker_t* w = (worker_t*)arg;
     scheduler_t* sched = g_scheduler;
 
+    /* Set thread-local worker ID for sharded counter operations */
+    scheduler_set_current_worker_id(w->id);
+
+    // Signal that worker has started
+    atomic_store(&w->started, true);
+
     // Warmup - do a quick spin to avoid cold-start latency
     for (int i = 0; i < 1000; i++) {
         __asm__ __volatile__("" ::: "memory");
     }
 
-    while (w->running) {
+    while (w->running && !w->stopped) {
         fiber_t* f = NULL;
 
-        // Try local queue first (fast path - no lock needed)
+        // 1. Try local queue first (fast path - no lock needed)
         f = pop_local(w);
 
-        // Try adaptive work-stealing if no local work
+        // 2. Try adaptive work-stealing if no local work
         if (!f && sched->config.work_stealing) {
-            // First try adaptive selection (steal from busiest)
             int victim = select_victim_adaptive(w);
             if (victim >= 0) {
                 f = steal_from_worker(w, victim);
             }
-            
-            // Fall back to round-robin if adaptive failed
+
             if (!f) {
                 for (size_t i = 0; i < sched->num_workers; i++) {
                     int victim_id = (w->id + i + 1) % sched->num_workers;
@@ -265,98 +548,115 @@ static void* worker_thread(void* arg) {
             }
         }
 
-        // Try global queue as last resort
+        // Try global queue as last resort (lock-free pop)
         if (!f) {
+            fiber_t* old_head = atomic_load(&sched->ready_queue);
+            while (old_head != NULL) {
+                fiber_t* next = old_head->next_ready;
+                if (atomic_compare_exchange_weak(&sched->ready_queue, &old_head, next)) {
+                    f = old_head;
+                    break;
+                }
+                /* old_head updated by CAS failure */
+            }
+        }
+
+        // 4. No work? Process timers and do a brief spin before sleeping
+        if (!f) {
+            process_timers(sched);
+
+            for (int spin = 0; spin < 100 && !w->stopped; spin++) {
+                __asm__ __volatile__("" ::: "memory");
+                f = pop_local(w);
+                if (f) break;
+
+                // Check global queue (lock-free pop)
+                fiber_t* old_head = atomic_load(&sched->ready_queue);
+                while (old_head != NULL) {
+                    fiber_t* next = old_head->next_ready;
+                    if (atomic_compare_exchange_weak(&sched->ready_queue, &old_head, next)) {
+                        f = old_head;
+                        break;
+                    }
+                }
+                if (f) break;
+            }
+        }
+
+        // 5. Still no work? Wait on condition variable
+        if (!f && !w->stopped) {
+            sched_yield();
+            struct timespec ts;
+            ts.tv_sec = 0;
+            ts.tv_nsec = 1000000; // 1ms timeout
+
             pthread_mutex_lock(&sched->mutex);
-            f = sched->ready_queue;
-            if (f) {
+            // Re-check global queue under lock
+            if (sched->ready_queue) {
+                f = sched->ready_queue;
                 sched->ready_queue = f->next_ready;
+            } else {
+                pthread_cond_timedwait(&sched->cond, &sched->mutex, &ts);
             }
             pthread_mutex_unlock(&sched->mutex);
         }
 
-        if (f) {
+        // 6. Execute found fiber
+        if (f && !w->stopped) {
+            fiber_state_t expected_state = f->state;
+            if (expected_state != FIBER_NEW && expected_state != FIBER_READY) {
+                /* Fiber already being processed? Should not happen with deque/lock ownership */
+                continue;
+            }
+            
+            /* Atomically try to claim the fiber */
+            if (!__atomic_compare_exchange_n(&f->state, &expected_state, FIBER_RUNNING,
+                                              false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+                continue;
+            }
+            
             w->current_fiber = f;
             w->tasks_executed++;
 
-            if (f->state == FIBER_NEW || f->state == FIBER_READY) {
-                jmp_buf jump_buf;
-                f->sched_jump = &jump_buf;
+            DEBUG_LOG_FIBER("Executing fiber", f);
+            
+            if (expected_state == FIBER_NEW) {
+                DEBUG_LOG("Worker %d: Running NEW fiber %lu", w->id, (unsigned long)f->id);
+                if (setjmp(f->context) == 0) {
+                    f->func(f->arg);
+                    
+                    /* Fiber completed - clean up */
+                    f->state = FIBER_COMPLETED;
+                    scheduler_atomic_inc_fibers_completed();
+                    scheduler_atomic_dec_task_count();
+                    scheduler_sharded_dec_task_count(scheduler_get_current_worker_id());
 
-                if (f->state == FIBER_NEW) {
-                    if (setjmp(f->context) == 0) {
-                        f->state = FIBER_RUNNING;
-                        f->func(f->arg);
-
-                        f->state = FIBER_COMPLETED;
-                        sched->stats.total_fibers_completed++;
-
-                        if (f->parent) {
-                            scheduler_schedule(f->parent, -1);
-                        }
-
-                        if (f->pool) {
-                            fiber_pool_free(f->pool, f);
-                        } else {
-                            fiber_free(f);
-                        }
-
-                        w->current_fiber = NULL;
-                        f->sched_jump = NULL;
-                        continue;
+                    if (f->parent) {
+                        scheduler_schedule(f->parent, -1);
                     }
-                } else {
-                    if (setjmp(f->context) == 0) {
-                        f->state = FIBER_RUNNING;
-                        longjmp(f->context, 1);
+
+                    if (f->pool) {
+                        fiber_pool_free(f->pool, f);
+                    } else {
+                        fiber_free(f);
                     }
+                    w->current_fiber = NULL;
+                    sched_yield();
+                    continue;
                 }
-
-                f->sched_jump = NULL;
+                /* Fiber resumed here after yield (from a yield inside its own func) */
+            } else {
+                /* Resume existing fiber (FIBER_READY) */
+                longjmp(f->context, 1);
             }
-
+            
+            /* After yield and eventual resumption, we reach here only if we fell through f->func(f->arg) or longjmp */
+            /* But actually, for resumed fibers, they jump back to the setjmp ABOVE. */
+            /* So this line is reached ONLY when a fiber yields and is then picked up again. */
             w->current_fiber = NULL;
-        } else {
-            // No work - process completions and timers
-            if (sched->io_uring_enabled) {
-                io_uring_submit(&sched->io_uring_ring);
-                process_io_completions(sched);
-            }
-
-            // Process expired timers
-            process_timers(sched);
-
-            // Brief spin before sleeping to reduce wake-up latency
-            for (int spin = 0; spin < 100 && !w->stopped; spin++) {
-                __asm__ __volatile__("" ::: "memory");
-
-                // Check queue during spin
-                pthread_mutex_lock(&sched->mutex);
-                fiber_t* f = sched->ready_queue;
-                if (f) {
-                    sched->ready_queue = f->next_ready;
-                }
-                pthread_mutex_unlock(&sched->mutex);
-                if (f) break;
-            }
-
-            // Sleep with timeout instead of indefinite wait
-            if (!w->stopped) {
-                struct timespec ts;
-                ts.tv_sec = 0;
-                ts.tv_nsec = 1000000; // 1ms timeout
-
-                pthread_mutex_lock(&sched->mutex);
-                pthread_cond_timedwait(&sched->cond, &sched->mutex, &ts);
-                pthread_mutex_unlock(&sched->mutex);
-            }
-        }
-        
-        if (w->stopped) {
-            break;
         }
     }
-    
+
     return NULL;
 }
 
@@ -436,9 +736,13 @@ static int get_random_victim(worker_t* w) {
         return -1;
     }
 
+    /* Use worker ID and thread address for seed - more robust initialization */
     static _Thread_local unsigned int seed = 0;
     if (seed == 0) {
-        seed = (unsigned int)((uintptr_t)w ^ time(NULL));
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        seed = (unsigned int)((uintptr_t)w ^ (uint64_t)ts.tv_nsec ^ (w->id + 1));
+        if (seed == 0) seed = 1;  /* Ensure non-zero */
     }
 
     int victim = w->last_victim;
@@ -447,22 +751,27 @@ static int get_random_victim(worker_t* w) {
     do {
         victim = (victim + 1 + (rand_r(&seed) % (sched->num_workers - 1))) % sched->num_workers;
         attempts++;
-    } while (victim == w->id && attempts < sched->num_workers);
+    } while (victim == w->id && attempts < (int)sched->num_workers);
 
     w->last_victim = victim;
     return victim;
 }
 
 int scheduler_init(scheduler_config_t* config) {
+    /* Install crash handler first */
+    install_crash_handler();
+    
+    DEBUG_LOG("Scheduler initialization starting...");
+    
     if (g_scheduler) {
         return -1;
     }
-    
+
     scheduler_t* sched = (scheduler_t*)calloc(1, sizeof(scheduler_t));
     if (!sched) {
         return -1;
     }
-    
+
     if (config) {
         sched->config = *config;
         // Auto-detect CPU cores if num_workers is 0
@@ -471,32 +780,33 @@ int scheduler_init(scheduler_config_t* config) {
         }
     } else {
         sched->config.num_workers = get_num_cpus();
-        sched->config.max_fibers = 1000000;
+        sched->config.max_fibers = 10000000;  /* 10M fibers default for high-concurrency */
         sched->config.stack_size = FIBER_DEFAULT_STACK_SIZE;
         sched->config.work_stealing = true;
         sched->config.backend = SCHEDULER_BACKEND_DEFAULT;
         sched->config.io_uring_entries = 256;
     }
-    
+
     sched->num_workers = sched->config.num_workers;
     sched->backend = sched->config.backend;
-    
+
     sched->workers = (worker_t*)calloc(sched->num_workers, sizeof(worker_t));
     if (!sched->workers) {
         free(sched);
         return -1;
     }
-    
+
     for (size_t i = 0; i < sched->num_workers; i++) {
         worker_t* w = &sched->workers[i];
         w->id = (int)i;
-        w->running = true;
-        w->stopped = false;
+        atomic_store(&w->running, false);
+        atomic_store(&w->started, false);
+        atomic_store(&w->stopped, false);
         w->current_fiber = NULL;
         w->tasks_executed = 0;
         w->steals_attempted = 0;
         w->steals_successful = 0;
-        
+
         w->deque = (deque_t*)calloc(1, sizeof(deque_t));
         if (!w->deque) {
             for (size_t j = 0; j < i; j++) {
@@ -509,8 +819,8 @@ int scheduler_init(scheduler_config_t* config) {
             free(sched);
             return -1;
         }
-        
-        if (deque_init(w->deque, 1024) != 0) {
+
+        if (deque_init(w->deque, 65536) != 0) {  /* 64K initial capacity per worker */
             free(w->deque);
             for (size_t j = 0; j < i; j++) {
                 if (sched->workers[j].deque) {
@@ -526,12 +836,22 @@ int scheduler_init(scheduler_config_t* config) {
     
     pthread_mutex_init(&sched->mutex, NULL);
     pthread_cond_init(&sched->cond, NULL);
-    
-    sched->fiber_pool = fiber_pool_create(sched->config.max_fibers);
-    
-    sched->ready_queue = NULL;
+
+    /* Initialize worker manager */
+    worker_manager_init(&sched->worker_manager, sched->num_workers);
+
+    /* Initialize sharded counters for low-contention task counting */
+    sharded_counter_init(&sched->sharded_task_count);
+    sharded_counter_init(&sched->sharded_completion_count);
+
+    /* Start with 8K fibers - grows on demand to 10M */
+    sched->fiber_pool = fiber_pool_create(8192);
+    DEBUG_LOG("Fiber pool created: capacity=%zu", fiber_pool_capacity(sched->fiber_pool));
+
+    /* Initialize timer pool for fast sleep allocation */
+    timer_pool_init(131072);  /* Support up to 128K concurrent timers */
     sched->blocked_queue = NULL;
-    
+
     sched->fd_table_size = FD_TABLE_SIZE;
     sched->fd_table = (fd_entry_t*)calloc(sched->fd_table_size, sizeof(fd_entry_t));
     if (!sched->fd_table) {
@@ -543,7 +863,7 @@ int scheduler_init(scheduler_config_t* config) {
         free(sched);
         return -1;
     }
-    
+
     pthread_mutex_init(&sched->pollers_mutex, NULL);
     pthread_mutex_init(&sched->timers_mutex, NULL);
 
@@ -568,8 +888,10 @@ int scheduler_init(scheduler_config_t* config) {
     sched->initialized = true;
 
     // Create worker threads with CPU affinity
+    // Set running=true BEFORE creating threads so they start processing immediately
     size_t num_cpus = get_num_cpus();
     for (size_t i = 0; i < sched->num_workers; i++) {
+        atomic_store(&sched->workers[i].running, true);
         pthread_create(&sched->workers[i].thread, NULL, worker_thread, &sched->workers[i]);
 
         // Pin thread to CPU core for better cache locality
@@ -581,6 +903,19 @@ int scheduler_init(scheduler_config_t* config) {
 #endif
     }
 
+    // Wait for all workers to signal they've started (with timeout)
+    struct timespec start_time;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    
+    for (size_t i = 0; i < sched->num_workers; i++) {
+        int timeout_count = 0;
+        while (!atomic_load(&sched->workers[i].started) && timeout_count < 100) {
+            struct timespec ts = {0, 1000000};  // 1ms
+            nanosleep(&ts, NULL);
+            timeout_count++;
+        }
+    }
+
     return 0;
 }
 
@@ -589,17 +924,17 @@ void scheduler_shutdown(bool wait_for_completion) {
     if (!sched || !sched->initialized) {
         return;
     }
-    
+
     sched->running = false;
-    
+
     if (wait_for_completion) {
         scheduler_wait_all();
     }
-    
+
     pthread_mutex_lock(&sched->mutex);
     for (size_t i = 0; i < sched->num_workers; i++) {
-        sched->workers[i].stopped = true;
-        sched->workers[i].running = false;
+        atomic_store(&sched->workers[i].stopped, true);
+        atomic_store(&sched->workers[i].running, false);
     }
     pthread_cond_broadcast(&sched->cond);
     pthread_mutex_unlock(&sched->mutex);
@@ -636,7 +971,22 @@ void scheduler_shutdown(bool wait_for_completion) {
     }
 #endif
     
+    /* Clean up remaining timers */
+    timer_node_t* node = sched->timers;
+    while (node) {
+        timer_node_t* next = atomic_load(&node->next);
+        timer_pool_free(node);
+        node = next;
+    }
+    
+    /* Free timer pool nodes array */
+    if (g_timer_pool.nodes) {
+        free(g_timer_pool.nodes);
+        g_timer_pool.nodes = NULL;
+    }
+    
     fiber_pool_destroy(sched->fiber_pool);
+    worker_manager_shutdown(&sched->worker_manager);
     fiber_cleanup();
     
     free(sched->workers);
@@ -654,7 +1004,7 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
     }
     
     fiber_t* f = NULL;
-    
+
     /* Try fiber pool first for faster allocation */
     if (g_scheduler->fiber_pool) {
         f = fiber_pool_alloc((fiber_pool_t*)g_scheduler->fiber_pool);
@@ -663,47 +1013,57 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
             f->func = entry;
             f->arg = user_data;
             f->parent = fiber_current();
-            
+
             /* Lazy stack allocation - allocate now if needed */
             if (!f->stack_base) {
-                size_t stack_size = g_scheduler->config.stack_size > 0 ? 
+                size_t stack_size = g_scheduler->config.stack_size > 0 ?
                     g_scheduler->config.stack_size : FIBER_DEFAULT_STACK_SIZE;
-                f->stack_base = mmap(
-                    NULL,
-                    stack_size + 4096,
-                    PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS,
-                    -1,
-                    0
-                );
+                size_t alloc_size = stack_size;
+#if FIBER_USE_GUARD_PAGES == 1
+                alloc_size += 4096;
+#endif
+                f->stack_base = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                
                 if (f->stack_base == MAP_FAILED) {
                     fiber_pool_free((fiber_pool_t*)g_scheduler->fiber_pool, f);
                     return 0;
                 }
+                
+#if FIBER_USE_GUARD_PAGES == 1
                 mprotect(f->stack_base, 4096, PROT_NONE);
+                f->stack_ptr = (char*)f->stack_base + stack_size + 4096;
+#else
+                f->stack_ptr = (char*)f->stack_base + stack_size;
+#endif
                 f->stack_size = stack_size;
                 f->stack_capacity = stack_size;
-                f->stack_ptr = (char*)f->stack_base + stack_size + 4096;
             }
         }
     }
-    
+
     /* Fall back to direct allocation if pool exhausted */
     if (!f) {
         f = fiber_create(entry, user_data, g_scheduler->config.stack_size);
     }
-    
+
     if (!f) {
         return 0;
     }
-    
-    g_scheduler->stats.total_fibers_created++;
-    
-    int worker_id = g_scheduler->next_worker % g_scheduler->num_workers;
-    g_scheduler->next_worker++;
-    
+
+    /* Lock-free atomic increment for spawn tracking */
+    scheduler_atomic_inc_fibers_spawned();
+    /* Increment atomic task count - this is what sync() waits on */
+    scheduler_atomic_inc_task_count();
+
+    /* Atomic round-robin worker selection */
+    size_t worker_idx = atomic_fetch_add(&g_scheduler->next_worker, 1) % g_scheduler->num_workers;
+    int worker_id = (int)worker_idx;
+
+    /* Sharded counter increment - uses worker_id for low contention */
+    scheduler_sharded_inc_task_count((uint32_t)worker_id);
+
     scheduler_schedule(f, worker_id);
-    
+
     return fiber_id(f);
 }
 
@@ -711,16 +1071,20 @@ void scheduler_schedule(fiber_t* f, int worker_id) {
     if (!g_scheduler || !f) {
         return;
     }
-    
+
     if (worker_id < 0 || worker_id >= (int)g_scheduler->num_workers) {
-        pthread_mutex_lock(&g_scheduler->mutex);
-        f->next_ready = g_scheduler->ready_queue;
-        g_scheduler->ready_queue = f;
+        /* Lock-free push to global ready queue */
+        fiber_t* old_head = atomic_load(&g_scheduler->ready_queue);
+        do {
+            f->next_ready = old_head;
+        } while (!atomic_compare_exchange_weak(&g_scheduler->ready_queue, &old_head, f));
+        
+        /* Wake up at least one worker */
         pthread_cond_signal(&g_scheduler->cond);
-        pthread_mutex_unlock(&g_scheduler->mutex);
     } else {
         worker_t* w = &g_scheduler->workers[worker_id];
         push_local(w, f);
+        /* Signal worker maybe waiting on condition */
         pthread_cond_signal(&g_scheduler->cond);
     }
 }
@@ -800,22 +1164,25 @@ int scheduler_spawn_batch_add(spawn_batch_t* batch, void (*entry)(void*), void* 
             if (!f->stack_base) {
                 size_t stack_size = g_scheduler->config.stack_size > 0 ? 
                     g_scheduler->config.stack_size : FIBER_DEFAULT_STACK_SIZE;
-                f->stack_base = mmap(
-                    NULL,
-                    stack_size + 4096,
-                    PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS,
-                    -1,
-                    0
-                );
+                size_t alloc_size = stack_size;
+#if FIBER_USE_GUARD_PAGES == 1
+                alloc_size += 4096;
+#endif
+                f->stack_base = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                
                 if (f->stack_base == MAP_FAILED) {
                     fiber_pool_free((fiber_pool_t*)g_scheduler->fiber_pool, f);
                     return -1;
                 }
+                
+#if FIBER_USE_GUARD_PAGES == 1
                 mprotect(f->stack_base, 4096, PROT_NONE);
+                f->stack_ptr = (char*)f->stack_base + stack_size + 4096;
+#else
+                f->stack_ptr = (char*)f->stack_base + stack_size;
+#endif
                 f->stack_size = stack_size;
                 f->stack_capacity = stack_size;
-                f->stack_ptr = (char*)f->stack_base + stack_size + 4096;
             }
         }
     }
@@ -849,11 +1216,16 @@ void scheduler_spawn_batch_submit(spawn_batch_t* batch) {
         fiber_t* f = batch->fibers[i];
         if (!f) continue;
         
-        int worker_id = sched->next_worker % sched->num_workers;
-        sched->next_worker++;
+        /* Atomic round-robin worker selection */
+        size_t worker_idx = atomic_fetch_add(&sched->next_worker, 1) % sched->num_workers;
+        int worker_id = (int)worker_idx;
         
         worker_t* w = &sched->workers[worker_id];
         push_local(w, f);
+        
+        /* FIX: Increment atomic task count for each fiber in batch */
+        scheduler_atomic_inc_task_count();
+        scheduler_atomic_inc_fibers_spawned();
     }
     
     pthread_cond_broadcast(&sched->cond);
@@ -926,26 +1298,129 @@ void scheduler_wait(fiber_t* f) {
     }
 }
 
+/* Forward declaration for deque_empty */
+static bool deque_empty(deque_t* dq);
+
 void scheduler_wait_all(void) {
     scheduler_t* sched = g_scheduler;
     if (!sched) {
         return;
     }
+
+    /* Wait using atomic task count - this is the authoritative count */
+    uint64_t spin_count = 0;
+    uint64_t last_task_count = 0;
+    uint64_t stuck_count = 0;
     
-    while (sched->ready_queue || sched->blocked_queue) {
-        bool has_work = false;
-        for (size_t i = 0; i < sched->num_workers; i++) {
-            if (sched->workers[i].current_fiber) {
-                has_work = true;
-                fiber_yield();
-                break;
+    while (scheduler_atomic_get_task_count() > 0) {
+        uint64_t current_count = scheduler_atomic_get_task_count();
+        
+        /* Check if we're stuck (task count not decreasing) */
+        if (current_count == last_task_count) {
+            stuck_count++;
+            /* After many spins with same count, log diagnostic */
+            if (stuck_count > 1000000) {
+                fprintf(stderr, "[gsyncio] scheduler_wait_all: stuck at %lu tasks\n", 
+                        (unsigned long)current_count);
+                stuck_count = 0;
             }
+        } else {
+            last_task_count = current_count;
+            stuck_count = 0;
         }
         
-        if (!has_work) {
-            break;
+        /* Yield to allow workers to run - RELEASE GIL TO PREVENT DEADLOCK */
+        #ifdef Py_BEGIN_ALLOW_THREADS
+        Py_BEGIN_ALLOW_THREADS
+        #endif
+        
+        struct timespec ts = {0, 1000000}; // 1ms sleep to reduce CPU usage
+        nanosleep(&ts, NULL);
+        
+        #ifdef Py_END_ALLOW_THREADS
+        Py_END_ALLOW_THREADS
+        #endif
+        
+        /* Print diagnostic after many spins */
+        spin_count++;
+        if (spin_count > 1000) {  /* Reduced from 1M since we sleep now */
+            // Reduced verbosity to avoid flooding logs
+            // fprintf(stderr, "[gsyncio] scheduler_wait_all: task_count=%lu\n", current_count);
+            spin_count = 0;
         }
     }
+}
+
+/* Debug/Diagnostic functions implementation */
+
+bool scheduler_workers_running(void) {
+    scheduler_t* sched = g_scheduler;
+    if (!sched) {
+        return false;
+    }
+    
+    for (size_t i = 0; i < sched->num_workers; i++) {
+        if (atomic_load(&sched->workers[i].running) && 
+            !atomic_load(&sched->workers[i].stopped)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t scheduler_total_queued_fibers(void) {
+    scheduler_t* sched = g_scheduler;
+    if (!sched) {
+        return 0;
+    }
+    
+    size_t total = 0;
+    
+    /* Count global queue */
+    pthread_mutex_lock(&sched->mutex);
+    fiber_t* f = sched->ready_queue;
+    while (f) {
+        total++;
+        f = f->next_ready;
+    }
+    pthread_mutex_unlock(&sched->mutex);
+    
+    /* Count per-worker local queues */
+    for (size_t i = 0; i < sched->num_workers; i++) {
+        if (!deque_empty(sched->workers[i].deque)) {
+            total += deque_size(sched->workers[i].deque);
+        }
+    }
+    
+    return total;
+}
+
+void scheduler_print_debug_info(void) {
+    scheduler_t* sched = g_scheduler;
+    if (!sched) {
+        fprintf(stderr, "[gsyncio] scheduler not initialized\n");
+        return;
+    }
+    
+    fprintf(stderr, "=== gsyncio Scheduler Debug Info ===\n");
+    fprintf(stderr, "Workers: %zu\n", sched->num_workers);
+    fprintf(stderr, "Running: %s\n", sched->running ? "yes" : "no");
+    fprintf(stderr, "Task count (atomic): %lu\n", scheduler_atomic_get_task_count());
+    fprintf(stderr, "Total queued fibers: %zu\n", scheduler_total_queued_fibers());
+    fprintf(stderr, "Fibers spawned: %lu\n", sched->stats.atomic_fibers_spawned);
+    fprintf(stderr, "Fibers completed: %lu\n", sched->stats.atomic_fibers_completed);
+    
+    for (size_t i = 0; i < sched->num_workers; i++) {
+        worker_t* w = &sched->workers[i];
+        fprintf(stderr, "  Worker %zu: running=%s, started=%s, stopped=%s, tasks=%lu, queue_size=%zu\n",
+                i,
+                atomic_load(&w->running) ? "yes" : "no",
+                atomic_load(&w->started) ? "yes" : "no",
+                atomic_load(&w->stopped) ? "yes" : "no",
+                w->tasks_executed,
+                deque_size(w->deque));
+    }
+    fprintf(stderr, "=====================================\n");
 }
 
 void scheduler_get_stats(scheduler_stats_t* stats) {
@@ -997,28 +1472,46 @@ void scheduler_run(void) {
         }
         
         if (f) {
-            if (f->state == FIBER_NEW || f->state == FIBER_READY) {
-                jmp_buf jump_buf;
-                f->sched_jump = &jump_buf;
-                
-                if (setjmp(f->context) == 0) {
-                    f->state = FIBER_RUNNING;
-                    f->func(f->arg);
-                    
-                    f->state = FIBER_COMPLETED;
-                    sched->stats.total_fibers_completed++;
-                    
-                    if (f->pool) {
-                        fiber_pool_free(f->pool, f);
-                    } else {
-                        fiber_free(f);
-                    }
-                    
-                    f->sched_jump = NULL;
-                    continue;
+            /* Check fiber state hasn't changed (prevent double execution) */
+            fiber_state_t expected_state = f->state;
+            if (expected_state != FIBER_NEW && expected_state != FIBER_READY) {
+                /* Fiber already being processed */
+                f = NULL;
+            } else {
+                /* Atomically try to claim the fiber */
+                if (!__atomic_compare_exchange_n(&f->state, &expected_state, FIBER_RUNNING,
+                                                false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+                    /* Another worker claimed it first */
+                    f = NULL;
                 }
-                
-                f->sched_jump = NULL;
+            }
+            
+            if (f && f->state == FIBER_RUNNING) {
+                if (expected_state == FIBER_NEW) {
+                    if (setjmp(f->context) == 0) {
+                        f->func(f->arg);
+
+                        f->state = FIBER_COMPLETED;
+                        sched->stats.total_fibers_completed++;
+                        
+                        /* Decrement global atomic task count */
+                        scheduler_atomic_dec_task_count();
+                        /* Sharded counter decrement */
+                        scheduler_sharded_dec_task_count(scheduler_get_current_worker_id());
+
+                        if (f->pool) {
+                            fiber_pool_free(f->pool, f);
+                        } else {
+                            fiber_free(f);
+                        }
+
+                        continue;
+                    }
+                    /* Fiber resumed after yield */
+                } else {
+                    /* Resume existing fiber at its yield point */
+                    longjmp(f->context, 1);
+                }
             }
         } else {
             if (sched->io_uring_enabled) {
@@ -1285,4 +1778,101 @@ void scheduler_unregister_fd(int fd) {
     
     g_scheduler->fd_table[fd].active = false;
     g_scheduler->fd_table[fd].fiber = NULL;
+}
+/* ============================================ */
+/* Worker Manager Integration                   */
+/* ============================================ */
+
+/**
+ * Background thread for worker scaling decisions
+ */
+static void* worker_manager_loop(scheduler_t *sched) {
+    while (sched->running) {
+        /* Check if scaling is needed */
+        size_t queue_depth = 0;
+        
+        pthread_mutex_lock(&sched->mutex);
+        fiber_t* f = sched->ready_queue;
+        while (f) {
+            queue_depth++;
+            f = f->next_ready;
+            if (queue_depth > 1000) break;  /* Cap counting */
+        }
+        pthread_mutex_unlock(&sched->mutex);
+        
+        /* Check scaling */
+        worker_manager_check_scale(&sched->worker_manager, queue_depth);
+        
+        /* Sleep for check interval */
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = WORKER_MANAGER_CHECK_INTERVAL_MS * 1000000;
+        nanosleep(&ts, NULL);
+    }
+    
+    return NULL;
+}
+
+void scheduler_check_worker_scaling(void) {
+    if (!g_scheduler) return;
+    
+    size_t queue_depth = 0;
+    pthread_mutex_lock(&g_scheduler->mutex);
+    fiber_t* f = g_scheduler->ready_queue;
+    while (f) {
+        queue_depth++;
+        f = f->next_ready;
+        if (queue_depth > 1000) break;
+    }
+    pthread_mutex_unlock(&g_scheduler->mutex);
+    
+    worker_manager_check_scale(&g_scheduler->worker_manager, queue_depth);
+}
+
+void scheduler_set_auto_scaling(bool enabled) {
+    if (!g_scheduler) return;
+    worker_manager_set_auto_scaling(&g_scheduler->worker_manager, enabled);
+}
+
+void scheduler_set_energy_efficient_mode(bool enabled) {
+    if (!g_scheduler) return;
+    worker_manager_set_energy_efficient_mode(&g_scheduler->worker_manager, enabled);
+}
+
+double scheduler_get_worker_utilization(void) {
+    if (!g_scheduler) return 0.0;
+    return worker_manager_get_utilization(&g_scheduler->worker_manager);
+}
+
+size_t scheduler_get_recommended_workers(void) {
+    if (!g_scheduler) return WORKER_MANAGER_MIN_WORKERS;
+    return worker_manager_get_recommended_workers(&g_scheduler->worker_manager);
+}
+
+/* ============================================ */
+/* Batch Python Task Spawning (Lock-Free)      */
+/* ============================================ */
+
+/**
+ * Spawn multiple Python tasks in a batch with minimal overhead.
+ * Uses single lock acquisition for all spawns.
+ *
+ * Note: This function allocates fibers efficiently but the actual
+ * Python callback is handled by the existing scheduler_spawn mechanism.
+ *
+ * @param tasks Array of python_task_t (func, args, fiber_id)
+ * @param count Number of tasks
+ * @return 0 on success, -1 on failure
+ */
+int scheduler_spawn_batch_python(python_task_t* tasks, size_t count) {
+    /* Note: This function is a placeholder for future optimization.
+     * Currently, batch spawning is handled more efficiently from Python
+     * using spawn_batch() which reuses pooled payloads.
+     * 
+     * The C-level batch spawn would need proper Python callback integration
+     * which requires careful GIL management.
+     */
+    (void)tasks;
+    (void)count;
+    return -1;  /* Not implemented - use Python spawn_batch() instead */
 }

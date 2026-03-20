@@ -55,6 +55,10 @@ from .core import (
     shutdown_scheduler,
     get_scheduler_stats,
     spawn,
+    spawn_direct,
+    spawn_batch,
+    spawn_batch_fast,
+    spawn_batch_ultra_fast,
     sleep_ns,
     sleep_us,
     sleep_ms,
@@ -62,15 +66,26 @@ from .core import (
     yield_execution,
     num_workers,
     _HAS_CYTHON,
+    # Worker management
+    check_worker_scaling,
+    set_auto_scaling,
+    set_energy_efficient_mode,
+    get_worker_utilization,
+    get_recommended_workers,
 )
 
 # Import task/sync model
 from .task import (
     task,
+    task_with_wrapper,
+    task_direct,
     sync,
     sync_timeout,
     task_count,
     run,
+    task_batch,
+    task_fast,
+    task_batch_fast,
 )
 
 # Import async/await model
@@ -84,6 +99,16 @@ from .async_ import (
     AsyncIterator,
     AsyncRange,
     AsyncContextManager,
+    create_tcp_socket,
+    create_udp_socket,
+    has_native_io,
+)
+
+# Import native I/O
+from .native_io import (
+    NativeSocket,
+    NativeEventLoop,
+    _HAS_NATIVE_IO,
 )
 
 # Import channel operations
@@ -125,70 +150,6 @@ from .future import (
 Future = _Future
 ensure_future = _ensure_future
 
-# Monkey-patching for asyncio compatibility
-def install():
-    """
-    Install gsyncio as the default event loop policy.
-    
-    This replaces asyncio's event loop with gsyncio's fiber-based
-    implementation, providing better performance for asyncio-based
-    code without any code changes.
-    
-    Usage:
-        import gsyncio
-        gsyncio.install()
-        
-        import asyncio
-        
-        async def main():
-            await asyncio.sleep(1)
-            return "done"
-        
-        result = asyncio.run(main())
-    """
-    import asyncio
-    
-    class GsyncioEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
-        """Event loop policy that uses gsyncio"""
-        
-        def new_event_loop(self):
-            # For now, return standard asyncio loop
-            # Full implementation would return gsyncio's event loop
-            return asyncio.new_event_loop()
-    
-    asyncio.set_event_loop_policy(GsyncioEventLoopPolicy())
-    
-    # Store original functions for restoration
-    if not hasattr(asyncio, '_gsyncio_original_run'):
-        asyncio._gsyncio_original_run = asyncio.run
-    
-    return True
-
-
-def uninstall():
-    """
-    Restore the default asyncio event loop policy.
-    """
-    import asyncio
-    
-    if hasattr(asyncio, '_gsyncio_original_run'):
-        asyncio.run = asyncio._gsyncio_original_run
-        del asyncio._gsyncio_original_run
-    
-    asyncio.set_event_loop_policy(None)
-
-
-def is_installed() -> bool:
-    """
-    Check if gsyncio is installed as the event loop policy.
-    
-    Returns:
-        True if gsyncio is installed
-    """
-    import asyncio
-    policy = asyncio.get_event_loop_policy()
-    return policy.__class__.__name__ == 'GsyncioEventLoopPolicy'
-
 
 # Public API
 __all__ = [
@@ -204,6 +165,10 @@ __all__ = [
     'shutdown_scheduler',
     'get_scheduler_stats',
     'spawn',
+    'spawn_direct',
+    'spawn_batch',
+    'spawn_batch_fast',
+    'spawn_batch_ultra_fast',
     'sleep_ns',
     'sleep_us',
     'sleep_ms',
@@ -212,12 +177,24 @@ __all__ = [
     'num_workers',
     '_HAS_CYTHON',
     
+    # Worker management
+    'check_worker_scaling',
+    'set_auto_scaling',
+    'set_energy_efficient_mode',
+    'get_worker_utilization',
+    'get_recommended_workers',
+    
     # Task/Sync model
     'task',
+    'task_with_wrapper',
+    'task_direct',
     'sync',
     'sync_timeout',
     'task_count',
     'run',
+    'task_batch',
+    'task_fast',
+    'task_batch_fast',
     
     # Async/Await model
     'create_task',
@@ -229,6 +206,14 @@ __all__ = [
     'AsyncIterator',
     'AsyncRange',
     'AsyncContextManager',
+    'create_tcp_socket',
+    'create_udp_socket',
+    'has_native_io',
+
+    # Native I/O
+    'NativeSocket',
+    'NativeEventLoop',
+    '_HAS_NATIVE_IO',
     
     # Channel operations
     'Chan',
@@ -253,9 +238,4 @@ __all__ = [
     
     # Future utilities
     'is_future',
-    
-    # Monkey-patching
-    'install',
-    'uninstall',
-    'is_installed',
 ]

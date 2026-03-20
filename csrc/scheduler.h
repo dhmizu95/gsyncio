@@ -12,12 +12,15 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
 
 #ifdef __linux__
 #include "io_uring.h"
 #include "evloop.h"
 #endif
+
+#include "worker_manager.h"  /* Intelligent worker management */
 
 #ifdef __cplusplus
 extern "C" {
@@ -106,7 +109,7 @@ typedef struct io_bucket {
     int count;
 } io_bucket_t;
 
-#define FD_TABLE_SIZE 65536
+#define FD_TABLE_SIZE 1048576  /* 1M file descriptors for high concurrency */
 
 typedef struct {
     fiber_t *fiber;
@@ -125,13 +128,15 @@ typedef struct worker {
     int id;
     deque_t* deque;
     fiber_t* current_fiber;
-    bool running;
-    bool stopped;
+    _Atomic bool running;
+    _Atomic bool started;      /* Worker thread has started */
+    _Atomic bool stopped;
     pthread_t thread;
     uint64_t tasks_executed;
     uint64_t steals_attempted;
     uint64_t steals_successful;
     int last_victim;
+    jmp_buf yield_jump;  /* Jump buffer for fiber yields */
 } worker_t;
 
 typedef struct scheduler_config {
@@ -152,7 +157,48 @@ typedef struct scheduler_stats {
     uint64_t current_ready_fibers;
     uint64_t total_io_submitted;
     uint64_t total_io_completed;
+    
+    /* Lock-free counters (C11 atomics) */
+    _Atomic uint64_t atomic_fibers_spawned;
+    _Atomic uint64_t atomic_fibers_completed;
+    _Atomic uint64_t atomic_task_count;
 } scheduler_stats_t;
+
+/* ============================================ */
+/* Sharded Counter for Low-Contention Counting   */
+/* ============================================ */
+
+#define NUM_SHARDS 64
+
+typedef struct {
+    _Atomic uint64_t counts[NUM_SHARDS];  /* Per-worker shards */
+    _Atomic uint64_t total;               /* Cached total (updated lazily) */
+    uint64_t last_update;                 /* Timestamp of last total update */
+} sharded_counter_t;
+
+/* Initialize sharded counter */
+static inline void sharded_counter_init(sharded_counter_t* sc) {
+    for (int i = 0; i < NUM_SHARDS; i++) {
+        atomic_store(&sc->counts[i], 0);
+    }
+    atomic_store(&sc->total, 0);
+    sc->last_update = 0;
+}
+
+/* Increment shard - O(1) with worker_id */
+static inline uint64_t sharded_counter_inc(sharded_counter_t* sc, uint32_t worker_id) {
+    uint32_t shard = worker_id % NUM_SHARDS;
+    return atomic_fetch_add(&sc->counts[shard], 1) + 1;
+}
+
+/* Decrement shard - O(1) with worker_id */
+static inline uint64_t sharded_counter_dec(sharded_counter_t* sc, uint32_t worker_id) {
+    uint32_t shard = worker_id % NUM_SHARDS;
+    return atomic_fetch_sub(&sc->counts[shard], 1) - 1;
+}
+
+/* Get total - recalculates if stale */
+uint64_t sharded_counter_get_total(sharded_counter_t* sc);
 
 /* Batch scheduling support */
 typedef struct spawn_batch {
@@ -161,43 +207,81 @@ typedef struct spawn_batch {
     size_t capacity;
 } spawn_batch_t;
 
+/* ============================================ */
+/* Lock-Free Task Counting (C11 atomics)       */
+/* ============================================ */
+
+/* Forward declaration */
+typedef struct scheduler scheduler_t;
+
+/* g_scheduler is declared in scheduler.c */
+extern scheduler_t* g_scheduler;
+
+/* Atomic operations - implemented in scheduler.c */
+uint64_t scheduler_atomic_inc_task_count(void);
+uint64_t scheduler_atomic_dec_task_count(void);
+uint64_t scheduler_atomic_get_task_count(void);
+uint64_t scheduler_atomic_inc_fibers_spawned(void);
+uint64_t scheduler_atomic_inc_fibers_completed(void);
+int scheduler_atomic_all_tasks_complete(void);
+
+/* Sharded atomic operations (low contention) */
+uint64_t scheduler_sharded_inc_task_count(uint32_t worker_id);
+uint64_t scheduler_sharded_dec_task_count(uint32_t worker_id);
+uint64_t scheduler_sharded_get_task_count(void);
+
+/* Get current worker ID (thread-local) */
+uint32_t scheduler_get_current_worker_id(void);
+
+/* Debug/Diagnostic functions */
+bool scheduler_workers_running(void);
+size_t scheduler_total_queued_fibers(void);
+void scheduler_print_debug_info(void);
+
 typedef struct scheduler {
     worker_t* workers;
     size_t num_workers;
-    size_t next_worker;
-    
-    fiber_t* ready_queue;
+    _Atomic size_t next_worker;  /* Atomic round-robin worker selection */
+
+    _Atomic(fiber_t*) ready_queue;
     fiber_t* blocked_queue;
-    
+
     scheduler_config_t config;
     scheduler_stats_t stats;
-    
+
+    /* Sharded task counters for low-contention counting */
+    sharded_counter_t sharded_task_count;
+    sharded_counter_t sharded_completion_count;
+
     bool running;
     bool initialized;
-    
+
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-    
+
     void* fiber_pool;
-    
+
     scheduler_backend_t backend;
-    
+
+    /* Intelligent worker management */
+    worker_manager_t worker_manager;
+
 #ifdef __linux__
     io_uring_t io_uring_ring;
     bool io_uring_enabled;
     io_uring_submission_t *pending_submissions;
     pthread_mutex_t io_uring_mutex;
 #endif
-    
+
     fd_entry_t *fd_table;
     size_t fd_table_size;
-    
+
     io_poller_t *pollers;
     pthread_mutex_t pollers_mutex;
-    
+
     timer_node_t *timers;
     pthread_mutex_t timers_mutex;
-    
+
     uint64_t current_time_ns;
 } scheduler_t;
 
@@ -244,6 +328,22 @@ void scheduler_sleep_ns(uint64_t ns);
 
 int scheduler_register_fd(int fd, fiber_t *fiber, uint32_t events);
 void scheduler_unregister_fd(int fd);
+
+/* Worker management functions */
+void scheduler_check_worker_scaling(void);
+void scheduler_set_auto_scaling(bool enabled);
+void scheduler_set_energy_efficient_mode(bool enabled);
+double scheduler_get_worker_utilization(void);
+size_t scheduler_get_recommended_workers(void);
+
+/* Batch spawn for high-performance task creation */
+typedef struct {
+    void* func;
+    void* args;
+    uint64_t fiber_id;
+} python_task_t;
+
+int scheduler_spawn_batch_python(python_task_t* tasks, size_t count);
 
 #ifdef __cplusplus
 }
