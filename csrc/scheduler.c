@@ -513,6 +513,10 @@ static void* worker_thread(void* arg) {
                         }
 
                         w->current_fiber = NULL;
+                        
+                        /* Yield to allow other workers to acquire GIL */
+                        sched_yield();
+                        
                         continue;  /* Pick next fiber */
                     }
                     /* Fiber resumed here after yield */
@@ -578,6 +582,10 @@ static void* worker_thread(void* arg) {
                             }
 
                             w->current_fiber = NULL;
+                            
+                            /* Yield to allow other workers to acquire GIL */
+                            sched_yield();
+                            
                             continue;
                         }
                     } else {
@@ -590,6 +598,9 @@ static void* worker_thread(void* arg) {
 
             // Sleep with timeout if no work found
             if (!found_work && !w->stopped) {
+                /* Yield before sleeping to let other threads run */
+                sched_yield();
+                
                 struct timespec ts;
                 ts.tv_sec = 0;
                 ts.tv_nsec = 1000000; // 1ms timeout
@@ -787,10 +798,11 @@ int scheduler_init(scheduler_config_t* config) {
     sharded_counter_init(&sched->sharded_task_count);
     sharded_counter_init(&sched->sharded_completion_count);
 
-    sched->fiber_pool = fiber_pool_create(65536);  /* Start with 64K fibers, grow on demand */
+    /* Start with 8K fibers - grows on demand to 10M */
+    sched->fiber_pool = fiber_pool_create(8192);
 
-    /* Initialize timer pool for fast sleep allocation */
-    timer_pool_init(65536);  /* Start with 64K timers, grow on demand */
+    /* Initialize timer pool - start with 8K timers */
+    timer_pool_init(8192);
 
     sched->ready_queue = NULL;
     sched->blocked_queue = NULL;

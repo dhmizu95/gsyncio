@@ -675,14 +675,14 @@ cdef class TaskBatch:
 
 cdef void _c_task_entry(void* arg) noexcept nogil:
     """C callback for task entry - arg is a Python tuple (func, args)
-    
-    Optimized for performance - minimal overhead in hot path.
+
+    Optimized for performance - minimal GIL hold time.
     Exception handling is done inline without try/except overhead.
     """
     if arg != NULL:
+        # Hold GIL for Python object access and function call
         with gil:
             payload = <object>arg
-            # Fast path: direct call without try/except overhead
             func = payload[0]
             args = payload[1]
             try:
@@ -699,9 +699,10 @@ cdef void _c_task_entry(void* arg) noexcept nogil:
 cdef void _c_fiber_entry(void* arg) noexcept nogil:
     """C callback for fiber entry - arg is a Python tuple (func, args)
 
-    Optimized for performance - minimal overhead in hot path.
+    Optimized for performance - minimal GIL hold time.
     """
     if arg != NULL:
+        # Hold GIL for Python object access and function call
         with gil:
             payload = <object>arg
             func = payload[0]

@@ -17,9 +17,9 @@
 /* Configuration                               */
 /* ============================================ */
 
-#define FIBER_POOL_INITIAL_SIZE 65536      /* Pre-allocate 64K fibers */
+#define FIBER_POOL_INITIAL_SIZE 8192       /* Pre-allocate 8K fibers (balanced) */
 #define FIBER_POOL_GROWTH_FACTOR 2
-#define FIBER_POOL_MAX_SIZE (10 * 1024 * 1024)  /* 10M fibers */
+#define FIBER_POOL_MAX_SIZE (10 * 1024 * 1024)  /* 10M fibers max */
 #define FIBER_POOL_LAZY_STACK 1            /* Lazy stack allocation for memory efficiency */
 
 /* Lock-free free list node */
