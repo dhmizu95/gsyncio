@@ -9,6 +9,7 @@
 #include "scheduler.h"
 #include "fiber.h"
 #include "fiber_pool.h"
+#include <Python.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -313,7 +314,12 @@ void task_sync(task_registry_t* reg) {
     /* Check inside mutex to avoid race condition */
     while (atomic_load(&reg->active_count) > 0) {
         reg->waiters++;
+        
+        /* Release GIL before waiting, reacquire after */
+        Py_BEGIN_ALLOW_THREADS
         pthread_cond_wait(&reg->cond, &reg->mutex);
+        Py_END_ALLOW_THREADS
+        
         reg->waiters--;
     }
 

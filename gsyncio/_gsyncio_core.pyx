@@ -118,7 +118,12 @@ cdef extern from "scheduler.h":
     void scheduler_run() nogil
     void scheduler_stop() nogil
     void scheduler_sleep_ns(uint64_t ns) nogil
-    
+
+    # Debug/Diagnostic functions
+    int scheduler_workers_running() nogil
+    size_t scheduler_total_queued_fibers() nogil
+    void scheduler_print_debug_info() nogil
+
     # Worker management
     void scheduler_check_worker_scaling()
     void scheduler_set_auto_scaling(int enabled)
@@ -774,6 +779,21 @@ def get_scheduler_stats():
     }
 
 
+def workers_running():
+    """Check if any worker threads are running"""
+    return scheduler_workers_running() != 0
+
+
+def get_queued_fiber_count():
+    """Get total number of fibers in all queues (global + per-worker)"""
+    return scheduler_total_queued_fibers()
+
+
+def print_scheduler_debug():
+    """Print scheduler debug information to stderr"""
+    scheduler_print_debug_info()
+
+
 # Object pool for task payloads (reduces allocation overhead)
 cdef object _get_payload(func, args):
     """Get a payload from pool or create new one"""
@@ -1247,8 +1267,8 @@ cdef extern from "scheduler.h":
     uint32_t scheduler_get_current_worker_id() nogil
 
 def atomic_task_count():
-    """Get current task count using sharded counters (low contention, thread-safe)"""
-    return scheduler_sharded_get_task_count()
+    """Get current task count using global atomic counter"""
+    return scheduler_atomic_get_task_count()
 
 def atomic_inc_task_count():
     """Atomically increment task count (lock-free)"""
@@ -1259,8 +1279,8 @@ def atomic_dec_task_count():
     return scheduler_atomic_dec_task_count()
 
 def atomic_all_tasks_complete():
-    """Check if all tasks are complete (uses sharded counter)"""
-    return scheduler_sharded_get_task_count() == 0
+    """Check if all tasks are complete (uses global atomic counter)"""
+    return scheduler_atomic_get_task_count() == 0
 
 
 # ============================================

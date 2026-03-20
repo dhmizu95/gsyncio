@@ -128,8 +128,9 @@ typedef struct worker {
     int id;
     deque_t* deque;
     fiber_t* current_fiber;
-    bool running;
-    bool stopped;
+    _Atomic bool running;
+    _Atomic bool started;      /* Worker thread has started */
+    _Atomic bool stopped;
     pthread_t thread;
     uint64_t tasks_executed;
     uint64_t steals_attempted;
@@ -231,6 +232,11 @@ uint64_t scheduler_sharded_get_task_count(void);
 
 /* Get current worker ID (thread-local) */
 uint32_t scheduler_get_current_worker_id(void);
+
+/* Debug/Diagnostic functions */
+bool scheduler_workers_running(void);
+size_t scheduler_total_queued_fibers(void);
+void scheduler_print_debug_info(void);
 
 typedef struct scheduler {
     worker_t* workers;
