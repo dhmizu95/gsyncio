@@ -121,8 +121,9 @@ fiber_pool_t* fiber_pool_create(size_t initial_size) {
     /* Store nodes array for cleanup */
     pool->_nodes = (void*)nodes;
     
-    pool->available = pool->capacity;
-    pool->allocated = 0;
+    /* Use atomic operations for initialization */
+    atomic_store(&pool->available, pool->capacity);
+    atomic_store(&pool->allocated, 0);
     
     pthread_mutex_init(&pool->mutex, NULL);
     
@@ -165,6 +166,9 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool) {
             /* Successfully popped */
             fiber_t* fiber = head->fiber;
 
+            /* CRITICAL: Save pool pointer BEFORE memset clears it */
+            void* saved_pool = fiber->pool;
+            
             /* Save stack info before reset (for lazy allocation) */
             void* saved_stack_base = fiber->stack_base;
             size_t saved_stack_capacity = fiber->stack_capacity;
@@ -172,6 +176,9 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool) {
             
             /* Reset fiber state */
             memset(fiber, 0, sizeof(fiber_t));
+            
+            /* CRITICAL: Restore pool pointer IMMEDIATELY after memset */
+            fiber->pool = saved_pool;
 
             /* Restore or allocate stack */
 #if FIBER_POOL_LAZY_STACK == 0
@@ -211,7 +218,6 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool) {
 #endif
 
             fiber->id = atomic_fetch_add(&pool->allocated, 1) + 1;  /* Unique ID */
-            fiber->pool = pool;
             fiber->state = FIBER_NEW;
             
             /* Note: Not adding to fiber table - pool fibers are tracked separately */
@@ -369,4 +375,23 @@ size_t fiber_pool_capacity(fiber_pool_t* pool) {
         return 0;
     }
     return pool->capacity;
+}
+
+/* Counter verification - useful for debugging */
+int fiber_pool_verify_counters(fiber_pool_t* pool) {
+    if (!pool) {
+        return 1;  /* Empty pool is consistent */
+    }
+    
+    size_t avail = atomic_load(&pool->available);
+    size_t alloc = atomic_load(&pool->allocated);
+    
+    /* Check for negative values */
+    if (avail + alloc > pool->capacity) {
+        DEBUG_LOG("COUNTER INCONSISTENCY: available=%zu + allocated=%zu > capacity=%zu",
+                  avail, alloc, pool->capacity);
+        return 0;
+    }
+    
+    return 1;
 }
