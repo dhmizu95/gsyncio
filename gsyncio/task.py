@@ -214,7 +214,7 @@ def task_count() -> int:
     return _atomic_task_count()
 
 
-def run(func: Callable, *args, mapping: str = "native", **kwargs) -> Any:
+def run(func: Callable, *args, mapping: str = "hybrid", **kwargs) -> Any:
     """Run a function in the gsyncio runtime.
     
     This function handles both regular functions and async functions.

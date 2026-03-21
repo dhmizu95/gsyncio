@@ -741,7 +741,7 @@ cdef size_t _PAYLOAD_POOL_MAX_SIZE = 1024
 import threading
 cdef object _payload_pool_lock = threading.Lock()  # Lock for protecting payload pool access
 
-def init_scheduler(size_t num_workers=0, size_t max_fibers=100000000, int work_stealing=1, int stack_mode=0):
+def init_scheduler(size_t num_workers=0, size_t max_fibers=100000000, int work_stealing=1, int stack_mode=1):
     """Initialize the gsyncio scheduler
     
     stack_mode: 0 = Native (Fastest), 1 = Hybrid (Save memory maps)
