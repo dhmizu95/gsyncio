@@ -306,7 +306,11 @@ except ImportError:
         t = threading.Thread(target=func, args=args)
         t.start()
         return t
-    
+
+    def spawn_direct(func, args):
+        """Pure Python spawn_direct - call function directly and return result"""
+        return func(*args)
+
     def sleep_ms(ms):
         """Sleep for milliseconds"""
         import time
@@ -356,6 +360,37 @@ except ImportError:
         """Get recommended workers (returns CPU count in pure Python)"""
         import os
         return os.cpu_count() or 1
+
+    # sync/sync_timeout for pure Python fallback
+    def sync():
+        """Wait for all tasks to complete (pure Python - uses atomic counter)"""
+        import time
+        while not atomic_all_tasks_complete():
+            time.sleep(0.001)
+
+    def sync_timeout(timeout: float) -> bool:
+        """Wait for all tasks with a timeout (pure Python)"""
+        import time
+        deadline = time.time() + timeout
+        while not atomic_all_tasks_complete() and time.time() < deadline:
+            time.sleep(0.001)
+        return atomic_all_tasks_complete()
+
+    def task_count() -> int:
+        """Get the number of active tasks (pure Python)"""
+        return atomic_task_count()
+
+    def task_completed_count() -> int:
+        """Get the number of completed tasks (pure Python)"""
+        return 0
+
+    def run(func, *args, **kwargs):
+        """Run a function in gsyncio runtime (pure Python - direct call)"""
+        return func(*args, **kwargs)
+
+    def _get_task_registry():
+        """Get task registry (pure Python - returns None)"""
+        return None
     
     # Batch spawn (pure Python fallback)
     def spawn_batch(funcs_and_args):

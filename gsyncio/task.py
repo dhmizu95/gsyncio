@@ -133,18 +133,28 @@ def task(func, *args, **kwargs):
     if not _scheduler_initialized:
         _ensure_scheduler()
 
-    # Get task registry
-    registry = _get_task_registry()
-
     # Check if this is a batch call (list of tuples) or single task
     # Single task: task(worker, 1000) -> func=worker, args=(1000,)
     # Batch call: task([(func, (args,)), ...]) -> func=list
     if isinstance(func, list) and len(func) > 0:
         # Batch spawning via TaskRegistry (proper counting)
-        return registry.spawn_batch([(f, a) for f, a in func])
+        if _HAS_CYTHON:
+            registry = _get_task_registry()
+            return registry.spawn_batch([(f, a) for f, a in func])
+        else:
+            # Pure Python fallback - use task_batch
+            return task_batch(func)
     else:
-        # Single task via TaskRegistry (proper counting)
-        registry.spawn(func, *args, **kwargs)
+        # Single task
+        if _HAS_CYTHON:
+            registry = _get_task_registry()
+            registry.spawn(func, *args, **kwargs)
+        else:
+            # Pure Python fallback - use threading directly
+            _ensure_scheduler()
+            if _atomic_task_count() == 0:
+                _all_done_event.clear()
+            _spawn(_task_completion_wrapper, func, args, kwargs)
         return True
 
 

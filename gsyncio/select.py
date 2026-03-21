@@ -7,29 +7,37 @@ Uses native C implementation for maximum performance.
 
 Usage:
     import gsyncio as gs
-    
+
     async def server():
         auth_chan = gs.chan(10)
         data_chan = gs.chan(10)
-        
+
         while True:
             result = await gs.select(
                 gs.select_recv(auth_chan),
                 gs.select_send(data_chan, "response"),
                 gs.default(lambda: None)
             )
-            
+
             if result.channel == auth_chan:
                 print(f"Auth: {result.value}")
             elif result.channel == data_chan:
                 print(f"Data: {result.value}")
-    
+
     gs.run(server())
 """
 
 from typing import Any, Optional, Callable, List
 from .core import _HAS_CYTHON, Channel as _CChannel
-from ._gsyncio_core import SelectState, Channel
+
+# Try to import C extension, fall back to pure Python
+if _HAS_CYTHON:
+    from ._gsyncio_core import SelectState, Channel
+else:
+    # Pure Python fallback
+    SelectState = None
+    Channel = _CChannel
+
 from .channel import Chan
 
 

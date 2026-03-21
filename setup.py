@@ -32,7 +32,10 @@ except ImportError:
 NAME = 'gsyncio'
 VERSION = '0.1.0'
 DESCRIPTION = 'High-performance fiber-based concurrency for Python'
-LONG_DESCRIPTION = Path('README.md').read_text() if Path('README.md').exists() else ''
+try:
+    LONG_DESCRIPTION = Path('README.md').read_text(encoding='utf-8') if Path('README.md').exists() else ''
+except UnicodeDecodeError:
+    LONG_DESCRIPTION = ''
 LONG_DESCRIPTION_CONTENT_TYPE = 'text/markdown'
 AUTHOR = 'gsyncio team'
 AUTHOR_EMAIL = 'gsyncio@example.com'
