@@ -92,6 +92,16 @@ class Chan(Generic[T]):
             StopAsyncIteration: If channel is closed and empty
         """
         return await self._channel.recv()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> T:
+        """For 'async for' iteration (equivalent to Go's for range)"""
+        try:
+            return await self.recv()
+        except StopAsyncIteration:
+            raise
     
     def send_nowait(self, value: T) -> bool:
         """

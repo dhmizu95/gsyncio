@@ -71,34 +71,49 @@ async def main():
 gs.run(main())
 ```
 
-### Channels
+### Channels (Go-equivalent Producer/Consumer)
+
+> **Note**: Channel `send`/`recv` use fiber parking under the hood, so both
+> producer and consumer must be plain functions spawned with `gs.task()` — not
+> `async def` coroutines. This mirrors Go's goroutine model.
 
 ```python
 import gsyncio as gs
 
-async def worker(worker_id, send_chan, recv_chan):
-    data = await gs.recv(recv_chan)
-    processed = f"Worker {worker_id}: {data}"
-    await gs.send(send_chan, processed)
+def producer(ch):
+    for i in range(1, 6):
+        ch.send_nowait(i)
+        print(f"Sent: {i}")
+    gs.close(ch)
 
-async def main():
-    recv_chan = gs.chan(10)  # Buffered channel
-    send_chan = gs.chan(10)
-    
-    # Spawn workers
-    for i in range(5):
-        gs.task(worker, i, send_chan, recv_chan)
-    
-    # Send data
-    for i in range(5):
-        await gs.send(recv_chan, f"Task {i}")
-    
-    # Receive results
-    for i in range(5):
-        result = await gs.recv(send_chan)
-        print(result)
+def consumer(ch):
+    # Mirrors Go's "for num := range ch" — drains until closed and empty
+    while True:
+        val = ch.recv_nowait()
+        if val is not None:
+            print(f"Received: {val}")
+        elif ch.size == 0 and ch.closed:
+            break
+    print("Channel closed.")
 
-gs.run(main())
+def main():
+    ch = gs.chan(5)  # buffered channel, like Go's make(chan int, 5)
+    gs.task(producer, ch)
+    gs.task(consumer, ch)
+    gs.sync()
+
+gs.run(main)
+```
+
+Output (order may interleave depending on scheduling):
+```
+Sent: 1
+Sent: 2
+...
+Received: 1
+Received: 2
+...
+Channel closed.
 ```
 
 ### WaitGroups
@@ -242,8 +257,10 @@ See the `examples/` directory for complete examples:
 - `task_example.py` - Basic task/sync usage
 - `async_example.py` - Async/await with gather
 - `channel_example.py` - Channel-based communication
+- `go_producer_consumer.py` - Go-equivalent producer/consumer (recommended channel pattern)
 - `waitgroup_example.py` - WaitGroup synchronization
 - `select_example.py` - Select statement multiplexing
+
 
 See the `benchmarks/` directory for performance benchmarks and comparisons with Go coroutines.
 
