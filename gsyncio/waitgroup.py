@@ -65,14 +65,25 @@ class WaitGroup:
         """
         self._wg.done()
     
-    async def wait(self) -> None:
+    async def wait_async(self) -> None:
         """
-        Wait for the counter to reach zero.
-        
+        Wait for the counter to reach zero (async version).
+
         Blocks until all operations have called done().
         """
         await self._wg.wait()
-    
+
+    def wait(self) -> None:
+        """
+        Wait synchronously for the counter to reach zero.
+
+        Blocks until all operations have called done().
+        Uses polling for pure Python fallback.
+        """
+        import time
+        while self._wg.counter > 0:
+            time.sleep(0.001)
+
     @property
     def counter(self) -> int:
         """Current counter value"""
@@ -103,21 +114,21 @@ def add(wg: WaitGroup, delta: int = 1) -> None:
 def done(wg: WaitGroup) -> None:
     """
     Decrement a WaitGroup counter.
-    
+
     Args:
         wg: WaitGroup
     """
     wg.done()
 
 
-async def wait(wg: WaitGroup) -> None:
+def wait(wg: WaitGroup) -> None:
     """
-    Wait for a WaitGroup counter to reach zero.
-    
+    Wait synchronously for a WaitGroup counter to reach zero.
+
     Args:
         wg: WaitGroup
     """
-    await wg.wait()
+    wg.wait()
 
 
 __all__ = ['WaitGroup', 'create_wg', 'add', 'done', 'wait']
