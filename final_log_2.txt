@@ -1,0 +1,23 @@
+WARNING: vm.max_map_count is 1048576, which is too low for 10M fibers.
+Suggest run: sudo sysctl -w vm.max_map_count=20000000
+Starting benchmark for 1000000 tasks in HYBRID mode...
+Spawning 1,000,000 tasks...
+Memory before: 21376 kB, Maps before: 80
+Spawned 50,000... Maps: 132
+Spawned 100,000... Maps: 132
+Spawned 150,000... Maps: 132
+Spawned 200,000... Syncing batch... Maps: 132
+Batch 200,000 completed. Maps: 148
+Spawned 250,000... Maps: 148
+Spawned 300,000... Maps: 143
+Spawned 350,000... Maps: 137
+Spawned 400,000... Syncing batch... Maps: 132
+Batch 400,000 completed. Maps: 144
+Spawned 450,000... Maps: 144
+Spawned 500,000... Maps: 142
+Spawned 550,000... Maps: 137
+Spawned 600,000... Syncing batch... Maps: 132
+Batch 600,000 completed. Maps: 141
+Spawned 650,000... Maps: 141
+Spawned 700,000... Maps: 141
+Spawned 750,000... Maps: 137

@@ -331,7 +331,7 @@ static void push_top(deque_t* dq, fiber_t* f) {
     }
 
     /* Store fiber FIRST (before updating bottom) */
-    dq->data[b] = f;
+    dq->data[b & (dq->capacity - 1)] = f;
     
     /* Full memory barrier to ensure store is visible before bottom update */
     atomic_thread_fence(memory_order_seq_cst);
@@ -350,7 +350,7 @@ static fiber_t* pop_top(deque_t* dq) {
         return NULL;  /* Empty */
     }
 
-    fiber_t* f = dq->data[t];
+    fiber_t* f = dq->data[t & (dq->capacity - 1)];
     atomic_store_explicit(&dq->top, t + 1, memory_order_relaxed);
     return f;
 }
@@ -363,7 +363,7 @@ static fiber_t* steal_bottom(deque_t* dq) {
         return NULL;  /* Empty */
     }
 
-    fiber_t* f = dq->data[t];
+    fiber_t* f = dq->data[t & (dq->capacity - 1)];
     atomic_store_explicit(&dq->top, t + 1, memory_order_release);
     return f;
 }
@@ -784,6 +784,7 @@ int scheduler_init(scheduler_config_t* config) {
         sched->config.stack_size = FIBER_DEFAULT_STACK_SIZE;
         sched->config.work_stealing = true;
         sched->config.backend = SCHEDULER_BACKEND_DEFAULT;
+        sched->config.stack_mode = STACK_MODE_NATIVE;
         sched->config.io_uring_entries = 256;
     }
 
@@ -845,7 +846,7 @@ int scheduler_init(scheduler_config_t* config) {
     sharded_counter_init(&sched->sharded_completion_count);
 
     /* Start with 8K fibers - grows on demand to 10M */
-    sched->fiber_pool = fiber_pool_create(8192);
+    sched->fiber_pool = fiber_pool_create(8192, sched->config.stack_mode);
     DEBUG_LOG("Fiber pool created: capacity=%zu", fiber_pool_capacity(sched->fiber_pool));
 
     /* Initialize timer pool for fast sleep allocation */
@@ -1028,6 +1029,8 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
                     fiber_pool_free((fiber_pool_t*)g_scheduler->fiber_pool, f);
                     return 0;
                 }
+                
+                f->mmap_size = alloc_size;
                 
 #if FIBER_USE_GUARD_PAGES == 1
                 mprotect(f->stack_base, 4096, PROT_NONE);

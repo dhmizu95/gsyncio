@@ -214,7 +214,7 @@ def task_count() -> int:
     return _atomic_task_count()
 
 
-def run(func: Callable, *args, **kwargs) -> Any:
+def run(func: Callable, *args, mapping: str = "native", **kwargs) -> Any:
     """Run a function in the gsyncio runtime.
     
     This function handles both regular functions and async functions.
@@ -250,7 +250,8 @@ def run(func: Callable, *args, **kwargs) -> Any:
     need_init = not _scheduler_initialized
     
     if need_init:
-        _init_scheduler(num_workers=_num_workers())
+        mode_val = 1 if mapping.lower() == "hybrid" else 0
+        _init_scheduler(num_workers=_num_workers(), stack_mode=mode_val, max_fibers=100_000_000)
         _scheduler_initialized = True
     
     try:

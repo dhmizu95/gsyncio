@@ -27,10 +27,10 @@ static void init_debug_flag(void) {
 } while(0)
 
 #define FIBER_POOL_INITIAL_SIZE 8192
-#define FIBER_POOL_MAX_SIZE (10 * 1024 * 1024)  /* 10M fibers */
+#define FIBER_POOL_MAX_SIZE (100 * 1024 * 1024) /* 100M fibers */
 #define FIBER_POOL_LAZY_STACK 1         /* Lazy allocate stacks when used */
 
-fiber_pool_t* fiber_pool_create(size_t initial_size) {
+fiber_pool_t* fiber_pool_create(size_t initial_size, fiber_stack_mode_t stack_mode) {
     if (initial_size == 0) initial_size = FIBER_POOL_INITIAL_SIZE;
     
     fiber_pool_t* pool = (fiber_pool_t*)calloc(1, sizeof(fiber_pool_t));
@@ -38,6 +38,7 @@ fiber_pool_t* fiber_pool_create(size_t initial_size) {
     
     pthread_mutex_init(&pool->mutex, NULL);
     atomic_store(&pool->free_list, NULL);
+    pool->stack_mode = stack_mode;
     
     pthread_mutex_lock(&pool->mutex);
     size_t actual = 0;
@@ -66,7 +67,7 @@ void fiber_pool_destroy(fiber_pool_t* pool) {
     while (f) {
         fiber_t* next = f->next_ready;
         if (f->stack_base) {
-            munmap(f->stack_base, f->stack_capacity + 4096);
+            munmap(f->stack_base, f->mmap_size);
         }
         free(f);
         f = next;
@@ -88,17 +89,27 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool) {
         
 #if FIBER_POOL_LAZY_STACK == 1
         if (!f->stack_base) {
-            f->stack_base = mmap(NULL, FIBER_DEFAULT_STACK_SIZE + 4096, 
+#if FIBER_USE_GUARD_PAGES == 1
+            size_t alloc_size = FIBER_DEFAULT_STACK_SIZE + 4096;
+            f->stack_base = mmap(NULL, alloc_size, 
                                 PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (f->stack_base != MAP_FAILED) {
+                mprotect(f->stack_base, 4096, PROT_NONE);
+            }
+#else
+            size_t alloc_size = FIBER_DEFAULT_STACK_SIZE;
+            f->stack_base = mmap(NULL, alloc_size, 
+                                PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
             if (f->stack_base == MAP_FAILED) {
                 f->next_ready = (fiber_t*)atomic_load(&pool->free_list);
                 atomic_store(&pool->free_list, f);
                 pthread_mutex_unlock(&pool->mutex);
                 return NULL;
             }
-            mprotect(f->stack_base, 4096, PROT_NONE);
             f->stack_capacity = FIBER_DEFAULT_STACK_SIZE;
-            f->stack_ptr = (char*)f->stack_base + FIBER_DEFAULT_STACK_SIZE + 4096;
+            f->mmap_size = alloc_size;
+            f->stack_ptr = (char*)f->stack_base + alloc_size;
         }
 #endif
         f->state = FIBER_NEW;
@@ -143,6 +154,14 @@ void fiber_pool_free(fiber_pool_t* pool, fiber_t* fiber) {
     fiber->prev_ready = NULL;
     fiber->affinity = 0;
     fiber->waiting_on = NULL;
+    
+    /* Hybrid Mode: Unmap stack to save memory maps */
+    if (pool->stack_mode == STACK_MODE_HYBRID && fiber->stack_base) {
+        munmap(fiber->stack_base, fiber->mmap_size);
+        fiber->stack_base = NULL;
+        fiber->stack_ptr = NULL;
+        fiber->mmap_size = 0;
+    }
     
     fiber->next_ready = (fiber_t*)pool->free_list;
     pool->free_list = fiber;

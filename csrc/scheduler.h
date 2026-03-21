@@ -145,6 +145,7 @@ typedef struct scheduler_config {
     size_t stack_size;
     bool work_stealing;
     scheduler_backend_t backend;
+    fiber_stack_mode_t stack_mode;
     size_t io_uring_entries;
 } scheduler_config_t;
 

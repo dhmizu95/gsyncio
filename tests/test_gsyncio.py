@@ -84,6 +84,21 @@ class TestTaskSync:
         result = gs.run(main)
         assert result == "hello"
 
+    def test_run_hybrid(self):
+        """Test run function with hybrid mapping"""
+        def main():
+            results = []
+            def worker(n):
+                results.append(n)
+            
+            for i in range(10):
+                gs.task(worker, i)
+            gs.sync()
+            return len(results)
+        
+        result = gs.run(main, mapping='hybrid')
+        assert result == 10
+
 
 class TestAsyncAwait:
     """Tests for async/await model"""

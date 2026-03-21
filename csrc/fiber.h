@@ -24,7 +24,7 @@ extern "C" {
 #define FIBER_INITIAL_STACK_SIZE 2048   /* 2KB initial stack */
 #define FIBER_MAX_STACK_SIZE 65536      /* 64KB max stack */
 #define FIBER_STACK_GROW_STEP 4096      /* Grow by 4KB */
-#define FIBER_DEFAULT_STACK_SIZE 2048   /* 2KB default - like Go goroutines */
+#define FIBER_DEFAULT_STACK_SIZE 8192   /* 8KB default - safer for Python 3.12 */
 #define FIBER_USE_GUARD_PAGES 0         /* Disable guard pages to reach 1M+ system limit */
 #define FIBER_POOL_LAZY_ALLOC 1         /* Lazy stack allocation for memory efficiency */
 
@@ -40,6 +40,15 @@ typedef enum {
     FIBER_COMPLETED = 4,   /* Finished execution */
     FIBER_CANCELLED = 5    /* Cancelled */
 } fiber_state_t;
+
+/* ============================================ */
+/* Stack Management Modes                       */
+/* ============================================ */
+
+typedef enum {
+    STACK_MODE_NATIVE = 0,   /* Default: Keep stacks mapped for reuse (Fastest) */
+    STACK_MODE_HYBRID = 1    /* Hybrid: munmap stacks when returning to pool (Saves maps) */
+} fiber_stack_mode_t;
 
 /* ============================================ */
 /* Fiber Control Block                          */
@@ -59,6 +68,7 @@ struct fiber {
     void* stack_ptr;            /* Current stack pointer */
     size_t stack_size;         /* Current stack size */
     size_t stack_capacity;      /* Allocated capacity */
+    size_t mmap_size;          /* Total size passed to mmap */
 
     /* Function to execute */
     void (*func)(void*);

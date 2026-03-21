@@ -76,12 +76,56 @@ int fiber_table_add(fiber_t* f) {
     
     uint64_t h = hash_id(f->id);
     size_t idx = h % g_fiber_table_capacity;
-    
-    while (g_fiber_table[idx] && g_fiber_table[idx] != (fiber_t*)-1) {
+    size_t first_tombstone = (size_t)-1;
+    size_t probes = 0;
+    const size_t max_probes = 256;
+    while (g_fiber_table[idx]) {
+        if (g_fiber_table[idx] == (fiber_t*)-1) {
+            if (first_tombstone == (size_t)-1) first_tombstone = idx;
+        } else if (g_fiber_table[idx] == f) {
+            /* Already exists, just return */
+            pthread_mutex_unlock(&g_fiber_table_mutex);
+            return 0;
+        }
         idx = (idx + 1) % g_fiber_table_capacity;
+        if (++probes >= max_probes && probes >= g_fiber_table_capacity / 2) break;
     }
     
-    g_fiber_table[idx] = f;
+    size_t target_idx;
+    if (g_fiber_table[idx] == NULL && first_tombstone == (size_t)-1) {
+        /* Usual case: found a NULL slot */
+        target_idx = idx;
+    } else if (first_tombstone != (size_t)-1) {
+        /* Found a tombstone to reuse */
+        target_idx = first_tombstone;
+        /* If we probed too much, we should still consider resizing soon, 
+         * but for now just reuse to stay O(1) for this call. */
+        if (probes >= max_probes) {
+            /* Pathological case: table is full of tombstones. 
+             * Force a resize to clean them up. */
+            if (fiber_table_resize(g_fiber_table_capacity * 2) != 0) {
+                /* Optimization failed, but we still have a tombstone to use. */
+            } else {
+                /* Recalculate everything for the new table */
+                h = hash_id(f->id);
+                idx = h % g_fiber_table_capacity;
+                while (g_fiber_table[idx]) idx = (idx + 1) % g_fiber_table_capacity;
+                target_idx = idx;
+            }
+        }
+    } else {
+        /* No NULL and no tombstone found within probes or table is really full */
+        if (fiber_table_resize(g_fiber_table_capacity * 2) != 0) {
+            pthread_mutex_unlock(&g_fiber_table_mutex);
+            return -1;
+        }
+        h = hash_id(f->id);
+        idx = h % g_fiber_table_capacity;
+        while (g_fiber_table[idx]) idx = (idx + 1) % g_fiber_table_capacity;
+        target_idx = idx;
+    }
+
+    g_fiber_table[target_idx] = f;
     g_fiber_table_count++;
     
     pthread_mutex_unlock(&g_fiber_table_mutex);
@@ -207,25 +251,24 @@ fiber_t* fiber_create(void (*func)(void*), void* arg, size_t stack_size) {
     fiber->stack_capacity = stack_size;
     
     /* Allocate stack with guard page */
-    fiber->stack_base = mmap(
-        NULL,
-        stack_size + 4096,  /* Extra page for guard */
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS,
-        -1,
-        0
-    );
+#if FIBER_USE_GUARD_PAGES == 1
+    size_t alloc_size = stack_size + 4096;
+    fiber->stack_base = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (fiber->stack_base != MAP_FAILED) {
+        mprotect(fiber->stack_base, 4096, PROT_NONE);
+    }
+#else
+    size_t alloc_size = stack_size;
+    fiber->stack_base = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
     
     if (fiber->stack_base == MAP_FAILED) {
         free(fiber);
         return NULL;
     }
     
-    /* Set up guard page (unreadable/unwritable) */
-    mprotect(fiber->stack_base, 4096, PROT_NONE);
-    
-    /* Stack grows downward, so stack_ptr starts at base + size */
-    fiber->stack_ptr = (char*)fiber->stack_base + stack_size + 4096;
+    fiber->mmap_size = alloc_size;
+    fiber->stack_ptr = (char*)fiber->stack_base + alloc_size;
     
     fiber_table_add(fiber);
     

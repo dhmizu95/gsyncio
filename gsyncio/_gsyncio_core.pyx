@@ -44,6 +44,10 @@ cdef extern from "fiber.h":
         FIBER_COMPLETED
         FIBER_CANCELLED
 
+    ctypedef enum fiber_stack_mode_t:
+        STACK_MODE_NATIVE
+        STACK_MODE_HYBRID
+
     ctypedef struct fiber_t:
         uint64_t id
         fiber_state_t state
@@ -87,6 +91,7 @@ cdef extern from "scheduler.h":
         size_t stack_size
         int work_stealing
         int backend
+        fiber_stack_mode_t stack_mode
         size_t io_uring_entries
 
     ctypedef struct scheduler_stats_t:
@@ -688,36 +693,29 @@ cdef class TaskBatch:
 
 cdef void _c_task_entry(void* arg) noexcept nogil:
     """C callback for task entry - arg is a Python tuple (func, args)
-
-    Optimized for performance - minimal GIL hold time.
-    Exception handling is done inline without try/except overhead.
     """
     if arg != NULL:
-        # Hold GIL for Python object access and function call
         with gil:
             payload = <object>arg
+            Py_DECREF(payload) # Balanced INCREF from spawn
             func = payload[0]
             args = payload[1]
             try:
                 func(*args)
             except:
-                # Only import sys on exception (rare case)
                 import sys
                 print(f"Task exception: {sys.exc_info()[1]}", file=sys.stderr)
             finally:
-                # Clear payload reference
                 del payload
 
 
 cdef void _c_fiber_entry(void* arg) noexcept nogil:
     """C callback for fiber entry - arg is a Python tuple (func, args)
-
-    Optimized for performance - minimal GIL hold time.
     """
     if arg != NULL:
-        # Hold GIL for Python object access and function call
         with gil:
             payload = <object>arg
+            Py_DECREF(payload) # Balanced INCREF from spawn
             func = payload[0]
             args = payload[1]
             try:
@@ -743,8 +741,11 @@ cdef size_t _PAYLOAD_POOL_MAX_SIZE = 1024
 import threading
 cdef object _payload_pool_lock = threading.Lock()  # Lock for protecting payload pool access
 
-def init_scheduler(size_t num_workers=0, size_t max_fibers=65536, int work_stealing=1):
-    """Initialize the gsyncio scheduler"""
+def init_scheduler(size_t num_workers=0, size_t max_fibers=100000000, int work_stealing=1, int stack_mode=0):
+    """Initialize the gsyncio scheduler
+    
+    stack_mode: 0 = Native (Fastest), 1 = Hybrid (Save memory maps)
+    """
     global _task_registry
     cdef scheduler_config_t config
     config.num_workers = num_workers
@@ -752,6 +753,7 @@ def init_scheduler(size_t num_workers=0, size_t max_fibers=65536, int work_steal
     config.stack_size = 2048
     config.work_stealing = work_stealing
     config.backend = 0
+    config.stack_mode = <fiber_stack_mode_t>stack_mode
     config.io_uring_entries = 256
 
     if scheduler_init(&config) != 0:

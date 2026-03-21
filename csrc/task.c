@@ -554,10 +554,10 @@ size_t task_batch_fast_spawn_nogil(task_batch_fast_t* batch, task_registry_t* re
 
         /* Fall back to direct allocation */
         if (!f) {
-            f = fiber_create(batch->funcs[i], wrapper, g_scheduler->config.stack_size);
+            f = fiber_create(task_wrapper, wrapper, g_scheduler->config.stack_size);
         } else {
             /* Initialize pooled fiber */
-            f->func = batch->funcs[i];
+            f->func = task_wrapper;
             f->arg = wrapper;
             f->parent = fiber_current();
 

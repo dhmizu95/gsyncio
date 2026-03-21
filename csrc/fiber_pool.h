@@ -25,6 +25,7 @@ typedef struct fiber_pool {
     size_t capacity;           /* Total fibers created across all segments */
     _Atomic size_t available;   /* Available fibers in the free list */
     _Atomic size_t allocated;   /* Currently handed out fibers */
+    fiber_stack_mode_t stack_mode; /* Native vs Hybrid */
     pthread_mutex_t mutex;     /* Mutex for growth and freelist protection */
 } fiber_pool_t;
 
@@ -35,9 +36,10 @@ typedef struct fiber_pool {
 /**
  * Create a new fiber pool
  * @param initial_size Initial number of fibers (0 = default)
+ * @param stack_mode Stack management mode
  * @return New pool, or NULL on failure
  */
-fiber_pool_t* fiber_pool_create(size_t initial_size);
+fiber_pool_t* fiber_pool_create(size_t initial_size, fiber_stack_mode_t stack_mode);
 
 /**
  * Destroy a fiber pool

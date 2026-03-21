@@ -38,9 +38,9 @@ def run_benchmark(count):
     maps_before = get_map_count()
     print(f"Memory before: {mem_before} kB, Maps before: {maps_before}")
     
-    # Use batch spawn for efficiency
-    batch_size = 100_000
-    sync_every = 500_000
+    # Use smaller batches for stability
+    batch_size = 50_000
+    sync_every = 200_000
     for i in range(0, count, batch_size):
         current_batch = min(batch_size, count - i)
         for _ in range(current_batch):
@@ -51,9 +51,8 @@ def run_benchmark(count):
             print(f"Spawned {total_spawned:,}... Syncing batch... Maps: {get_map_count()}", flush=True)
             gs.sync()
             print(f"Batch {total_spawned:,} completed. Maps: {get_map_count()}", flush=True)
-        elif count > batch_size:
-            if total_spawned % 100_000 == 0:
-                print(f"Spawned {total_spawned:,}... Maps: {get_map_count()}", flush=True)
+        elif total_spawned % 50_000 == 0:
+            print(f"Spawned {total_spawned:,}... Maps: {get_map_count()}", flush=True)
         
     print(f"Spawning completed in {time.time() - start:.2f}s. Final sync...", flush=True)
     gs.sync()
@@ -79,4 +78,11 @@ if __name__ == "__main__":
         pass
 
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 1_000_000
-    gs.run(run_benchmark, count)
+    print(f"Starting benchmark for {count} tasks in HYBRID mode...")
+    try:
+        gs.run(run_benchmark, count, mapping='hybrid')
+        print("Benchmark completed successfully!")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
