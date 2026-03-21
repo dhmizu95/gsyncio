@@ -97,7 +97,7 @@ def consumer(ch):
     print("Channel closed.")
 
 def main():
-    ch = gs.chan(5)  # buffered channel, like Go's make(chan int, 5)
+    ch = gs.create_chan(5)  # buffered channel, like Go's make(chan int, 5)
     gs.task(producer, ch)
     gs.task(consumer, ch)
     gs.sync()
@@ -147,8 +147,8 @@ gs.run(main())
 import gsyncio as gs
 
 async def server():
-    auth_chan = gs.chan(10)
-    data_chan = gs.chan(10)
+    auth_chan = gs.create_chan(10)
+    data_chan = gs.create_chan(10)
     
     while True:
         result = await gs.select(
@@ -193,7 +193,7 @@ result = asyncio.run(main())  # Now uses gsyncio's scheduler
 | `gs.create_task(coro)` | Create task from coroutine |
 | `gs.sleep(ms)` | Async sleep for milliseconds |
 | `gs.gather(*futures)` | Wait for multiple futures |
-| `gs.chan(capacity)` | Create a channel |
+| `gs.create_chan(capacity)` | Create a channel |
 | `gs.send(chan, value)` | Send to channel |
 | `gs.recv(chan)` | Receive from channel |
 | `gs.create_wg()` | Create WaitGroup |
