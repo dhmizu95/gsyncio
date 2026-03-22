@@ -258,12 +258,16 @@ def run(func: Callable, *args, mapping: str = "hybrid", **kwargs) -> Any:
     
     # Check if scheduler needs initialization
     need_init = not _scheduler_initialized
-    
+
     if need_init:
         mode_val = 1 if mapping.lower() == "hybrid" else 0
-        _init_scheduler(num_workers=_num_workers(), stack_mode=mode_val, max_fibers=100_000_000)
+        try:
+            _init_scheduler(num_workers=_num_workers(), stack_mode=mode_val, max_fibers=100_000_000)
+        except TypeError:
+            # Fallback for pure Python (no stack_mode parameter)
+            _init_scheduler(num_workers=_num_workers(), max_fibers=100_000_000)
         _scheduler_initialized = True
-    
+
     try:
         return _run_coroutine(coro)
     finally:
