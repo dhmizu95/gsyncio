@@ -1439,13 +1439,29 @@ __all__ = [
 gsyncio/
 ├── __init__.py              # Module exports
 ├── core.py                  # Python C extension wrappers
-├── _gsyncio_core.c          # Native C fiber scheduler
+├── _gsyncio_core.c          # Native C fiber scheduler (Phase 1-14)
 ├── _gsyncio_core.h          # C header file
 ├── task.py                  # run(), task(), sync()
 ├── channel.py               # Chan (sync + async API)
 ├── async_.py                # sleep(), gather(), wait_for()
+├── io.py                    # Async I/O helpers (Phase 9)
+├── primitives.py            # Lock, Event, Semaphore (Phase 10)
+├── debug.py                 # Fiber introspection (Phase 11)
+├── cancellation.py          # Cancellation tokens (Phase 8)
 └── setup.py                 # Build C extension
 ```
+
+## Performance Goals
+
+| Operation | Target | Notes |
+|-----------|--------|-------|
+| Fiber create | < 1 µs | Pure C allocation |
+| Fiber park/unpark | < 500 ns | pthread_cond_wait |
+| Channel send/recv | < 2 µs | Lock-free where possible |
+| sleep(0) yield | < 500 ns | Direct scheduler call |
+| Task spawn | < 1 µs | C atomic increment |
+| Thread pool submit | < 2 µs | Lock-free where possible |
+| I/O poll (100 fds) | < 100 µs | epoll_wait batching |
 
 ---
 
@@ -1558,13 +1574,17 @@ setup(
 
 ## Implementation Checklist
 
-- [ ] **Phase 1: C Extension**
+- [ ] **Phase 1: C Extension - Core**
   - [ ] Define Fiber, Future, EventLoop structs
   - [ ] Implement fiber_create, fiber_resume, fiber_park
   - [ ] Implement loop_create, loop_run, loop_add_ready
   - [ ] Implement future_create, future_set_result
   - [ ] Implement timer_schedule, timer_check
   - [ ] Create Python module definition
+  - [ ] **FIX: Remove fibers from pending queue on resume (BUG FIX)**
+  - [ ] **FIX: Add memory barriers for thread-safe queue operations**
+  - [ ] **FIX: Proper fiber_cleanup() from all queues before free**
+  - [ ] **FIX: timer_cancel_fiber() and timer_queue_clear() on loop close**
 
 - [ ] **Phase 2: Python Wrappers**
   - [ ] Create Fiber, EventLoop, Future classes
@@ -1595,17 +1615,64 @@ setup(
   - [ ] Write tests
   - [ ] Benchmark performance
 
+- [ ] **Phase 7: Thread Pool Management** (NEW)
+  - [ ] Implement ThreadPoolObject struct with work-stealing queues
+  - [ ] Implement worker_thread() main loop
+  - [ ] Implement pool_submit(), pool_create(), pool_shutdown()
+  - [ ] Implement init_scheduler_py(), shutdown_scheduler_py(), num_workers_py()
+  - [ ] Implement graceful_shutdown() with three-phase protocol
+  - [ ] Test thread pool with concurrent fibers
+
+- [ ] **Phase 8: Cancellation Support** (NEW)
+  - [ ] Implement CancelTokenObject with parent chain
+  - [ ] Implement cancel_token_is_cancelled()
+  - [ ] Implement fiber_cancel() and fiber_raise_cancelled()
+  - [ ] Implement Python CancellationToken wrapper
+  - [ ] Implement check_cancelled() async helper
+  - [ ] Test cancellation propagation
+
+- [ ] **Phase 9: Async I/O Integration** (NEW)
+  - [ ] Implement IOWatcherObject with epoll/kqueue
+  - [ ] Implement io_watcher_register(), io_watcher_poll()
+  - [ ] Integrate I/O polling into main event loop
+  - [ ] Implement Python sock_recv, sock_sendall, sock_accept
+  - [ ] Test network I/O with fiber parking
+
+- [ ] **Phase 10: Sync Primitives** (NEW)
+  - [ ] Implement Lock with async context manager
+  - [ ] Implement Event with wait/set/clear
+  - [ ] Implement Semaphore with acquire/release
+  - [ ] Implement Condition with wait/notify
+  - [ ] Test concurrent access with primitives
+
+- [ ] **Phase 11: Fiber Introspection** (NEW)
+  - [ ] Implement FiberInfo struct and fiber_to_info()
+  - [ ] Implement loop_get_fibers()
+  - [ ] Implement Python get_all_fibers(), get_fiber_count()
+  - [ ] Implement FiberDump context manager
+  - [ ] Test fiber introspection in debug scenarios
+
+- [ ] **Phase 12: Memory Management Fixes** (NEW - BUG FIXES)
+  - [ ] Implement fiber_cleanup() to remove from all queues
+  - [ ] Implement fiber_dealloc() with proper cleanup
+  - [ ] Implement timer_cancel_fiber() for fiber cancellation
+  - [ ] Implement timer_queue_clear() on loop destruction
+  - [ ] Test memory leaks with long-running fibers
+
+- [ ] **Phase 13: Exception Propagation** (NEW - BUG FIX)
+  - [ ] Implement StoredException struct
+  - [ ] Implement capture_exception(), restore_exception()
+  - [ ] Update fiber_resume() to handle all exception paths
+  - [ ] Test exception propagation in nested coroutines
+
+- [ ] **Phase 14: Missing Python Helpers** (NEW - BUG FIX)
+  - [ ] Implement atomic_task_inc(), atomic_task_dec()
+  - [ ] Implement atomic_task_count(), atomic_all_tasks_complete()
+  - [ ] Implement yield_execution_py()
+  - [ ] Update Python wrappers to use C atomics
+  - [ ] Test atomic counters under load
+
 ---
-
-## Performance Goals
-
-| Operation | Target | Notes |
-|-----------|--------|-------|
-| Fiber create | < 1 µs | Pure C allocation |
-| Fiber park/unpark | < 500 ns | pthread_cond_wait |
-| Channel send/recv | < 2 µs | Lock-free where possible |
-| sleep(0) yield | < 500 ns | Direct scheduler call |
-| Task spawn | < 1 µs | C atomic increment |
 
 ---
 
@@ -1685,6 +1752,1009 @@ gs.run(main())
 
 ---
 
+## Phase 7: Thread Pool Management
+
+### 7.1 C Thread Pool Implementation
+
+```c
+// Thread pool state
+typedef struct ThreadPool {
+    pthread_t *workers;           // Worker threads
+    int num_workers;               // Number of threads
+    FiberObject *shared_queue;     // Work-stealing queue head
+    FiberObject **shared_queue_tail;
+    atomic_int active_workers;     // Currently running workers
+    atomic_int shutdown_requested; // Shutdown flag
+    
+    pthread_mutex_t lock;          // Queue lock
+    pthread_cond_t work_avail;     // New work notification
+    pthread_cond_t idle;           // All workers idle
+    
+    // Per-worker local queues for work-stealing
+    FiberObject **local_queues;    // Array of local queues
+    int *local_queue_sizes;        // Array of local queue sizes
+} ThreadPoolObject;
+
+// Initialize thread pool
+static ThreadPoolObject* pool_create(int num_workers) {
+    ThreadPoolObject *pool = malloc(sizeof(ThreadPoolObject));
+    if (!pool) return NULL;
+    
+    pool->num_workers = num_workers;
+    pool->workers = malloc(num_workers * sizeof(pthread_t));
+    pool->active_workers = num_workers;
+    pool->shutdown_requested = 0;
+    
+    pool->shared_queue = NULL;
+    pool->shared_queue_tail = &pool->shared_queue;
+    
+    pthread_mutex_init(&pool->lock, NULL);
+    pthread_cond_init(&pool->work_avail, NULL);
+    pthread_cond_init(&pool->idle, NULL);
+    
+    // Per-worker local queues
+    pool->local_queues = calloc(num_workers, sizeof(FiberObject*));
+    pool->local_queue_sizes = calloc(num_workers, sizeof(int));
+    
+    // Start worker threads
+    for (int i = 0; i < num_workers; i++) {
+        pthread_create(&pool->workers[i], NULL, worker_thread, 
+                       (void*)(intptr_t)i);
+    }
+    
+    return pool;
+}
+
+// Worker thread main loop
+static void* worker_thread(void *arg) {
+    int worker_id = (int)(intptr_t)arg;
+    ThreadPoolObject *pool = _global_pool;
+    
+    while (!atomic_load(&pool->shutdown_requested)) {
+        FiberObject *f = NULL;
+        
+        // Try local queue first (no lock needed)
+        if (pool->local_queue_sizes[worker_id] > 0) {
+            FiberObject **local = &pool->local_queues[worker_id];
+            f = *local;
+            *local = f->next;
+            pool->local_queue_sizes[worker_id]--;
+        }
+        // Try stealing from other workers
+        else {
+            for (int i = 0; i < pool->num_workers; i++) {
+                if (i == worker_id) continue;
+                if (pool->local_queue_sizes[i] > 0) {
+                    pthread_mutex_lock(&pool->lock);
+                    FiberObject **local = &pool->local_queues[i];
+                    if (*local) {
+                        f = *local;
+                        *local = f->next;
+                        pool->local_queue_sizes[i]--;
+                    }
+                    pthread_mutex_unlock(&pool->lock);
+                    break;
+                }
+            }
+        }
+        
+        // Try shared queue
+        if (!f) {
+            pthread_mutex_lock(&pool->lock);
+            if (pool->shared_queue) {
+                f = pool->shared_queue;
+                pool->shared_queue = f->next;
+                if (pool->shared_queue == NULL) {
+                    pool->shared_queue_tail = &pool->shared_queue;
+                }
+            }
+            if (!f) {
+                // Wait for work
+                pthread_cond_wait(&pool->work_avail, &pool->lock);
+            }
+            pthread_mutex_unlock(&pool->lock);
+        }
+        
+        // Execute fiber if we got one
+        if (f) {
+            fiber_resume(f);
+        }
+    }
+    
+    atomic_fetch_sub(&pool->active_workers, 1);
+    return NULL;
+}
+
+// Submit fiber to thread pool
+static void pool_submit(ThreadPoolObject *pool, FiberObject *f) {
+    pthread_mutex_lock(&pool->lock);
+    *pool->shared_queue_tail = f;
+    pool->shared_queue_tail = &f->next;
+    f->next = NULL;
+    pthread_cond_signal(&pool->work_avail);
+    pthread_mutex_unlock(&pool->lock);
+}
+
+// Shutdown thread pool
+static void pool_shutdown(ThreadPoolObject *pool, int wait) {
+    atomic_store(&pool->shutdown_requested, 1);
+    
+    // Wake all workers
+    pthread_mutex_lock(&pool->lock);
+    pthread_cond_broadcast(&pool->work_avail);
+    pthread_mutex_unlock(&pool->lock);
+    
+    if (wait) {
+        for (int i = 0; i < pool->num_workers; i++) {
+            pthread_join(pool->workers[i], NULL);
+        }
+    }
+    
+    // Cleanup
+    free(pool->workers);
+    free(pool->local_queues);
+    free(pool->local_queue_sizes);
+    pthread_mutex_destroy(&pool->lock);
+    pthread_cond_destroy(&pool->work_avail);
+    pthread_cond_destroy(&pool->idle);
+    free(pool);
+}
+```
+
+### 7.2 Graceful Shutdown Protocol
+
+```c
+// Shutdown phases for graceful cleanup
+typedef enum {
+    SHUTDOWN_PHASE_1_DRAIN,    // Stop accepting new tasks
+    SHUTDOWN_PHASE_2_CANCEL,   // Cancel pending fibers
+    SHUTDOWN_PHASE_3_TERMINATE // Force terminate remaining
+} ShutdownPhase;
+
+// Graceful shutdown with timeout
+static int graceful_shutdown(ThreadPoolObject *pool, int64_t timeout_ns) {
+    int64_t deadline = get_time_ns() + timeout_ns;
+    
+    // Phase 1: Signal shutdown
+    atomic_store(&pool->shutdown_requested, 1);
+    
+    // Phase 2: Wait for active fibers with timeout
+    while (atomic_load(&pool->active_workers) > 0) {
+        if (get_time_ns() >= deadline) {
+            // Phase 3: Force terminate
+            return -1;
+        }
+        usleep(1000);  // 1ms
+    }
+    
+    return 0;
+}
+```
+
+---
+
+## Phase 8: Cancellation Support
+
+### 8.1 Cancellation Tokens
+
+```c
+// Cancellation token object
+typedef struct CancelToken {
+    PyObject_HEAD
+    atomic_int cancelled;        // Cancellation flag
+    atomic_int shielded;         // Shield from parent cancellation
+    struct CancelToken *parent;   // Parent token (weak ref)
+} CancelTokenObject;
+
+// Check if token is cancelled
+static int cancel_token_is_cancelled(CancelTokenObject *token) {
+    if (!token) return 0;
+    
+    if (atomic_load(&token->cancelled)) {
+        return 1;
+    }
+    
+    // Check parent chain
+    if (token->parent && atomic_load(&token->parent->cancelled)) {
+        // Only propagate if not shielded
+        if (!atomic_load(&token->shielded)) {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+// Throw cancellation exception in fiber
+static int fiber_raise_cancelled(FiberObject *f) {
+    if (!f || f->state == FIBER_STATE_DONE) return 0;
+    
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    PyErr_SetString(PyExc_OperationCancelledError, "Task cancelled");
+    // Store exception for retrieval
+    f->exception = PyErr_Occurred();
+    Py_XINCREF(f->exception);
+    PyGILState_Release(gstate);
+    
+    return 1;
+}
+
+// Cancel a fiber
+static int fiber_cancel(FiberObject *f, CancelTokenObject *token) {
+    if (!f || f->state == FIBER_STATE_DONE) return -1;
+    
+    if (token && !cancel_token_is_cancelled(token)) {
+        return 0;  // Not cancelled yet
+    }
+    
+    // If fiber is suspended, unpark with cancellation
+    if (f->state == FIBER_STATE_SUSPENDED) {
+        fiber_unpark(f);
+    }
+    
+    // Mark as cancelled
+    f->state = FIBER_STATE_CANCELLED;
+    return 1;
+}
+```
+
+### 8.2 Python Cancellation API
+
+```python
+class CancelledError(Exception):
+    """Raised when operation is cancelled."""
+    pass
+
+class CancellationToken:
+    """Token for cooperative cancellation."""
+    
+    def __init__(self):
+        self._token = _CancelToken()
+    
+    @property
+    def cancelled(self) -> bool:
+        return self._token.cancelled
+    
+    def cancel(self):
+        """Request cancellation."""
+        self._token.cancel()
+    
+    def shield(self):
+        """Create shielded child token."""
+        child = CancellationToken()
+        child._token.parent = self._token
+        return child
+    
+    def throw(self, exc):
+        """Throw exception in associated coroutines."""
+        self._token.throw(exc)
+
+
+async def check_cancelled(token: CancellationToken):
+    """Check for cancellation, raise if cancelled."""
+    if token.cancelled:
+        raise CancelledError()
+```
+
+---
+
+## Phase 9: Async I/O Integration
+
+### 9.1 I/O Readiness via epoll/kqueue
+
+```c
+// I/O watcher for async I/O operations
+typedef struct IOWatcher {
+    int epoll_fd;                  // Linux: epoll, BSD: kqueue
+    struct epoll_event *events;    // Event buffer
+    int max_events;
+    
+    // Registered file descriptors
+    struct {
+        int fd;
+        FiberObject *read_fiber;   // Fiber waiting for read
+        FiberObject *write_fiber;  // Fiber waiting for write
+        int events;                // epoll events mask
+    } *watchers;
+    int num_watchers;
+    int capacity;
+    
+    pthread_mutex_t lock;
+    pthread_cond_t io_ready;
+} IOWatcherObject;
+
+// Register file descriptor for I/O
+static int io_watcher_register(IOWatcherObject *io, int fd, 
+                                int events, FiberObject *fiber) {
+    pthread_mutex_lock(&io->lock);
+    
+    // Expand capacity if needed
+    if (io->num_watchers >= io->capacity) {
+        io->capacity *= 2;
+        io->watchers = realloc(io->watchers, 
+                               io->capacity * sizeof(*io->watchers));
+    }
+    
+    // Add to watchers array
+    int idx = io->num_watchers++;
+    io->watchers[idx].fd = fd;
+    io->watchers[idx].events = events;
+    io->watchers[idx].read_fiber = events & EPOLLIN ? fiber : NULL;
+    io->watchers[idx].write_fiber = events & EPOLLOUT ? fiber : NULL;
+    
+    // Add to epoll
+    struct epoll_event ev;
+    ev.events = events;
+    ev.data.fd = fd;
+    epoll_ctl(io->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+    
+    pthread_mutex_unlock(&io->lock);
+    return 0;
+}
+
+// Process I/O events
+static void io_watcher_poll(IOWatcherObject *io, int timeout_ms) {
+    int n = epoll_wait(io->epoll_fd, io->events, io->max_events, timeout_ms);
+    
+    for (int i = 0; i < n; i++) {
+        int fd = io->events[i].data.fd;
+        uint32_t events = io->events[i].events;
+        
+        pthread_mutex_lock(&io->lock);
+        
+        // Find and unpark fiber
+        for (int j = 0; j < io->num_watchers; j++) {
+            if (io->watchers[j].fd != fd) continue;
+            
+            if (events & EPOLLIN && io->watchers[j].read_fiber) {
+                fiber_unpark(io->watchers[j].read_fiber);
+            }
+            if (events & EPOLLOUT && io->watchers[j].write_fiber) {
+                fiber_unpark(io->watchers[j].write_fiber);
+            }
+            if (events & (EPOLLERR | EPOLLHUP)) {
+                // Error condition - unpark both
+                fiber_unpark(io->watchers[j].read_fiber);
+                fiber_unpark(io->watchers[j].write_fiber);
+            }
+            break;
+        }
+        
+        pthread_mutex_unlock(&io->lock);
+    }
+}
+```
+
+### 9.2 Python Async I/O Helpers
+
+```python
+async def sock_recv(sock, n):
+    """Receive from socket without blocking thread."""
+    loop = get_current_loop()
+    fut = loop.create_future()
+    
+    def on_readable():
+        try:
+            data = sock.recv(n)
+            fut.set_result(data)
+        except Exception as e:
+            fut.set_exception(e)
+    
+    loop.add_reader(sock, on_readable)
+    return await fut
+
+
+async def sock_sendall(sock, data):
+    """Send all data without blocking."""
+    loop = get_current_loop()
+    fut = loop.create_future()
+    
+    def on_writable():
+        try:
+            n = sock.send(data)
+            if n == len(data):
+                fut.set_result(n)
+            else:
+                data = data[n:]
+        except Exception as e:
+            fut.set_exception(e)
+    
+    loop.add_writer(sock, on_writable)
+    return await fut
+
+
+async def sock_accept(sock):
+    """Accept connection without blocking."""
+    loop = get_current_loop()
+    fut = loop.create_future()
+    
+    def on_readable():
+        try:
+            conn, addr = sock.accept()
+            fut.set_result((conn, addr))
+        except Exception as e:
+            fut.set_exception(e)
+    
+    loop.add_reader(sock, on_readable)
+    return await fut
+```
+
+---
+
+## Phase 10: Sync Primitives
+
+### 10.1 Lock and Event
+
+```python
+class Lock:
+    """Async lock for synchronizing access."""
+    
+    def __init__(self):
+        self._locked = False
+        self._waiters = []
+    
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+    
+    async def __aexit__(self, *args):
+        self.release()
+    
+    async def acquire(self):
+        loop = get_current_loop()
+        while self._locked:
+            fut = loop.create_future()
+            self._waiters.append(fut)
+            await fut
+        self._locked = True
+    
+    def release(self):
+        self._locked = False
+        if self._waiters:
+            fut = self._waiters.pop(0)
+            fut.set_result(None)
+
+
+class Event:
+    """Async event for signaling."""
+    
+    def __init__(self):
+        self._set = False
+        self._waiters = []
+    
+    async def wait(self):
+        if self._set:
+            return
+        fut = get_current_loop().create_future()
+        self._waiters.append(fut)
+        await fut
+    
+    def set(self):
+        self._set = True
+        for fut in self._waiters:
+            fut.set_result(None)
+        self._waiters.clear()
+    
+    def is_set(self) -> bool:
+        return self._set
+    
+    def clear(self):
+        self._set = False
+
+
+class Semaphore:
+    """Async semaphore for limiting concurrency."""
+    
+    def __init__(self, value: int = 1):
+        self._value = value
+        self._waiters = []
+    
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+    
+    async def __aexit__(self, *args):
+        self.release()
+    
+    async def acquire(self):
+        loop = get_current_loop()
+        while self._value <= 0:
+            fut = loop.create_future()
+            self._waiters.append(fut)
+            await fut
+        self._value -= 1
+    
+    def release(self):
+        self._value += 1
+        if self._waiters:
+            fut = self._waiters.pop(0)
+            fut.set_result(None)
+
+
+class Condition:
+    """Async condition variable."""
+    
+    def __init__(self, lock=None):
+        self._lock = lock or Lock()
+        self._waiters = []
+    
+    async def __aenter__(self):
+        await self._lock.acquire()
+        return self
+    
+    async def __aexit__(self, *args):
+        self._lock.release()
+    
+    async def wait(self):
+        self.release()
+        try:
+            fut = get_current_loop().create_future()
+            self._waiters.append(fut)
+            await fut
+        finally:
+            await self._lock.acquire()
+    
+    def notify(self, n=1):
+        for i in range(min(n, len(self._waiters))):
+            fut = self._waiters.pop(0)
+            fut.set_result(None)
+    
+    def notify_all(self):
+        for fut in self._waiters:
+            fut.set_result(None)
+        self._waiters.clear()
+```
+
+---
+
+## Phase 11: Fiber Introspection
+
+### 11.1 Debug and Inspection API
+
+```c
+// Fiber info for introspection
+typedef struct {
+    int id;
+    FiberType type;
+    FiberState state;
+    int pending;
+    PyObject *awaited_obj;  // What fiber is waiting on
+    PyObject *repr;         // String representation
+} FiberInfo;
+
+// Get all fibers in loop
+static PyObject* loop_get_fibers(EventLoopObject *loop) {
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    
+    PyObject *list = PyList_New(0);
+    
+    pthread_mutex_lock(&loop->lock);
+    
+    // Traverse ready queue
+    FiberObject *f = loop->ready_queue;
+    while (f) {
+        PyObject *info = fiber_to_info(f);
+        PyList_Append(list, info);
+        Py_DECREF(info);
+        f = f->next;
+    }
+    
+    // Traverse pending queue
+    f = loop->pending_queue;
+    while (f) {
+        PyObject *info = fiber_to_info(f);
+        PyList_Append(list, info);
+        Py_DECREF(info);
+        f = f->next;
+    }
+    
+    pthread_mutex_unlock(&loop->lock);
+    PyGILState_Release(gstate);
+    
+    return list;
+}
+
+// Convert fiber to info dict
+static PyObject* fiber_to_info(FiberObject *f) {
+    PyObject *info = PyDict_New();
+    PyDict_SetItemString(info, "id", PyLong_FromLong(f->id));
+    
+    const char *type_str = f->type == FIBER_SYNC ? "sync" : "async";
+    PyDict_SetItemString(info, "type", PyUnicode_FromString(type_str));
+    
+    const char *state_str;
+    switch (f->state) {
+        case FIBER_STATE_NEW: state_str = "new"; break;
+        case FIBER_STATE_RUNNING: state_str = "running"; break;
+        case FIBER_STATE_SUSPENDED: state_str = "suspended"; break;
+        case FIBER_STATE_DONE: state_str = "done"; break;
+        case FIBER_STATE_CANCELLED: state_str = "cancelled"; break;
+        default: state_str = "unknown";
+    }
+    PyDict_SetItemString(info, "state", PyUnicode_FromString(state_str));
+    
+    PyDict_SetItemString(info, "pending", PyBool_FromLong(f->pending));
+    
+    if (f->awaited) {
+        Py_INCREF(f->awaited);
+        PyDict_SetItemString(info, "awaited", f->awaited);
+    }
+    
+    return info;
+}
+```
+
+### 11.2 Python Debug API
+
+```python
+def get_all_fibers():
+    """Get list of all fibers in current loop."""
+    loop = get_current_loop()
+    if not loop:
+        return []
+    return loop.get_fibers()
+
+
+def get_fiber_count():
+    """Get count of active fibers."""
+    return len(get_all_fibers())
+
+
+def current_fiber():
+    """Get current fiber object."""
+    return Fiber.current()
+
+
+def fiber_stack_trace(fiber):
+    """Get stack trace for a fiber (if suspended)."""
+    # Uses PyFrameObject introspection
+    pass
+
+
+class FiberDump:
+    """Context manager to dump fiber state on exception."""
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            print("=== Fiber Dump ===")
+            for info in get_all_fibers():
+                print(f"  {info}")
+        return False
+```
+
+---
+
+## Phase 12: Memory Management Fixes
+
+### 12.1 Proper Fiber Cleanup
+
+```c
+// Clear fiber from all queues before freeing
+static void fiber_cleanup(FiberObject *f) {
+    EventLoopObject *loop = _current_loop;
+    if (!loop) return;
+    
+    pthread_mutex_lock(&loop->lock);
+    
+    // Remove from ready queue
+    FiberObject **pp = &loop->ready_queue;
+    while (*pp) {
+        if (*pp == f) {
+            *pp = f->next;
+            if (f->next) {
+                f->next->prev = *pp ? (*pp)->prev : NULL;
+            }
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    
+    // Remove from pending queue
+    pp = &loop->pending_queue;
+    while (*pp) {
+        if (*pp == f) {
+            *pp = f->next;
+            if (f->next) {
+                f->next->prev = *pp ? (*pp)->prev : NULL;
+            }
+            loop->pending_count--;
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    
+    pthread_mutex_unlock(&loop->lock);
+    
+    // Decrement active fiber count
+    atomic_fetch_sub(&loop->fiber_count, 1);
+}
+
+// Deallocate fiber
+static void fiber_dealloc(FiberObject *f) {
+    // Untrack from GC
+    PyObject_GC_UnTrack(f);
+    
+    // Cleanup from queues
+    fiber_cleanup(f);
+    
+    // Clear references
+    Py_CLEAR(f->coro);
+    Py_CLEAR(f->awaited);
+    Py_CLEAR(f->args);
+    Py_CLEAR(f->result);
+    Py_CLEAR(f->exception);
+    
+    // Free type-specific memory
+    PyObject_Del(f);
+}
+```
+
+### 12.2 Timer Memory Safety
+
+```c
+// Cancel and free all timers for a fiber
+static void timer_cancel_fiber(EventLoopObject *loop, FiberObject *fiber) {
+    pthread_mutex_lock(&loop->lock);
+    
+    TimerObject **pp = &loop->timer_queue;
+    while (*pp) {
+        if ((*pp)->fiber == fiber) {
+            TimerObject *t = *pp;
+            *pp = t->next;
+            free(t);  // Timer was malloc'd
+        } else {
+            pp = &(*pp)->next;
+        }
+    }
+    
+    pthread_mutex_unlock(&loop->lock);
+}
+
+// Clear timer queue on loop close
+static void timer_queue_clear(EventLoopObject *loop) {
+    pthread_mutex_lock(&loop->lock);
+    
+    TimerObject *t = loop->timer_queue;
+    while (t) {
+        TimerObject *next = t->next;
+        free(t);
+        t = next;
+    }
+    loop->timer_queue = NULL;
+    
+    pthread_mutex_unlock(&loop->lock);
+}
+```
+
+---
+
+## Phase 13: Exception Propagation
+
+### 13.1 Complete Exception Handling
+
+```c
+// Store exception in fiber for later retrieval
+typedef struct {
+    PyObject *exc_type;
+    PyObject *exc_value;
+    PyObject *exc_traceback;
+} StoredException;
+
+// Capture current exception
+static StoredException* capture_exception(void) {
+    if (!PyErr_Occurred()) return NULL;
+    
+    StoredException *stored = malloc(sizeof(StoredException));
+    PyErr_Fetch(&stored->exc_type, &stored->exc_value, &stored->exc_traceback);
+    PyErr_NormalizeException(&stored->exc_type, &stored->exc_value, 
+                             &stored->exc_traceback);
+    return stored;
+}
+
+// Restore exception in fiber context
+static void restore_exception(StoredException *stored) {
+    if (!stored) return;
+    PyErr_Restore(stored->exc_type, stored->exc_value, stored->exc_traceback);
+    free(stored);
+}
+
+// Free without restoring
+static void free_exception(StoredException *stored) {
+    if (!stored) return;
+    Py_XDECREF(stored->exc_type);
+    Py_XDECREF(stored->exc_value);
+    Py_XDECREF(stored->exc_traceback);
+    free(stored);
+}
+
+// Updated fiber_resume with proper exception handling
+static void fiber_resume(FiberObject *f) {
+    if (!f || f->state == FIBER_STATE_DONE) return;
+    
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    
+    PyObject *result = NULL;
+    
+    // Restore any stored exception before resuming
+    if (f->exception) {
+        restore_exception(f->exception);
+        f->exception = NULL;
+    }
+    
+    if (f->type == FIBER_ASYNC) {
+        // === ASYNC: Resume coroutine ===
+        if (f->awaited == NULL) {
+            result = PyObject_Send(f->coro, Py_None);
+        } else {
+            result = PyObject_Send(f->coro, f->awaited);
+            Py_DECREF(f->awaited);
+            f->awaited = NULL;
+        }
+        
+        if (result == NULL) {
+            // Exception occurred in coroutine
+            if (PyErr_ExceptionMatches(PyExc_StopAsyncIteration)) {
+                PyErr_Clear();
+                f->state = FIBER_STATE_DONE;
+                Py_DECREF(f->coro);
+                f->coro = NULL;
+            } else if (PyErr_ExceptionMatches(PyExc_CancelledError)) {
+                PyErr_Clear();
+                f->state = FIBER_STATE_CANCELLED;
+                Py_DECREF(f->coro);
+                f->coro = NULL;
+            } else {
+                // Store exception for propagation
+                f->exception = capture_exception();
+                f->state = FIBER_STATE_DONE;
+                Py_DECREF(f->coro);
+                f->coro = NULL;
+            }
+            PyGILState_Release(gstate);
+            return;
+        }
+        
+        if (PyObject_TypeCheck(result, &FutureType)) {
+            FutureObject *fut = (FutureObject*)result;
+            f->awaited = (PyObject*)fut;
+            f->state = FIBER_STATE_SUSPENDED;
+            fut->fiber = f;
+            loop_add_pending(_current_loop, f);
+        } else if (result == Py_None) {
+            Py_DECREF(result);
+            loop_add_ready(_current_loop, f);
+        } else {
+            // Unknown yield - store and continue
+            f->awaited = result;
+            loop_add_pending(_current_loop, f);
+        }
+        
+    } else {
+        // === SYNC: Call function ===
+        if (f->func != NULL) {
+            f->result = PyObject_CallObject((PyObject*)f->func, f->args);
+            if (f->result == NULL) {
+                f->exception = capture_exception();
+            }
+            f->state = FIBER_STATE_DONE;
+            Py_DECREF(f->args);
+            f->args = NULL;
+        }
+    }
+    
+    PyGILState_Release(gstate);
+}
+```
+
+---
+
+## Phase 14: Missing Python Helpers (C Implementation)
+
+### 14.1 Atomic Operations for Python
+
+```c
+// Global atomic counters
+static atomic_int _task_count = 0;
+static atomic_int _pending_count = 0;
+
+// Increment task count
+static PyObject* atomic_task_inc(PyObject *self) {
+    int new_val = atomic_fetch_add(&_task_count, 1) + 1;
+    return PyLong_FromLong(new_val);
+}
+
+// Decrement task count
+static PyObject* atomic_task_dec(PyObject *self) {
+    int new_val = atomic_fetch_sub(&_task_count, 1) - 1;
+    return PyLong_FromLong(new_val);
+}
+
+// Get task count
+static PyObject* atomic_task_count(PyObject *self) {
+    return PyLong_FromLong(atomic_load(&_task_count));
+}
+
+// Check if all tasks complete
+static PyObject* atomic_all_tasks_complete(PyObject *self) {
+    int count = atomic_load(&_task_count);
+    return PyBool_FromLong(count == 0);
+}
+
+// Yield execution to scheduler
+static PyObject* yield_execution_py(PyObject *self) {
+    FiberObject *current = get_current_fiber();
+    if (current && current->state == FIBER_STATE_RUNNING) {
+        // Move to end of ready queue
+        pthread_mutex_lock(&_current_loop->lock);
+        current->state = FIBER_STATE_SUSPENDED;
+        loop_add_pending(_current_loop, current);
+        pthread_mutex_unlock(&_current_loop->lock);
+        
+        // Wait to be resumed
+        pthread_mutex_lock(&_current_loop->lock);
+        while (current->state == FIBER_STATE_SUSPENDED) {
+            pthread_cond_wait(&_current_loop->cond, &_current_loop->lock);
+        }
+        pthread_mutex_unlock(&_current_loop->lock);
+    }
+    Py_RETURN_NONE;
+}
+
+// Thread pool initialization
+static ThreadPoolObject *_global_pool = NULL;
+
+static PyObject* init_scheduler_py(PyObject *self, PyObject *args) {
+    int num_workers = 0;  // 0 = auto (CPU count)
+    
+    if (!PyArg_ParseTuple(args, "|i", &num_workers)) {
+        return NULL;
+    }
+    
+    if (num_workers <= 0) {
+        num_workers = sysconf(_SC_NPROCESSORS_ONLN);
+    }
+    
+    if (_global_pool) {
+        Py_RETURN_NONE;  // Already initialized
+    }
+    
+    _global_pool = pool_create(num_workers);
+    if (!_global_pool) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to create thread pool");
+        return NULL;
+    }
+    
+    return PyLong_FromLong(num_workers);
+}
+
+static PyObject* shutdown_scheduler_py(PyObject *self, PyObject *args) {
+    int wait = 1;
+    
+    if (!PyArg_ParseTuple(args, "|p", &wait)) {
+        return NULL;
+    }
+    
+    if (_global_pool) {
+        pool_shutdown(_global_pool, wait);
+        _global_pool = NULL;
+    }
+    
+    Py_RETURN_NONE;
+}
+
+static PyObject* num_workers_py(PyObject *self) {
+    if (!_global_pool) {
+        return PyLong_FromLong(0);
+    }
+    return PyLong_FromLong(_global_pool->num_workers);
+}
+```
+
+---
+
 ## Notes
 
 1. **No asyncio dependency** - All scheduling done in C
@@ -1694,3 +2764,11 @@ gs.run(main())
 5. **GIL management** - Acquire/release GIL appropriately in C code
 6. **Unified scheduler** - Both sync and async share same fiber pool
 7. **Backward compatible** - Existing Task/Sync code continues to work
+8. **Memory safety** - All allocated resources freed in cleanup paths
+9. **Cancellation** - Cooperative cancellation via tokens
+10. **Graceful shutdown** - Three-phase shutdown protocol
+11. **Exception propagation** - Exceptions stored and re-raised in caller context
+12. **I/O integration** - epoll/kqueue for async I/O operations
+13. **Sync primitives** - Lock, Event, Semaphore, Condition for coordination
+14. **Fiber introspection** - Debug info for all fibers in system
+15. **Atomic operations** - Lock-free counters for task tracking
