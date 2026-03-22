@@ -138,14 +138,17 @@ class Chan(Generic[T]):
 def chan(capacity: int = 0) -> Chan:
     """
     Create a new channel.
-    
+
     Args:
         capacity: Buffer capacity (0 = unbuffered/synchronous)
-    
+
     Returns:
         New channel
     """
     return Chan(capacity)
+
+
+create_chan = chan
 
 
 async def send(ch: Chan[T], value: T) -> None:
@@ -182,4 +185,4 @@ def close(ch: Chan) -> None:
     ch.close()
 
 
-__all__ = ['Chan', 'chan', 'send', 'recv', 'close']
+__all__ = ['Chan', 'chan', 'create_chan', 'send', 'recv', 'close']

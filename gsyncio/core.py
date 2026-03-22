@@ -196,8 +196,16 @@ except ImportError:
         async def _wait_for_data(self):
             """Wait for data in channel (async)"""
             import asyncio
+            # Check if closed before waiting
+            if self._closed:
+                return
             event = asyncio.Event()
             self._waiters_recv.append(event)
+            # Check again after adding to waiters (race condition fix)
+            if self._closed:
+                if event in self._waiters_recv:
+                    self._waiters_recv.remove(event)
+                return
             try:
                 await event.wait()
             finally:

@@ -115,6 +115,7 @@ from .native_io import (
 from .channel import (
     Chan,
     chan,
+    create_chan,
     send,
     recv,
     close,
@@ -218,6 +219,7 @@ __all__ = [
     # Channel operations
     'Chan',
     'chan',
+    'create_chan',
     'send',
     'recv',
     'close',
