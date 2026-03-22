@@ -51,15 +51,30 @@ from .core import (
     Future,
     EventLoop,
     Fiber,
+    Task,
+    create_task,
+    run,
     get_current_loop,
     set_current_loop,
     fiber_park,
+    is_future,
+    sleep,
 )
 
 # Import channel operations
 from .channel import (
     Chan,
     chan,
+)
+
+# Import select operations
+from .select import (
+    select,
+    recv,
+    send,
+    default,
+    SelectCase,
+    SelectResult,
 )
 
 # Re-export with consistent names
@@ -77,82 +92,12 @@ __all__ = [
     'Future',
     'EventLoop',
     'Fiber',
+    'Task',
+    'create_task',
     'get_current_loop',
     'set_current_loop',
     'fiber_park',
-    
-    # Channel operations
-    'Chan',
-    'chan',
-    
-    # Future utilities
     'is_future',
-]
-
-
-# Public API
-__all__ = [
-    # Version
-    '__version__',
-    '__author__',
-    
-    # Core
-    'Future',
-    'Channel',
-    'WaitGroup',
-    'init_scheduler',
-    'shutdown_scheduler',
-    'get_scheduler_stats',
-    'spawn',
-    'spawn_direct',
-    'spawn_batch',
-    'spawn_batch_fast',
-    'spawn_batch_ultra_fast',
-    'sleep_ns',
-    'sleep_us',
-    'sleep_ms',
-    'current_fiber_id',
-    'yield_execution',
-    'num_workers',
-    '_HAS_CYTHON',
-    
-    # Worker management
-    'check_worker_scaling',
-    'set_auto_scaling',
-    'set_energy_efficient_mode',
-    'get_worker_utilization',
-    'get_recommended_workers',
-    
-    # Task/Sync model
-    'task',
-    'task_with_wrapper',
-    'task_direct',
-    'sync',
-    'sync_timeout',
-    'task_count',
-    'run',
-    'task_batch',
-    'task_fast',
-    'task_batch_fast',
-    
-    # Async/Await model
-    'create_task',
-    'sleep',
-    'gather',
-    'wait_for',
-    'ensure_future',
-    'async_range',
-    'AsyncIterator',
-    'AsyncRange',
-    'AsyncContextManager',
-    'create_tcp_socket',
-    'create_udp_socket',
-    'has_native_io',
-
-    # Native I/O
-    'NativeSocket',
-    'NativeEventLoop',
-    '_HAS_NATIVE_IO',
     
     # Channel operations
     'Chan',
@@ -161,21 +106,4 @@ __all__ = [
     'send',
     'recv',
     'close',
-    
-    # WaitGroup operations
-    'create_wg',
-    'add',
-    'done',
-    'wait',
-    
-    # Select operations
-    'SelectCase',
-    'SelectResult',
-    'select_recv',
-    'select_send',
-    'default',
-    'select',
-    
-    # Future utilities
-    'is_future',
 ]

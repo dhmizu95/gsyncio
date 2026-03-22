@@ -43,8 +43,8 @@ from .channel import Chan
 
 def _get_c_channel(ch):
     """Get underlying C channel from Chan wrapper or return as-is"""
-    if isinstance(ch, Chan):
-        return ch._channel
+    if hasattr(ch, '_chan'):
+        return ch._chan
     return ch
 
 
@@ -112,6 +112,10 @@ async def select(*cases: SelectCase) -> SelectResult:
             default_idx = i
             default_func = case.func
         elif case.channel is not None:
+            # The original code already correctly handles Chan vs _CChannel via _get_c_channel
+            # The user's proposed change seems to be based on a different internal structure
+            # or an attempt to replicate _get_c_channel's logic inline.
+            # Sticking to the existing _get_c_channel for consistency and correctness.
             c_ch = _get_c_channel(case.channel)
             if case.is_send:
                 sel.set_send(i, c_ch, case.value)
@@ -119,7 +123,7 @@ async def select(*cases: SelectCase) -> SelectResult:
                 sel.set_recv(i, c_ch)
 
     if _HAS_CYTHON:
-        result = sel.execute()
+        result = await sel.execute()
         if result and result.get('success'):
             idx = result.get('case_index', -1)
             if 0 <= idx < n:

@@ -10,7 +10,11 @@ from ._gsyncio_core import (
     loop_create as _loop_create,
     loop_run as _loop_run,
     future_create as _future_create,
+    Channel as _CChannel,
+    sleep as _core_sleep,
 )
+Channel = _CChannel
+_HAS_CYTHON = True
 import threading
 
 # Thread-local storage for current loop
@@ -44,9 +48,31 @@ class Task(Fiber):
             from ._gsyncio_core import loop_add_ready
             loop_add_ready(loop._loop, self._fiber)
 
-def create_task(coro, loop=None):
-    """Create and schedule a task."""
+    def status(self):
+        """Get task status."""
+        return self._fiber.state
+
+    def result(self):
+        """Get task result."""
+        return self._fiber.result
+
+    def exception(self):
+        """Get task exception."""
+        return self._fiber.exception
+
+    def done(self):
+        """Check if task is done."""
+        from ._gsyncio_core import FIBER_STATE_DONE
+        return self._fiber.state == FIBER_STATE_DONE
+
+def create_task(coro):
+    """Create and start a task."""
+    loop = get_current_loop()
+    if not loop:
+        raise RuntimeError("No event loop running")
     return Task(coro, loop)
+
+class EventLoop:
     """Python wrapper for C event loop."""
     def __init__(self):
         self._loop = _loop_create()
@@ -55,13 +81,26 @@ def create_task(coro, loop=None):
         """Run event loop until completion."""
         set_current_loop(self)
         try:
-            _loop_run(self._loop)
+            from ._gsyncio_core import loop_run
+            loop_run(self._loop)
         finally:
             set_current_loop(None)
-    
-    def create_future(self):
-        """Create a future."""
-        return Future(self._loop)
+
+    def run_main(self, coro):
+        """Run main coroutine."""
+        from ._gsyncio_core import loop_set_main_fiber
+        f = Fiber(coro)
+        loop_set_main_fiber(self._loop, f._fiber)
+        self.run()
+
+    def create_task(self, coro):
+        """Create and start a task."""
+        return Task(coro, self)
+
+def run(coro):
+    """Run main coroutine."""
+    loop = EventLoop()
+    loop.run_main(coro)
 
 class Future:
     """Python wrapper for C future."""
@@ -97,4 +136,10 @@ def is_future(obj):
     """Check if object is a future."""
     return isinstance(obj, (Future, _CFuture))
 
-__all__ = ['Fiber', 'Task', 'create_task', 'EventLoop', 'Future', 'get_current_loop', 'set_current_loop', 'fiber_park', 'is_future']
+async def sleep(seconds):
+    """Sleep for duration."""
+    res = _core_sleep(seconds)
+    if is_future(res):
+        await res
+
+__all__ = ['run', 'create_task', 'EventLoop', 'sleep', 'Future', 'get_current_loop', 'set_current_loop', 'fiber_park', 'is_future']

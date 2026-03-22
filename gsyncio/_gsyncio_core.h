@@ -30,6 +30,7 @@ typedef struct Fiber {
     FiberState state;            /* Current state */
     int id;                      /* Unique fiber ID */
     int pending;                 /* 1 if in pending queue */
+    int ready;                   /* 1 if in ready queue */
     
     /* For async fibers */
     PyObject *coro;              /* Python coroutine (ASYNC only) */
@@ -38,7 +39,11 @@ typedef struct Fiber {
     /* For sync fibers */
     PyCFunction func;            /* C function (SYNC only) */
     PyObject *args;              /* Function args (SYNC only) */
-    PyObject *result;            /* Return value (SYNC only) */
+    
+    /* Execution results */
+    PyObject *result;            /* Return value */
+    PyObject *exception;         /* Exception if failed */
+    PyObject *select_state;      /* SelectStateObject if waiting */
     
     /* Thread state for GIL management */
     PyThreadState *tstate;
@@ -47,6 +52,41 @@ typedef struct Fiber {
     struct Fiber *next;
     struct Fiber *prev;
 } FiberObject;
+
+/* Select wait node for channel queues */
+typedef struct SelectWaitNode {
+    struct Fiber *fiber;
+    struct SelectState *select_state;
+    int case_index;
+    struct SelectWaitNode *next;
+    struct SelectWaitNode *prev;
+} SelectWaitNode;
+
+/* Select case types */
+typedef enum {
+    SELECT_RECV,
+    SELECT_SEND,
+    SELECT_DEFAULT
+} SelectCaseType;
+
+/* Select case */
+typedef struct SelectCase {
+    SelectCaseType type;
+    PyObject *channel;           /* ChannelObject */
+    PyObject *value;             /* If send, value to send */
+    SelectWaitNode *node;        /* Node registered in channel queue */
+} SelectCase;
+
+/* Select object */
+typedef struct SelectState {
+    PyObject_HEAD
+    SelectCase *cases;
+    SelectWaitNode *nodes;       /* Waiting nodes, one per case */
+    int case_count;
+    int done_index;              /* Index of ready case */
+    PyObject *result_value;
+    struct Fiber *fiber;         /* Waiting fiber */
+} SelectStateObject;
 
 /* Future object (C implementation) */
 typedef struct Future {
