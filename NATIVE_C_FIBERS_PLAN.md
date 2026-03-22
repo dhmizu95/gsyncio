@@ -1591,7 +1591,7 @@ setup(
   - [ ] Implement get_current_loop, set_current_loop
   - [ ] Test basic fiber creation and resume
 
-- [ ] **Phase 3: Channel**
+- [x] **Phase 3: Channel**
   - [ ] Implement Chan class with sync send/recv
   - [ ] Implement async send_async/recv_async
   - [ ] Add sync and async iterators

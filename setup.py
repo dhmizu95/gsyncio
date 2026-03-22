@@ -94,8 +94,8 @@ def get_extensions():
     extensions = [
         Extension(
             'gsyncio._gsyncio_core',
-            sources=['gsyncio/_gsyncio_core.pyx'] + C_SOURCES,
-            include_dirs=[str(CSRC_DIR)],
+            sources=['gsyncio/_gsyncio_core.c'] + C_SOURCES,
+            include_dirs=[str(CSRC_DIR), 'gsyncio'],
             extra_compile_args=CFLAGS,
             extra_link_args=['-pthread'],
         ),

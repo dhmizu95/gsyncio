@@ -1,0 +1,151 @@
+running build_ext
+building 'gsyncio._gsyncio_core' extension
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/c_tasks.c -o build/temp.linux-x86_64-cpython-312/csrc/c_tasks.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/channel.c -o build/temp.linux-x86_64-cpython-312/csrc/channel.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/evloop.c -o build/temp.linux-x86_64-cpython-312/csrc/evloop.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+csrc/evloop.c: In function ‘evloop_run’:
+csrc/evloop.c:297:22: warning: unused variable ‘user_data’ [-Wunused-variable]
+  297 |             uint64_t user_data = events[i].data.u64;
+      |                      ^~~~~~~~~
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/fiber.c -o build/temp.linux-x86_64-cpython-312/csrc/fiber.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/fiber_pool.c -o build/temp.linux-x86_64-cpython-312/csrc/fiber_pool.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/future.c -o build/temp.linux-x86_64-cpython-312/csrc/future.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/io_uring.c -o build/temp.linux-x86_64-cpython-312/csrc/io_uring.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/native_io.c -o build/temp.linux-x86_64-cpython-312/csrc/native_io.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/net.c -o build/temp.linux-x86_64-cpython-312/csrc/net.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+csrc/net.c: In function ‘wait_fd’:
+csrc/net.c:476:25: warning: variable ‘ts’ set but not used [-Wunused-but-set-variable]
+  476 |         struct timespec ts;
+      |                         ^~
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/scheduler.c -o build/temp.linux-x86_64-cpython-312/csrc/scheduler.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+csrc/scheduler.c: In function ‘timer_pool_init’:
+csrc/scheduler.c:142:36: warning: assignment to ‘timer_node_t *’ {aka ‘struct timer_node *’} from incompatible pointer type ‘_Atomic timer_node_t *’ {aka ‘_Atomic struct timer_node *’} [-Wincompatible-pointer-types]
+  142 |         g_timer_pool.nodes[i].next = atomic_load(&g_timer_pool.free_list);
+      |                                    ^
+csrc/scheduler.c:143:9: warning: initialization of ‘_Atomic timer_node_t *’ {aka ‘_Atomic struct timer_node *’} from incompatible pointer type ‘timer_node_t *’ {aka ‘struct timer_node *’} [-Wincompatible-pointer-types]
+  143 |         atomic_store(&g_timer_pool.free_list, &g_timer_pool.nodes[i]);
+      |         ^~~~~~~~~~~~
+csrc/scheduler.c: In function ‘timer_pool_alloc’:
+csrc/scheduler.c:148:26: warning: initialization of ‘timer_node_t *’ {aka ‘struct timer_node *’} from incompatible pointer type ‘_Atomic timer_node_t *’ {aka ‘_Atomic struct timer_node *’} [-Wincompatible-pointer-types]
+  148 |     timer_node_t* node = atomic_load(&g_timer_pool.free_list);
+      |                          ^~~~~~~~~~~
+csrc/scheduler.c:151:13: warning: initialization of ‘_Atomic timer_node_t *’ {aka ‘_Atomic struct timer_node *’} from incompatible pointer type ‘timer_node_t *’ {aka ‘struct timer_node *’} [-Wincompatible-pointer-types]
+  151 |         if (atomic_compare_exchange_weak(&g_timer_pool.free_list, &node, next)) {
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+csrc/scheduler.c:154:14: warning: assignment to ‘timer_node_t *’ {aka ‘struct timer_node *’} from incompatible pointer type ‘_Atomic timer_node_t *’ {aka ‘_Atomic struct timer_node *’} [-Wincompatible-pointer-types]
+  154 |         node = atomic_load(&g_timer_pool.free_list);
+      |              ^
+csrc/scheduler.c: In function ‘timer_pool_free’:
+csrc/scheduler.c:167:22: warning: assignment to ‘timer_node_t *’ {aka ‘struct timer_node *’} from incompatible pointer type ‘_Atomic timer_node_t *’ {aka ‘_Atomic struct timer_node *’} [-Wincompatible-pointer-types]
+  167 |             old_head = atomic_load(&g_timer_pool.free_list);
+      |                      ^
+csrc/scheduler.c:169:19: warning: initialization of ‘_Atomic timer_node_t *’ {aka ‘_Atomic struct timer_node *’} from incompatible pointer type ‘timer_node_t *’ {aka ‘struct timer_node *’} [-Wincompatible-pointer-types]
+  169 |         } while (!atomic_compare_exchange_weak(&g_timer_pool.free_list, &old_head, node));
+      |                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+csrc/scheduler.c: In function ‘worker_thread’:
+csrc/scheduler.c:353:14: warning: variable ‘f’ might be clobbered by ‘longjmp’ or ‘vfork’ [-Wclobbered]
+  353 |     fiber_t* f = dq->data[t & (dq->capacity - 1)];
+      |              ^
+csrc/scheduler.c:553:22: warning: variable ‘old_head’ might be clobbered by ‘longjmp’ or ‘vfork’ [-Wclobbered]
+  553 |             fiber_t* old_head = atomic_load(&sched->ready_queue);
+      |                      ^~~~~~~~
+csrc/scheduler.c:574:26: warning: variable ‘old_head’ might be clobbered by ‘longjmp’ or ‘vfork’ [-Wclobbered]
+  574 |                 fiber_t* old_head = atomic_load(&sched->ready_queue);
+      |                          ^~~~~~~~
+csrc/scheduler.c:353:14: warning: variable ‘f’ might be clobbered by ‘longjmp’ or ‘vfork’ [-Wclobbered]
+  353 |     fiber_t* f = dq->data[t & (dq->capacity - 1)];
+      |              ^
+csrc/scheduler.c: In function ‘scheduler_run’:
+csrc/scheduler.c:1466:18: warning: variable ‘f’ might be clobbered by ‘longjmp’ or ‘vfork’ [-Wclobbered]
+ 1466 |         fiber_t* f = pop_local(&sched->workers[0]);
+      |                  ^
+csrc/scheduler.c:353:14: warning: variable ‘f’ might be clobbered by ‘longjmp’ or ‘vfork’ [-Wclobbered]
+  353 |     fiber_t* f = dq->data[t & (dq->capacity - 1)];
+      |              ^
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/select.c -o build/temp.linux-x86_64-cpython-312/csrc/select.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/task.c -o build/temp.linux-x86_64-cpython-312/csrc/task.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/waitgroup.c -o build/temp.linux-x86_64-cpython-312/csrc/waitgroup.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/worker_manager.c -o build/temp.linux-x86_64-cpython-312/csrc/worker_manager.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -Igsyncio -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c gsyncio/_gsyncio_core.c -o build/temp.linux-x86_64-cpython-312/gsyncio/_gsyncio_core.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -shared -Wl,-O1 -Wl,-Bsymbolic-functions -Wl,-Bsymbolic-functions -Wl,-z,relro -g -fwrapv -O2 build/temp.linux-x86_64-cpython-312/csrc/c_tasks.o build/temp.linux-x86_64-cpython-312/csrc/channel.o build/temp.linux-x86_64-cpython-312/csrc/evloop.o build/temp.linux-x86_64-cpython-312/csrc/fiber.o build/temp.linux-x86_64-cpython-312/csrc/fiber_pool.o build/temp.linux-x86_64-cpython-312/csrc/future.o build/temp.linux-x86_64-cpython-312/csrc/io_uring.o build/temp.linux-x86_64-cpython-312/csrc/native_io.o build/temp.linux-x86_64-cpython-312/csrc/net.o build/temp.linux-x86_64-cpython-312/csrc/scheduler.o build/temp.linux-x86_64-cpython-312/csrc/select.o build/temp.linux-x86_64-cpython-312/csrc/task.o build/temp.linux-x86_64-cpython-312/csrc/waitgroup.o build/temp.linux-x86_64-cpython-312/csrc/worker_manager.o build/temp.linux-x86_64-cpython-312/gsyncio/_gsyncio_core.o -L/usr/lib/x86_64-linux-gnu -o build/lib.linux-x86_64-cpython-312/gsyncio/_gsyncio_core.cpython-312-x86_64-linux-gnu.so -pthread
+building 'gsyncio._gsyncio_native_io' extension
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/c_tasks.c -o build/temp.linux-x86_64-cpython-312/csrc/c_tasks.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/channel.c -o build/temp.linux-x86_64-cpython-312/csrc/channel.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/evloop.c -o build/temp.linux-x86_64-cpython-312/csrc/evloop.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+csrc/evloop.c: In function ‘evloop_run’:
+csrc/evloop.c:297:22: warning: unused variable ‘user_data’ [-Wunused-variable]
+  297 |             uint64_t user_data = events[i].data.u64;
+      |                      ^~~~~~~~~
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/fiber.c -o build/temp.linux-x86_64-cpython-312/csrc/fiber.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/fiber_pool.c -o build/temp.linux-x86_64-cpython-312/csrc/fiber_pool.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/future.c -o build/temp.linux-x86_64-cpython-312/csrc/future.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/io_uring.c -o build/temp.linux-x86_64-cpython-312/csrc/io_uring.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/native_io.c -o build/temp.linux-x86_64-cpython-312/csrc/native_io.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/net.c -o build/temp.linux-x86_64-cpython-312/csrc/net.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+csrc/net.c: In function ‘wait_fd’:
+csrc/net.c:476:25: warning: variable ‘ts’ set but not used [-Wunused-but-set-variable]
+  476 |         struct timespec ts;
+      |                         ^~
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/scheduler.c -o build/temp.linux-x86_64-cpython-312/csrc/scheduler.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+csrc/scheduler.c: In function ‘timer_pool_init’:
+csrc/scheduler.c:142:36: warning: assignment to ‘timer_node_t *’ {aka ‘struct timer_node *’} from incompatible pointer type ‘_Atomic timer_node_t *’ {aka ‘_Atomic struct timer_node *’} [-Wincompatible-pointer-types]
+  142 |         g_timer_pool.nodes[i].next = atomic_load(&g_timer_pool.free_list);
+      |                                    ^
+csrc/scheduler.c:143:9: warning: initialization of ‘_Atomic timer_node_t *’ {aka ‘_Atomic struct timer_node *’} from incompatible pointer type ‘timer_node_t *’ {aka ‘struct timer_node *’} [-Wincompatible-pointer-types]
+  143 |         atomic_store(&g_timer_pool.free_list, &g_timer_pool.nodes[i]);
+      |         ^~~~~~~~~~~~
+csrc/scheduler.c: In function ‘timer_pool_alloc’:
+csrc/scheduler.c:148:26: warning: initialization of ‘timer_node_t *’ {aka ‘struct timer_node *’} from incompatible pointer type ‘_Atomic timer_node_t *’ {aka ‘_Atomic struct timer_node *’} [-Wincompatible-pointer-types]
+  148 |     timer_node_t* node = atomic_load(&g_timer_pool.free_list);
+      |                          ^~~~~~~~~~~
+csrc/scheduler.c:151:13: warning: initialization of ‘_Atomic timer_node_t *’ {aka ‘_Atomic struct timer_node *’} from incompatible pointer type ‘timer_node_t *’ {aka ‘struct timer_node *’} [-Wincompatible-pointer-types]
+  151 |         if (atomic_compare_exchange_weak(&g_timer_pool.free_list, &node, next)) {
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+csrc/scheduler.c:154:14: warning: assignment to ‘timer_node_t *’ {aka ‘struct timer_node *’} from incompatible pointer type ‘_Atomic timer_node_t *’ {aka ‘_Atomic struct timer_node *’} [-Wincompatible-pointer-types]
+  154 |         node = atomic_load(&g_timer_pool.free_list);
+      |              ^
+csrc/scheduler.c: In function ‘timer_pool_free’:
+csrc/scheduler.c:167:22: warning: assignment to ‘timer_node_t *’ {aka ‘struct timer_node *’} from incompatible pointer type ‘_Atomic timer_node_t *’ {aka ‘_Atomic struct timer_node *’} [-Wincompatible-pointer-types]
+  167 |             old_head = atomic_load(&g_timer_pool.free_list);
+      |                      ^
+csrc/scheduler.c:169:19: warning: initialization of ‘_Atomic timer_node_t *’ {aka ‘_Atomic struct timer_node *’} from incompatible pointer type ‘timer_node_t *’ {aka ‘struct timer_node *’} [-Wincompatible-pointer-types]
+  169 |         } while (!atomic_compare_exchange_weak(&g_timer_pool.free_list, &old_head, node));
+      |                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+csrc/scheduler.c: In function ‘worker_thread’:
+csrc/scheduler.c:353:14: warning: variable ‘f’ might be clobbered by ‘longjmp’ or ‘vfork’ [-Wclobbered]
+  353 |     fiber_t* f = dq->data[t & (dq->capacity - 1)];
+      |              ^
+csrc/scheduler.c:553:22: warning: variable ‘old_head’ might be clobbered by ‘longjmp’ or ‘vfork’ [-Wclobbered]
+  553 |             fiber_t* old_head = atomic_load(&sched->ready_queue);
+      |                      ^~~~~~~~
+csrc/scheduler.c:574:26: warning: variable ‘old_head’ might be clobbered by ‘longjmp’ or ‘vfork’ [-Wclobbered]
+  574 |                 fiber_t* old_head = atomic_load(&sched->ready_queue);
+      |                          ^~~~~~~~
+csrc/scheduler.c:353:14: warning: variable ‘f’ might be clobbered by ‘longjmp’ or ‘vfork’ [-Wclobbered]
+  353 |     fiber_t* f = dq->data[t & (dq->capacity - 1)];
+      |              ^
+csrc/scheduler.c: In function ‘scheduler_run’:
+csrc/scheduler.c:1466:18: warning: variable ‘f’ might be clobbered by ‘longjmp’ or ‘vfork’ [-Wclobbered]
+ 1466 |         fiber_t* f = pop_local(&sched->workers[0]);
+      |                  ^
+csrc/scheduler.c:353:14: warning: variable ‘f’ might be clobbered by ‘longjmp’ or ‘vfork’ [-Wclobbered]
+  353 |     fiber_t* f = dq->data[t & (dq->capacity - 1)];
+      |              ^
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/select.c -o build/temp.linux-x86_64-cpython-312/csrc/select.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/task.c -o build/temp.linux-x86_64-cpython-312/csrc/task.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/waitgroup.c -o build/temp.linux-x86_64-cpython-312/csrc/waitgroup.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c csrc/worker_manager.c -o build/temp.linux-x86_64-cpython-312/csrc/worker_manager.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+x86_64-linux-gnu-gcc -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -Icsrc -I/home/user/gsyncio/.venv/include -I/usr/include/python3.12 -c gsyncio/_gsyncio_native_io.c -o build/temp.linux-x86_64-cpython-312/gsyncio/_gsyncio_native_io.o -O3 -std=c11 -pthread -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O3 -march=native -O3 -march=native
+gsyncio/_gsyncio_native_io.c: In function ‘__pyx_pf_7gsyncio_18_gsyncio_native_io_12NativeSocket_10accept’:
+gsyncio/_gsyncio_native_io.c:4031:63: warning: passing argument 2 of ‘native_socket_accept’ from incompatible pointer type [-Wincompatible-pointer-types]
+ 4031 |   __pyx_v_client_fd = native_socket_accept(__pyx_v_self->fd, (&__pyx_v_client_addr_buf));
+      |                                                              ~^~~~~~~~~~~~~~~~~~~~~~~~~
+      |                                                               |
+      |                                                               char (*)[128]
+In file included from gsyncio/_gsyncio_native_io.c:1169:
+csrc/native_io.h:139:54: note: expected ‘struct sockaddr_in *’ but argument is of type ‘char (*)[128]’
+  139 | int native_socket_accept(int fd, struct sockaddr_in* client_addr);
+      |                                  ~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~
+x86_64-linux-gnu-gcc -shared -Wl,-O1 -Wl,-Bsymbolic-functions -Wl,-Bsymbolic-functions -Wl,-z,relro -g -fwrapv -O2 build/temp.linux-x86_64-cpython-312/csrc/c_tasks.o build/temp.linux-x86_64-cpython-312/csrc/channel.o build/temp.linux-x86_64-cpython-312/csrc/evloop.o build/temp.linux-x86_64-cpython-312/csrc/fiber.o build/temp.linux-x86_64-cpython-312/csrc/fiber_pool.o build/temp.linux-x86_64-cpython-312/csrc/future.o build/temp.linux-x86_64-cpython-312/csrc/io_uring.o build/temp.linux-x86_64-cpython-312/csrc/native_io.o build/temp.linux-x86_64-cpython-312/csrc/net.o build/temp.linux-x86_64-cpython-312/csrc/scheduler.o build/temp.linux-x86_64-cpython-312/csrc/select.o build/temp.linux-x86_64-cpython-312/csrc/task.o build/temp.linux-x86_64-cpython-312/csrc/waitgroup.o build/temp.linux-x86_64-cpython-312/csrc/worker_manager.o build/temp.linux-x86_64-cpython-312/gsyncio/_gsyncio_native_io.o -L/usr/lib/x86_64-linux-gnu -o build/lib.linux-x86_64-cpython-312/gsyncio/_gsyncio_native_io.cpython-312-x86_64-linux-gnu.so -pthread
+copying build/lib.linux-x86_64-cpython-312/gsyncio/_gsyncio_core.cpython-312-x86_64-linux-gnu.so -> gsyncio
+copying build/lib.linux-x86_64-cpython-312/gsyncio/_gsyncio_native_io.cpython-312-x86_64-linux-gnu.so -> gsyncio

@@ -43,113 +43,51 @@ Installation:
 For more information, see https://github.com/gsyncio/gsyncio
 """
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 __author__ = 'gsyncio team'
 
 # Import core components
 from .core import (
     Future,
-    Channel,
-    WaitGroup,
-    init_scheduler,
-    shutdown_scheduler,
-    get_scheduler_stats,
-    spawn,
-    spawn_direct,
-    spawn_batch,
-    spawn_batch_fast,
-    spawn_batch_ultra_fast,
-    sleep_ns,
-    sleep_us,
-    sleep_ms,
-    current_fiber_id,
-    yield_execution,
-    num_workers,
-    _HAS_CYTHON,
-    # Worker management
-    check_worker_scaling,
-    set_auto_scaling,
-    set_energy_efficient_mode,
-    get_worker_utilization,
-    get_recommended_workers,
-)
-
-# Import task/sync model
-from .task import (
-    task,
-    task_with_wrapper,
-    task_direct,
-    sync,
-    sync_timeout,
-    task_count,
-    run,
-    task_batch,
-    task_fast,
-    task_batch_fast,
-)
-
-# Import async/await model
-from .async_ import (
-    create_task,
-    sleep,
-    gather,
-    wait_for,
-    ensure_future,
-    async_range,
-    AsyncIterator,
-    AsyncRange,
-    AsyncContextManager,
-    create_tcp_socket,
-    create_udp_socket,
-    has_native_io,
-)
-
-# Import native I/O
-from .native_io import (
-    NativeSocket,
-    NativeEventLoop,
-    _HAS_NATIVE_IO,
+    EventLoop,
+    Fiber,
+    get_current_loop,
+    set_current_loop,
+    fiber_park,
 )
 
 # Import channel operations
 from .channel import (
     Chan,
     chan,
-    create_chan,
-    send,
-    recv,
-    close,
-)
-
-# Import waitgroup operations
-from .waitgroup import (
-    WaitGroup,
-    create_wg,
-    add,
-    done,
-    wait,
-)
-
-# Import select operations
-from .select import (
-    SelectCase,
-    SelectResult,
-    recv as select_recv,
-    send as select_send,
-    default,
-    select,
-)
-
-# Import future
-from .future import (
-    Future as _Future,
-    ensure_future as _ensure_future,
-    is_future,
 )
 
 # Re-export with consistent names
-Future = _Future
-ensure_future = _ensure_future
+# Future utilities
+def is_future(obj):
+    return isinstance(obj, Future)
+
+# Public API
+__all__ = [
+    # Version
+    '__version__',
+    '__author__',
+    
+    # Core
+    'Future',
+    'EventLoop',
+    'Fiber',
+    'get_current_loop',
+    'set_current_loop',
+    'fiber_park',
+    
+    # Channel operations
+    'Chan',
+    'chan',
+    
+    # Future utilities
+    'is_future',
+]
 
 
 # Public API
