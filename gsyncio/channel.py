@@ -22,8 +22,7 @@ class Chan:
 
     def close(self):
         """Close the channel."""
-        # TODO: Implement close in C
-        pass
+        self._chan.close()
 
 def chan(size: int = 0) -> Chan:
     """Create a new channel."""
