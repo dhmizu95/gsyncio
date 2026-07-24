@@ -141,7 +141,7 @@ cdef class NativeSocket:
         
         memset(&client_addr_buf, 0, sizeof(client_addr_buf))
 
-        client_fd = native_socket_accept(self.fd, &client_addr_buf)
+        client_fd = native_socket_accept(self.fd, <void*>&client_addr_buf)
         if client_fd < 0:
             raise OSError("Accept failed")
 

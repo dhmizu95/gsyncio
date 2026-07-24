@@ -139,19 +139,19 @@ static void timer_pool_init(size_t capacity) {
 
     /* Pre-populate free list */
     for (size_t i = 0; i < capacity; i++) {
-        g_timer_pool.nodes[i].next = atomic_load(&g_timer_pool.free_list);
+        g_timer_pool.nodes[i].next = (timer_node_t*)atomic_load(&g_timer_pool.free_list);
         atomic_store(&g_timer_pool.free_list, &g_timer_pool.nodes[i]);
     }
 }
 
 static timer_node_t* timer_pool_alloc(void) {
-    timer_node_t* node = atomic_load(&g_timer_pool.free_list);
+    timer_node_t* node = (timer_node_t*)atomic_load(&g_timer_pool.free_list);
     while (node != NULL) {
         timer_node_t* next = node->next;  /* Regular load - node->next is not atomic */
         if (atomic_compare_exchange_weak(&g_timer_pool.free_list, &node, next)) {
             return node;
         }
-        node = atomic_load(&g_timer_pool.free_list);
+        node = (timer_node_t*)atomic_load(&g_timer_pool.free_list);
     }
     /* Pool exhausted - fall back to malloc */
     return (timer_node_t*)malloc(sizeof(timer_node_t));
@@ -164,7 +164,7 @@ static void timer_pool_free(timer_node_t* node) {
     if (node >= g_timer_pool.nodes && node < g_timer_pool.nodes + g_timer_pool.capacity) {
         timer_node_t* old_head;
         do {
-            old_head = atomic_load(&g_timer_pool.free_list);
+            old_head = (timer_node_t*)atomic_load(&g_timer_pool.free_list);
             node->next = old_head;  /* Regular store - node->next is not atomic */
         } while (!atomic_compare_exchange_weak(&g_timer_pool.free_list, &old_head, node));
     } else {

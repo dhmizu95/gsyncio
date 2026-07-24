@@ -294,8 +294,6 @@ int evloop_run(evloop_t *loop) {
         int nfds = epoll_wait(loop->epoll_fd, events, MAX_EVENTS, timeout_ms);
         
         for (int i = 0; i < nfds; i++) {
-            uint64_t user_data = events[i].data.u64;
-            
             evloop_timer_t *timer = (evloop_timer_t*)events[i].data.ptr;
             if (events[i].events & (EPOLLERR | EPOLLHUP)) {
                 continue;

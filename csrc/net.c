@@ -473,10 +473,6 @@ static int wait_fd(int fd, uint32_t events, int64_t timeout_ns) {
     uint64_t deadline = start + timeout_ns;
     
     while (1) {
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = 10000000;
-        
         fd_set read_fds;
         fd_set write_fds;
         FD_ZERO(&read_fds);
