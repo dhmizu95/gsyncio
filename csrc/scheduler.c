@@ -123,7 +123,7 @@ scheduler_t* g_scheduler = NULL;
 /* Pre-allocated timer pool for lock-free timer allocation */
 typedef struct timer_pool {
     timer_node_t* nodes;
-    _Atomic timer_node_t* free_list;
+    _Atomic(timer_node_t*) free_list;
     size_t capacity;
 } timer_pool_t;
 

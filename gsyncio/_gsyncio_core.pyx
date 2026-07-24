@@ -742,11 +742,18 @@ import threading
 cdef object _payload_pool_lock = threading.Lock()  # Lock for protecting payload pool access
 
 def init_scheduler(size_t num_workers=0, size_t max_fibers=100000000, int work_stealing=1, int stack_mode=1):
-    """Initialize the gsyncio scheduler
+    """Initialize the gsyncio scheduler (idempotent — safe to call multiple times).
     
     stack_mode: 0 = Native (Fastest), 1 = Hybrid (Save memory maps)
     """
     global _task_registry
+
+    # Already initialized — skip silently
+    if g_scheduler != NULL:
+        if _task_registry is None:
+            _task_registry = TaskRegistry()
+        return
+
     cdef scheduler_config_t config
     config.num_workers = num_workers
     config.max_fibers = max_fibers
@@ -776,9 +783,8 @@ def shutdown_scheduler(int wait=1):
     scheduler_shutdown(wait)
     fiber_cleanup()
     c_tasks_shutdown()
-    # Reset registry for next use
-    if _task_registry:
-        _task_registry.reset()
+    # Clear registry so init_scheduler / task() can reinitialize cleanly
+    _task_registry = None
 
 
 def get_scheduler_stats():

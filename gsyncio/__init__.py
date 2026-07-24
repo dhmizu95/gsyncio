@@ -1,109 +1,279 @@
 """
-gsyncio - High-Performance Fiber-Based Concurrency for Python
+gsyncio — High-Performance Fiber-Based Concurrency for Python
+=============================================================
 
-gsyncio provides Viper-like fiber-based concurrency primitives, designed
-to override and replace Python's asyncio with significantly better
-performance. It provides both fire-and-forget parallel work (task/sync)
-and I/O-bound asynchronous operations (async/await) with minimal overhead.
+Provides Go-style fiber/goroutine concurrency with:
+  • M:N fiber scheduler (C11 + pthreads + io_uring)
+  • task/sync model for fire-and-forget parallelism
+  • async/await model (asyncio-compatible)
+  • Channels (buffered & unbuffered)
+  • WaitGroups
+  • Select statements
+  • Native sockets (GSocket)
+  • Full pure-Python fallback when C extension is not built
 
-Features:
-- M:N fiber scheduler with work-stealing
-- Task/Sync model for fire-and-forget parallelism
-- Async/Await model for I/O-bound operations
-- Channels for message-passing between fibers
-- WaitGroups for synchronization
-- Select statements for channel multiplexing
-- Full asyncio compatibility (with monkey-patching)
-
-Usage:
+Usage
+-----
     import gsyncio as gs
-    
-    # Task/Sync model
+
+    # --- Task/Sync model ---
     def worker(n):
-        result = sum(range(n))
-        print(f"Result: {result}")
-    
-    gs.task(worker, 1000)
+        return sum(range(n))
+
+    gs.task(worker, 10_000)
     gs.sync()
-    
-    # Async/Await model
+
+    # --- Async/Await model ---
     async def fetch(url):
-        await gs.sleep(100)
-        return f"Data from {url}"
-    
+        await gs.sleep(100)          # 100 ms
+        return f"data from {url}"
+
     async def main():
-        results = await gs.gather(*[fetch(f"url/{i}") for i in range(100)])
-        print(f"Fetched {len(results)} items")
-    
+        tasks = [gs.create_task(fetch(f"url/{i}")) for i in range(10)]
+        results = await gs.gather(*tasks)
+
     gs.run(main())
-
-Installation:
-    pip install gsyncio
-
-For more information, see https://github.com/gsyncio/gsyncio
 """
 
-__version__ = '0.2.0'
-__author__ = 'gsyncio team'
+__version__ = "0.2.0"
+__author__  = "gsyncio team"
 
-# Import core components
-from .core import (
-    Future,
-    EventLoop,
-    Fiber,
-    Task,
+# ── 1. C extension (Cython) ──────────────────────────────────────────────────
+try:
+    from ._gsyncio_core import (
+        # Classes
+        Future,
+        Channel,
+        WaitGroup,
+        TaskRegistry,
+        TaskBatch,
+        SelectState,
+        GSocket,
+        # Scheduler
+        init_scheduler,
+        shutdown_scheduler,
+        get_scheduler_stats,
+        workers_running,
+        get_queued_fiber_count,
+        print_scheduler_debug,
+        # Fiber primitives
+        spawn,
+        spawn_direct,
+        spawn_batch,
+        spawn_batch_fast,
+        spawn_batch_ultra_fast,
+        sleep_ns,
+        sleep_us,
+        sleep_ms,
+        current_fiber_id,
+        yield_execution,
+        num_workers,
+        # Task / sync model
+        task,
+        task_batch,
+        sync,
+        sync_timeout,
+        task_count,
+        task_completed_count,
+        run,
+        # Atomic helpers
+        atomic_task_count,
+        atomic_inc_task_count,
+        atomic_dec_task_count,
+        atomic_all_tasks_complete,
+        # Worker management
+        check_worker_scaling,
+        set_auto_scaling,
+        set_energy_efficient_mode,
+        get_worker_utilization,
+        get_recommended_workers,
+        # Async gather / wait
+        gather_native,
+        wait_for_native,
+        # Net
+        net_init_,
+        net_shutdown_,
+        # internal registry ref
+        _task_registry,
+    )
+    _HAS_CYTHON = True
+    _HAS_NATIVE_IO = True
+
+except ImportError:
+    _HAS_CYTHON = False
+    _HAS_NATIVE_IO = False
+    from ._fallback import (          # all symbols pulled from fallback module
+        Future, Channel, WaitGroup,
+        init_scheduler, shutdown_scheduler, get_scheduler_stats,
+        spawn, spawn_direct, spawn_batch, spawn_batch_fast, spawn_batch_ultra_fast,
+        sleep_ns, sleep_us, sleep_ms,
+        current_fiber_id, yield_execution, num_workers,
+        task, sync, sync_timeout, task_count, task_completed_count, run,
+        atomic_task_count, atomic_inc_task_count,
+        atomic_dec_task_count, atomic_all_tasks_complete,
+        check_worker_scaling, set_auto_scaling,
+        set_energy_efficient_mode, get_worker_utilization, get_recommended_workers,
+        workers_running, get_queued_fiber_count, print_scheduler_debug,
+    )
+    # Stub classes/functions not available in fallback
+    class TaskRegistry:
+        pass
+    class TaskBatch:
+        pass
+    class SelectState:
+        pass
+    class GSocket:
+        pass
+    def gather_native(*args, **kw):
+        raise RuntimeError("gather_native requires C extension")
+    def wait_for_native(*args, **kw):
+        raise RuntimeError("wait_for_native requires C extension")
+    def net_init_():
+        pass
+    def net_shutdown_():
+        pass
+    _task_registry = None
+
+# ── 2. async/await helpers ────────────────────────────────────────────────────
+from ._async import (
     create_task,
-    run,
-    get_current_loop,
-    set_current_loop,
-    fiber_park,
-    is_future,
     sleep,
+    gather,
+    wait_for,
+    ensure_future,
+    async_range,
+    AsyncRange,
+    AsyncIterator,
+    AsyncContextManager,
+    _run_coroutine,
 )
 
-# Import channel operations
-from .channel import (
+# ── 3. Override run() with a smarter Python wrapper ─────────────────────────
+# The C extension's run() is a simple fire-and-forget; the Python wrapper
+# handles coroutines, async mains, and return values correctly.
+
+import asyncio as _asyncio
+import inspect as _inspect
+
+def run(func_or_coro, *args, **kwargs):
+    """
+    Run a function or coroutine in the gsyncio runtime.
+
+    Handles:
+    - Plain synchronous callables (returns their result)
+    - Async callables: run with asyncio.run()
+    - Already-created coroutines: awaited directly
+    """
+    from .core import init_scheduler, sync, shutdown_scheduler
+    init_scheduler()
+    try:
+        if _inspect.iscoroutine(func_or_coro):
+            return _asyncio.run(func_or_coro)
+        elif _inspect.iscoroutinefunction(func_or_coro):
+            return _asyncio.run(func_or_coro(*args, **kwargs))
+        else:
+            result = func_or_coro(*args, **kwargs)
+            if _inspect.iscoroutine(result):
+                return _asyncio.run(result)
+            sync()
+            return result
+    finally:
+        pass   # keep scheduler alive for subsequent task() calls
+
+
+from ._channel import (
     Chan,
     chan,
+    create_chan,
+    send,
+    recv,
+    close,
 )
 
-# Import select operations
-from .select import (
-    select,
-    recv,
-    send,
-    default,
+# ── 4. WaitGroup helpers ──────────────────────────────────────────────────────
+from ._waitgroup import (
+    WaitGroup as WaitGroup,   # richer Python class (wraps C WaitGroup)
+    create_wg,
+    add,
+    done,
+    wait,
+)
+
+# ── 5. Select helpers ─────────────────────────────────────────────────────────
+from ._select import (
     SelectCase,
     SelectResult,
+    select_recv,
+    select_send,
+    default,
+    select as select,
 )
 
-# Re-export with consistent names
-# Future utilities
-def is_future(obj):
-    return isinstance(obj, Future)
+# ── 6. Future helpers ─────────────────────────────────────────────────────────
+from ._future import (
+    Future as Future,
+    ensure_future as ensure_future,
+    is_future,
+)
 
-# Public API
+# ── 7. Native I/O ─────────────────────────────────────────────────────────────
+from .native_io import (
+    NativeSocket,
+    NativeEventLoop,
+    _HAS_NATIVE_IO as _HAS_NATIVE_IO,
+)
+
+# ── 8. Public API ─────────────────────────────────────────────────────────────
 __all__ = [
-    # Version
-    '__version__',
-    '__author__',
-    
-    # Core
-    'Future',
-    'EventLoop',
-    'Fiber',
-    'Task',
-    'create_task',
-    'get_current_loop',
-    'set_current_loop',
-    'fiber_park',
-    'is_future',
-    
-    # Channel operations
-    'Chan',
-    'chan',
-    'create_chan',
-    'send',
-    'recv',
-    'close',
+    "__version__", "__author__",
+
+    # Flags
+    "_HAS_CYTHON", "_HAS_NATIVE_IO",
+
+    # Core C classes
+    "Channel", "WaitGroup", "TaskRegistry", "TaskBatch", "SelectState", "GSocket",
+
+    # Scheduler
+    "init_scheduler", "shutdown_scheduler", "get_scheduler_stats",
+    "workers_running", "get_queued_fiber_count", "print_scheduler_debug",
+
+    # Fiber primitives
+    "spawn", "spawn_direct", "spawn_batch", "spawn_batch_fast", "spawn_batch_ultra_fast",
+    "sleep_ns", "sleep_us", "sleep_ms",
+    "current_fiber_id", "yield_execution", "num_workers",
+
+    # Task / sync model
+    "task", "task_batch", "sync", "sync_timeout",
+    "task_count", "task_completed_count", "run",
+
+    # Atomics
+    "atomic_task_count", "atomic_inc_task_count",
+    "atomic_dec_task_count", "atomic_all_tasks_complete",
+
+    # Worker management
+    "check_worker_scaling", "set_auto_scaling",
+    "set_energy_efficient_mode", "get_worker_utilization", "get_recommended_workers",
+
+    # Async/await
+    "create_task", "sleep", "gather", "wait_for",
+    "ensure_future", "async_range", "AsyncRange", "AsyncIterator", "AsyncContextManager",
+    "gather_native", "wait_for_native",
+
+    # Channel API
+    "Chan", "chan", "create_chan", "send", "recv", "close",
+
+    # WaitGroup API
+    "create_wg", "add", "done", "wait",
+
+    # Select API
+    "SelectCase", "SelectResult", "select_recv", "select_send", "default", "select",
+
+    # Future API
+    "Future", "is_future",
+
+    # Native I/O
+    "NativeSocket", "NativeEventLoop",
+
+    # Net
+    "net_init_", "net_shutdown_",
 ]

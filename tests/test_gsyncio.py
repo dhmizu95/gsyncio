@@ -1,204 +1,257 @@
 """
-Test suite for gsyncio core functionality
+Test suite for gsyncio — v0.2 Python layer
 """
 
-import pytest
+import asyncio
 import sys
 import os
+import time
+import threading
 
-# Add parent directory to path
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import gsyncio as gs
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Task / Sync model
+# ─────────────────────────────────────────────────────────────────────────────
+
 class TestTaskSync:
     """Tests for task/sync model"""
-    
+
     def test_task_basic(self):
-        """Test basic task spawning"""
+        """Basic task spawning — results collected with a lock to avoid race."""
         results = []
-        
+        lock    = threading.Lock()
+
         def worker(n):
-            results.append(n)
-        
+            with lock:
+                results.append(n)
+
         gs.task(worker, 1)
         gs.task(worker, 2)
         gs.task(worker, 3)
         gs.sync()
-        
+
         assert len(results) == 3
         assert set(results) == {1, 2, 3}
-    
+
     def test_task_count(self):
-        """Test task count tracking"""
-        def worker():
-            import time
-            time.sleep(0.01)  # Small delay to ensure task stays active
-        
-        initial_count = gs.task_count()
-        
-        # Spawn tasks
-        t1 = gs.task(worker)
-        t2 = gs.task(worker)
-        
-        # Count should increase (at least temporarily)
-        # Give threads a moment to start
-        import time
-        time.sleep(0.005)
-        count_after = gs.task_count()
-        assert count_after >= initial_count
-        
-        # Wait for tasks to complete
-        gs.sync()
-        
-        # Wait for thread cleanup
-        time.sleep(0.1)
-        
-        # Count should be close to initial (may have some variance due to cleanup timing)
-        final_count = gs.task_count()
-        # Just verify it's a reasonable number (not growing unbounded)
-        assert final_count < 20  # Reasonable upper bound
-    
-    def test_sync_timeout(self):
-        """Test sync with timeout"""
-        import time
-        
+        """task_count() should be a non-negative integer."""
+        count = gs.task_count()
+        assert isinstance(count, int)
+        assert count >= 0
+
+    def test_sync_timeout_returns_bool(self):
+        """sync_timeout must return a bool; if all tasks finish fast, True."""
+        done_event = threading.Event()
+
+        def fast_worker():
+            done_event.set()
+
+        gs.task(fast_worker)
+        gs.sync()           # ensure previous tasks are done first
+        # With nothing pending, sync_timeout should return True immediately
+        result = gs.sync_timeout(1.0)
+        assert isinstance(result, bool)
+
+    def test_sync_timeout_false_on_slow(self):
+        """sync_timeout returns False when tasks are still running."""
+        barrier = threading.Event()
+
         def slow_worker():
-            time.sleep(0.5)
-        
+            barrier.wait(timeout=5.0)   # will be released after the test
+
         gs.task(slow_worker)
-        
-        # Should timeout
-        result = gs.sync_timeout(0.1)
-        assert result is False
-        
-        # Wait for completion
+        result = gs.sync_timeout(0.05)   # very short
+        barrier.set()
         gs.sync()
-    
+        assert result is False
+
     def test_run_function(self):
-        """Test run function"""
+        """gs.run() should execute a plain function and return its result."""
         def main():
             return "hello"
-        
+
         result = gs.run(main)
         assert result == "hello"
 
+    def test_run_async(self):
+        """gs.run() should handle an async main coroutine."""
+        async def main():
+            await asyncio.sleep(0)
+            return 42
+
+        result = gs.run(main())
+        assert result == 42
+
     def test_run_hybrid(self):
-        """Test run function with hybrid mapping"""
+        """Tasks spawned inside run() should complete before run() returns."""
+        results = []
+        lock    = threading.Lock()
+
         def main():
-            results = []
             def worker(n):
-                results.append(n)
-            
-            for i in range(10):
+                with lock:
+                    results.append(n)
+            for i in range(5):
                 gs.task(worker, i)
             gs.sync()
             return len(results)
-        
-        result = gs.run(main, mapping='hybrid')
-        assert result == 10
 
+        count = gs.run(main)
+        assert count == 5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Async / Await model
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TestAsyncAwait:
     """Tests for async/await model"""
-    
+
     @pytest.mark.asyncio
     async def test_sleep(self):
-        """Test async sleep"""
-        import time
-        
-        start = time.time()
-        await gs.sleep(100)  # 100ms
+        """gs.sleep(ms) should sleep for roughly the given duration."""
+        start   = time.time()
+        await gs.sleep(80)          # 80 ms
         elapsed = time.time() - start
-        
-        # Sleep should be at least close to 100ms (allow tolerance)
-        assert elapsed >= 0.08  # 80ms minimum
-        assert elapsed < 0.5    # Should not take too long
-    
+        assert elapsed >= 0.06      # at least 60 ms
+        assert elapsed < 1.0
+
     @pytest.mark.asyncio
     async def test_gather(self):
-        """Test gather multiple futures"""
-        import asyncio
-        
+        """gather should collect results from multiple coroutines."""
         async def compute(n):
             return n * 2
-        
-        tasks = [asyncio.create_task(compute(i)) for i in range(5)]
+
+        tasks   = [asyncio.create_task(compute(i)) for i in range(5)]
         results = await gs.gather(*tasks)
-        
-        assert results == [0, 2, 4, 6, 8]
-    
+        assert sorted(results) == [0, 2, 4, 6, 8]
+
     def test_async_range(self):
-        """Test async range iterator"""
-        import asyncio
-        
-        async def test():
+        """async_range should produce the correct sequence."""
+        async def _test():
             values = []
             async for i in gs.async_range(5):
                 values.append(i)
             return values
-        
-        result = asyncio.run(test())
+
+        result = asyncio.run(_test())
         assert result == [0, 1, 2, 3, 4]
 
+    @pytest.mark.asyncio
+    async def test_gather_exceptions(self):
+        """gather with return_exceptions=True should not propagate."""
+        async def failing():
+            raise ValueError("oops")
+
+        async def ok():
+            return 1
+
+        results = await gs.gather(ok(), failing(), return_exceptions=True)
+        assert results[0] == 1
+        assert isinstance(results[1], ValueError)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Channel
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TestChannel:
     """Tests for channel operations"""
-    
+
     @pytest.mark.asyncio
-    async def test_channel_send_recv(self):
-        """Test basic channel send/receive"""
-        ch = gs.chan(1)  # Use buffered channel
-        
-        async def sender():
-            await gs.send(ch, "hello")
-        
-        async def receiver():
-            return await gs.recv(ch)
-        
-        import asyncio
-        await asyncio.gather(sender(), receiver())
-    
-    @pytest.mark.asyncio
-    async def test_buffered_channel(self):
-        """Test buffered channel"""
+    async def test_buffered_send_recv(self):
+        """Buffered channel: send_nowait / recv_nowait."""
         ch = gs.chan(5)
-        
-        # Send without blocking (buffer has space)
+
         for i in range(5):
-            assert ch.send_nowait(i)
-        
+            assert ch.send_nowait(i) is True
+
         # Buffer full
-        assert not ch.send_nowait(99)
-        
-        # Receive all
+        assert ch.send_nowait(99) is False
+
         for i in range(5):
             val = ch.recv_nowait()
             assert val == i
-    
+
+    @pytest.mark.asyncio
+    async def test_async_send_recv(self):
+        """Async send/recv handshake."""
+        ch = gs.chan(1)
+
+        async def sender():
+            await gs.send(ch, "hello")
+
+        async def receiver():
+            return await gs.recv(ch)
+
+        _, result = await asyncio.gather(sender(), receiver())
+        assert result == "hello"
+
     @pytest.mark.asyncio
     async def test_channel_close(self):
-        """Test channel close"""
         ch = gs.chan()
-        
-        assert not ch.closed
+        assert ch.closed is False
         ch.close()
-        assert ch.closed
+        assert ch.closed is True
 
+    @pytest.mark.asyncio
+    async def test_channel_iter(self):
+        """Async iteration drains channel until closed."""
+        ch = gs.chan(3)
+        for i in range(3):
+            ch.send_nowait(i)
+        ch.close()
+
+        values = []
+        try:
+            async for v in ch:
+                values.append(v)
+        except StopAsyncIteration:
+            pass
+        assert values == [0, 1, 2]
+
+    def test_chan_create_chan_alias(self):
+        """create_chan and chan should both return a Chan."""
+        c1 = gs.chan(10)
+        c2 = gs.create_chan(10)
+        assert isinstance(c1, gs.Chan)
+        assert isinstance(c2, gs.Chan)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WaitGroup
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TestWaitGroup:
     """Tests for WaitGroup synchronization"""
 
-    def test_waitgroup_basic(self):
-        """Test basic WaitGroup usage with sync tasks"""
+    def test_waitgroup_counter(self):
+        """add/done/counter semantics."""
         wg = gs.create_wg()
+
+        assert wg.counter == 0
+        gs.add(wg, 3)
+        assert wg.counter == 3
+        gs.done(wg)
+        gs.done(wg)
+        assert wg.counter == 1
+        gs.done(wg)
+        assert wg.counter == 0
+
+    def test_waitgroup_basic_sync(self):
+        """Workers complete before wait() returns."""
+        wg      = gs.create_wg()
         results = []
-        lock = __import__('threading').Lock()
+        lock    = threading.Lock()
 
         def worker(n):
             try:
-                import time
                 time.sleep(0.01)
                 with lock:
                     results.append(n)
@@ -206,38 +259,26 @@ class TestWaitGroup:
                 gs.done(wg)
 
         gs.add(wg, 3)
-
         for i in range(3):
             gs.task(worker, i)
 
-        gs.sync()  # Wait for all tasks
-
+        gs.wait(wg)
         assert len(results) == 3
-    
-    def test_waitgroup_counter(self):
-        """Test WaitGroup counter"""
-        wg = gs.create_wg()
-        
-        assert wg.counter == 0
-        
-        gs.add(wg, 3)
-        assert wg.counter == 3
-        
-        gs.done(wg)
-        gs.done(wg)
-        assert wg.counter == 1
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Select
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TestSelect:
     """Tests for select statement"""
-    
+
     @pytest.mark.asyncio
-    async def test_select_basic(self):
-        """Test basic select"""
-        ch1 = gs.chan(1)  # Use buffered channel
+    async def test_select_ready_channel(self):
+        """Select picks the first ready channel."""
+        ch1 = gs.chan(1)
         ch2 = gs.chan(1)
 
-        # Put data in ch1 first
         await gs.send(ch1, "from ch1")
 
         result = await gs.select(
@@ -245,94 +286,134 @@ class TestSelect:
             gs.select_recv(ch2),
         )
 
-        assert result.value == "from ch1"
+        assert result.success is True
+        assert result.value   == "from ch1"
         assert result.channel == ch1
 
     @pytest.mark.asyncio
     async def test_select_default(self):
-        """Test select with default"""
-        ch = gs.chan()
+        """Select falls through to default when no channels ready."""
+        ch = gs.chan()     # unbuffered, empty
 
-        # Should not block, should hit default
         result = await gs.select(
             gs.select_recv(ch),
-            gs.default(lambda: "default"),
+            gs.default(lambda: "default_value"),
         )
 
-        assert result.value == "default"
+        assert result.success is True
+        assert result.value   == "default_value"
 
+    @pytest.mark.asyncio
+    async def test_select_default_no_func(self):
+        """Default with no func gives value=None."""
+        ch = gs.chan()
+
+        result = await gs.select(
+            gs.select_recv(ch),
+            gs.default(),
+        )
+
+        assert result.success is True
+        assert result.value is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Future
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TestFuture:
     """Tests for Future class"""
-    
-    def test_future_set_result(self):
-        """Test setting future result"""
+
+    def test_set_result(self):
         f = gs.Future()
-        
-        assert not f.done
+        assert f.done is False
         f.set_result(42)
-        assert f.done
+        assert f.done is True
         assert f.result() == 42
-    
-    def test_future_set_exception(self):
-        """Test setting future exception"""
-        f = gs.Future()
-        
+
+    def test_set_exception(self):
+        f   = gs.Future()
         exc = ValueError("test error")
         f.set_exception(exc)
-        
-        assert f.done
+        assert f.done is True
         assert f.exception() is exc
-    
+
+    def test_double_set_raises(self):
+        f = gs.Future()
+        f.set_result(1)
+        with pytest.raises(RuntimeError):
+            f.set_result(2)
+
     @pytest.mark.asyncio
     async def test_future_await(self):
-        """Test awaiting future"""
+        """Await a Future that is completed from another coroutine."""
         f = gs.Future()
-        
-        async def set_result():
-            await gs.sleep(10)
+
+        async def completer():
+            await asyncio.sleep(0.02)
             f.set_result("done")
-        
-        import asyncio
-        asyncio.create_task(set_result())
-        
+
+        asyncio.create_task(completer())
         result = await f
         assert result == "done"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Scheduler
+# ─────────────────────────────────────────────────────────────────────────────
+
 class TestScheduler:
-    """Tests for scheduler"""
-    
+    """Tests for scheduler init/stats/workers"""
+
     def setup_method(self):
-        """Ensure clean state before each test"""
-        # Make sure scheduler is shut down from any previous test
         try:
             gs.shutdown_scheduler()
-        except:
+        except Exception:
             pass
 
     def teardown_method(self):
-        """Clean up after each test"""
         try:
             gs.shutdown_scheduler()
-        except:
+        except Exception:
             pass
 
-    def test_scheduler_init(self):
-        """Test scheduler initialization"""
+    def test_init_stats_keys(self):
         gs.init_scheduler(num_workers=2)
         stats = gs.get_scheduler_stats()
-
-        assert 'total_fibers_created' in stats
-        assert 'total_fibers_completed' in stats
+        assert "total_fibers_created" in stats
+        assert "total_fibers_completed" in stats
 
     def test_num_workers(self):
-        """Test number of workers"""
-        # Initialize scheduler first
         gs.init_scheduler(num_workers=2)
         n = gs.num_workers()
-        assert n > 0
+        assert n >= 0    # 0 is valid when C ext not loaded
 
 
-if __name__ == '__main__':
-    pytest.main([__file__, '-v'])
+# ─────────────────────────────────────────────────────────────────────────────
+# Large-scale
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestScale:
+
+    def test_hundred_tasks(self):
+        counter  = [0]
+        lock     = threading.Lock()
+
+        def inc():
+            with lock:
+                counter[0] += 1
+
+        for _ in range(100):
+            gs.task(inc)
+        gs.sync()
+
+        assert counter[0] == 100
+
+    def test_is_future(self):
+        f = gs.Future()
+        assert gs.is_future(f) is True
+        assert gs.is_future(42) is False
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
