@@ -1055,7 +1055,7 @@ def spawn_batch_ultra_fast(funcs_and_args, int store_fiber_ids=0):
     # This is where the magic happens - the entire spawn loop runs
     # without holding the GIL, allowing true parallel task creation
     cdef task_registry_t* reg_ptr
-    reg_ptr = <task_registry_t*>_task_registry._reg
+    reg_ptr = (<TaskRegistry>_task_registry)._reg
     with nogil:
         # Spawn all tasks - NO GIL held here!
         # This is pure C code running without Python overhead
