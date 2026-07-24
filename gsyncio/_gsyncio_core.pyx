@@ -1033,17 +1033,19 @@ def spawn_batch_ultra_fast(funcs_and_args, int store_fiber_ids=0):
     # Create fast batch context
     batch = task_batch_fast_create(count)
     if not batch:
-        # Clean up payloads on error
+        # No fiber will ever run for these payloads, so release the
+        # manual Py_INCREF above ourselves (the `payloads` list still
+        # holds its own reference and cleans that up on its own).
         for p in payloads:
             Py_DECREF(p)
         raise MemoryError("Failed to create batch")
-    
+
     # Set up batch with function pointers and args
     # Still holding GIL here for safety
     for i, p in enumerate(payloads):
         # _c_fiber_entry is the C function pointer
         if task_batch_fast_add(batch, _c_fiber_entry, <void*>p) != 0:
-            # Clean up on error
+            # Clean up on error - same reasoning as above
             task_batch_fast_destroy(batch, 0)
             for p2 in payloads:
                 Py_DECREF(p2)
@@ -1065,12 +1067,14 @@ def spawn_batch_ultra_fast(funcs_and_args, int store_fiber_ids=0):
     
     # Clean up batch structure (but not the Python payloads)
     task_batch_fast_destroy(batch, 0)
-    
-    # Clean up payload references (they're now owned by the fibers)
-    # The fibers will DECREF when they complete
-    for p in payloads:
-        Py_DECREF(p)
-    
+
+    # Do NOT decref payloads here: each spawned fiber's _c_fiber_entry
+    # already balances the manual Py_INCREF above with its own
+    # Py_DECREF. The `payloads` list still holds its own reference to
+    # each tuple and releases it automatically when this function
+    # returns - decrementing again here was a double-free (a fiber
+    # could dealloc the tuple mid-flight while another still ran).
+
     # Return results
     if store_fiber_ids:
         # Note: fiber IDs not stored in current implementation
