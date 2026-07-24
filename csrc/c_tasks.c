@@ -235,20 +235,22 @@ int c_task_sum_squares(void* arg) {
         sum += (long long)i * i;
     }
     
-    /* Store result back in arg */
-    *(long long*)arg = sum;
-    
+    /* Do NOT write `sum` back into arg: arg was allocated as sizeof(int)
+     * by c_task_spawn_int, and sum is a long long - writing it back
+     * would overflow that 4-byte buffer and corrupt the heap. Nothing
+     * reads this result back, so just return it instead. */
+
     clock_gettime(CLOCK_MONOTONIC, &end);
-    
-    uint64_t elapsed_ns = (end.tv_sec - start.tv_sec) * 1000000000ULL + 
+
+    uint64_t elapsed_ns = (end.tv_sec - start.tv_sec) * 1000000000ULL +
                           (end.tv_nsec - start.tv_nsec);
-    
+
     pthread_mutex_lock(&g_stats_mutex);
     g_c_task_stats.total_c_task_time_ns += elapsed_ns;
     g_c_task_stats.total_c_tasks_completed++;
     pthread_mutex_unlock(&g_stats_mutex);
-    
-    return 0;
+
+    return (int)sum;
 }
 
 int c_task_count_primes(void* arg) {

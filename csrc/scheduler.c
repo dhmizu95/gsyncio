@@ -344,19 +344,29 @@ static void push_top(deque_t* dq, fiber_t* f) {
 
 static fiber_t* pop_top(deque_t* dq) {
     size_t b = atomic_load_explicit(&dq->bottom, memory_order_acquire);
-    size_t t = atomic_load_explicit(&dq->top, memory_order_relaxed);
+    size_t t = atomic_load_explicit(&dq->top, memory_order_acquire);
 
     if (t >= b) {
         return NULL;  /* Empty */
     }
 
     fiber_t* f = dq->data[t & (dq->capacity - 1)];
-    atomic_store_explicit(&dq->top, t + 1, memory_order_relaxed);
+
+    /* CAS to claim this slot: a concurrent steal_bottom() (or another
+     * owner-side pop) may be racing for the same element. Without this,
+     * two threads can both walk away with the same fiber pointer - one
+     * runs it while the other frees/resets it underneath it. */
+    if (!atomic_compare_exchange_strong_explicit(&dq->top, &t, t + 1,
+                                                  memory_order_seq_cst,
+                                                  memory_order_relaxed)) {
+        return NULL;  /* Lost the race */
+    }
     return f;
 }
 
 static fiber_t* steal_bottom(deque_t* dq) {
     size_t t = atomic_load_explicit(&dq->top, memory_order_acquire);
+    atomic_thread_fence(memory_order_seq_cst);
     size_t b = atomic_load_explicit(&dq->bottom, memory_order_acquire);
 
     if (t >= b) {
@@ -364,7 +374,13 @@ static fiber_t* steal_bottom(deque_t* dq) {
     }
 
     fiber_t* f = dq->data[t & (dq->capacity - 1)];
-    atomic_store_explicit(&dq->top, t + 1, memory_order_release);
+
+    /* Same CAS as pop_top() - see comment there. */
+    if (!atomic_compare_exchange_strong_explicit(&dq->top, &t, t + 1,
+                                                  memory_order_seq_cst,
+                                                  memory_order_relaxed)) {
+        return NULL;  /* Lost the race */
+    }
     return f;
 }
 
