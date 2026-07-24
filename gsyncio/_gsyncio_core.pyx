@@ -148,6 +148,7 @@ cdef extern from "c_tasks.h":
     int c_task_execute(int task_id, void* arg)
     uint64_t c_task_spawn(int task_id, void* arg) nogil
     uint64_t c_task_spawn_int(int task_id, int value) nogil
+    size_t c_task_spawn_batch_int(int task_id, const int* values, size_t count) nogil
     int c_task_sum_squares(void* arg) nogil
     int c_task_count_primes(void* arg) nogil
     int c_task_array_fill(void* arg) nogil
@@ -1260,6 +1261,36 @@ def c_task_spawn_sum_squares(int n):
 def c_task_spawn_count_primes(int n):
     """Spawn count_primes C task - GIL-free!"""
     return c_task_spawn_int(c_task_lookup(b"count_primes"), n)
+
+def c_task_spawn_batch_sum_squares(values):
+    """Batch-spawn sum_squares C tasks - GIL released for the whole batch.
+
+    Combines spawn_batch_fast()'s low per-task spawn overhead (the task
+    is looked up once, not once per call) with c_task's GIL-free
+    execution, for the best of both spawn rate and sync() time.
+    """
+    cdef int task_id = c_task_lookup(b"sum_squares")
+    if task_id < 0:
+        raise RuntimeError("sum_squares task not registered")
+
+    cdef size_t count = len(values)
+    if count == 0:
+        return 0
+
+    cdef int* carr = <int*>malloc(count * sizeof(int))
+    if not carr:
+        raise MemoryError("Failed to allocate argument buffer")
+
+    cdef size_t i
+    for i in range(count):
+        carr[i] = values[i]
+
+    cdef size_t spawned
+    with nogil:
+        spawned = c_task_spawn_batch_int(task_id, carr, count)
+
+    free(carr)
+    return spawned
 
 def c_task_get_stats_py():
     """Get C task statistics"""

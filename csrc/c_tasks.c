@@ -139,7 +139,12 @@ typedef struct {
 
 static void c_task_wrapper(void* arg) {
     c_task_wrapper_t* wrapper = (c_task_wrapper_t*)arg;
-    wrapper->result = wrapper->func(wrapper->arg);
+    wrapper->func(wrapper->arg);
+    /* Nothing reads wrapper->result back (fire-and-forget), and nobody
+     * else owns wrapper/wrapper->arg after this point - free them here
+     * or every spawn leaks its arg box + wrapper struct forever. */
+    free(wrapper->arg);
+    free(wrapper);
 }
 
 int c_task_execute(int task_id, void* arg) {
@@ -215,6 +220,56 @@ uint64_t c_task_spawn_int_int(int task_id, int arg1, int arg2) {
     args[0] = arg1;
     args[1] = arg2;
     return c_task_spawn(task_id, args);
+}
+
+size_t c_task_spawn_batch_int(int task_id, const int* values, size_t count) {
+    if (task_id < 0 || task_id >= (int)g_c_task_registry.count || !values || count == 0) {
+        return 0;
+    }
+
+    /* Resolve the function pointer ONCE for the whole batch, instead of
+     * re-locking the registry mutex and re-comparing task_id on every
+     * single spawn like repeated c_task_spawn_int() calls would. */
+    pthread_mutex_lock(&g_c_task_registry.mutex);
+    if (!g_c_task_registry.tasks[task_id].active) {
+        pthread_mutex_unlock(&g_c_task_registry.mutex);
+        return 0;
+    }
+    c_task_func_t func = g_c_task_registry.tasks[task_id].func;
+    pthread_mutex_unlock(&g_c_task_registry.mutex);
+
+    size_t spawned = 0;
+    for (size_t i = 0; i < count; i++) {
+        int* arg = (int*)malloc(sizeof(int));
+        if (!arg) {
+            continue;
+        }
+        *arg = values[i];
+
+        c_task_wrapper_t* wrapper = (c_task_wrapper_t*)malloc(sizeof(c_task_wrapper_t));
+        if (!wrapper) {
+            free(arg);
+            continue;
+        }
+        wrapper->func = func;
+        wrapper->arg = arg;
+        wrapper->result = 0;
+
+        if (scheduler_spawn(c_task_wrapper, wrapper) > 0) {
+            spawned++;
+        } else {
+            free(wrapper);
+            free(arg);
+        }
+    }
+
+    if (spawned > 0) {
+        pthread_mutex_lock(&g_stats_mutex);
+        g_c_task_stats.total_c_tasks_spawned += spawned;
+        pthread_mutex_unlock(&g_stats_mutex);
+    }
+
+    return spawned;
 }
 
 /* ============================================ */

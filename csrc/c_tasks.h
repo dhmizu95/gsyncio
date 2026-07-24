@@ -145,6 +145,20 @@ uint64_t c_task_spawn_int(int task_id, int value);
  */
 uint64_t c_task_spawn_int_int(int task_id, int arg1, int arg2);
 
+/**
+ * Spawn a batch of C tasks with integer arguments, GIL-free.
+ *
+ * Resolves the task function pointer once (instead of once per call, like
+ * repeated c_task_spawn_int() calls would) and never touches Python, so
+ * this is safe to call with the GIL released for the whole batch.
+ *
+ * @param task_id Task ID (resolved once for the whole batch)
+ * @param values Array of integer arguments, one per task
+ * @param count Number of tasks to spawn
+ * @return Number of tasks successfully spawned
+ */
+size_t c_task_spawn_batch_int(int task_id, const int* values, size_t count);
+
 /* ============================================ */
 /* Pre-registered C Tasks                       */
 /* ============================================ */
