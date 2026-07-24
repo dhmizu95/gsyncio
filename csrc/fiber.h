@@ -155,6 +155,15 @@ void fiber_resume(fiber_t* fiber);
 fiber_t* fiber_current(void);
 
 /**
+ * Set current running fiber for this OS thread (TLS)
+ * Called by the scheduler's worker loop around fiber execution, since
+ * fibers here run as plain calls on the worker's own stack rather than
+ * through a stack-switching fiber_switch().
+ * @param f Fiber now running on this thread, or NULL when none is
+ */
+void fiber_set_current(fiber_t* f);
+
+/**
  * Add fiber to tracking table
  * @param f Fiber to add
  * @return 0 on success, -1 on failure

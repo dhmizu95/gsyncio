@@ -482,33 +482,27 @@ void scheduler_sleep_ns(uint64_t ns) {
         /* Fall through to timer-based sleep if spin didn't complete */
     }
     
-    /* Slow path: use timer and yield */
+    /* Slow path: block this worker thread until the deadline.
+     *
+     * Fibers currently run as plain calls on the worker's own OS stack
+     * (no stack-switching yet - see NATIVE_C_FIBERS_PLAN.md), so there is
+     * no way to suspend mid-call and let the worker run other fibers.
+     * A real OS sleep is the only correct wait here; other fibers still
+     * make progress on the scheduler's other worker threads.
+     */
+    (void)current;
     uint64_t deadline = get_time_ns() + ns;
-
-    timer_node_t* node = timer_pool_alloc();
-    if (!node) {
-        /* Fallback - just yield if we can't allocate timer */
-        fiber_yield();
-        return;
+    for (;;) {
+        uint64_t now = get_time_ns();
+        if (now >= deadline) {
+            break;
+        }
+        uint64_t remaining = deadline - now;
+        struct timespec req;
+        req.tv_sec = (time_t)(remaining / 1000000000ULL);
+        req.tv_nsec = (long)(remaining % 1000000000ULL);
+        nanosleep(&req, NULL);
     }
-
-    node->deadline_ns = deadline;
-    node->fiber = current;
-    node->active = true;
-    atomic_store(&node->next, NULL);
-
-    /* Mark fiber as waiting and add timer */
-    current->state = FIBER_WAITING;
-    current->waiting_on = node;
-
-    /* Add to timer list (lock-free push) */
-    pthread_mutex_lock(&g_scheduler->timers_mutex);
-    atomic_store(&node->next, g_scheduler->timers);
-    g_scheduler->timers = node;
-    pthread_mutex_unlock(&g_scheduler->timers_mutex);
-
-    /* CRITICAL: Actually yield the fiber to the scheduler */
-    fiber_yield();
 }
 
 static void* worker_thread(void* arg) {
@@ -616,15 +610,16 @@ static void* worker_thread(void* arg) {
             }
             
             w->current_fiber = f;
+            fiber_set_current(f);
             w->tasks_executed++;
 
             DEBUG_LOG_FIBER("Executing fiber", f);
-            
+
             if (expected_state == FIBER_NEW) {
                 DEBUG_LOG("Worker %d: Running NEW fiber %lu", w->id, (unsigned long)f->id);
                 if (setjmp(f->context) == 0) {
                     f->func(f->arg);
-                    
+
                     /* Fiber completed - clean up */
                     f->state = FIBER_COMPLETED;
                     scheduler_atomic_inc_fibers_completed();
@@ -641,6 +636,7 @@ static void* worker_thread(void* arg) {
                         fiber_free(f);
                     }
                     w->current_fiber = NULL;
+                    fiber_set_current(NULL);
                     sched_yield();
                     continue;
                 }
@@ -649,11 +645,12 @@ static void* worker_thread(void* arg) {
                 /* Resume existing fiber (FIBER_READY) */
                 longjmp(f->context, 1);
             }
-            
+
             /* After yield and eventual resumption, we reach here only if we fell through f->func(f->arg) or longjmp */
             /* But actually, for resumed fibers, they jump back to the setjmp ABOVE. */
             /* So this line is reached ONLY when a fiber yields and is then picked up again. */
             w->current_fiber = NULL;
+            fiber_set_current(NULL);
         }
     }
 
@@ -1490,13 +1487,14 @@ void scheduler_run(void) {
             }
             
             if (f && f->state == FIBER_RUNNING) {
+                fiber_set_current(f);
                 if (expected_state == FIBER_NEW) {
                     if (setjmp(f->context) == 0) {
                         f->func(f->arg);
 
                         f->state = FIBER_COMPLETED;
                         sched->stats.total_fibers_completed++;
-                        
+
                         /* Decrement global atomic task count */
                         scheduler_atomic_dec_task_count();
                         /* Sharded counter decrement */
@@ -1508,6 +1506,7 @@ void scheduler_run(void) {
                             fiber_free(f);
                         }
 
+                        fiber_set_current(NULL);
                         continue;
                     }
                     /* Fiber resumed after yield */
@@ -1515,6 +1514,7 @@ void scheduler_run(void) {
                     /* Resume existing fiber at its yield point */
                     longjmp(f->context, 1);
                 }
+                fiber_set_current(NULL);
             }
         } else {
             if (sched->io_uring_enabled) {

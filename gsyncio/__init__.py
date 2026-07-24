@@ -148,39 +148,6 @@ from ._async import (
     _run_coroutine,
 )
 
-# ── 3. Override run() with a smarter Python wrapper ─────────────────────────
-# The C extension's run() is a simple fire-and-forget; the Python wrapper
-# handles coroutines, async mains, and return values correctly.
-
-import asyncio as _asyncio
-import inspect as _inspect
-
-def run(func_or_coro, *args, **kwargs):
-    """
-    Run a function or coroutine in the gsyncio runtime.
-
-    Handles:
-    - Plain synchronous callables (returns their result)
-    - Async callables: run with asyncio.run()
-    - Already-created coroutines: awaited directly
-    """
-    from .core import init_scheduler, sync, shutdown_scheduler
-    init_scheduler()
-    try:
-        if _inspect.iscoroutine(func_or_coro):
-            return _asyncio.run(func_or_coro)
-        elif _inspect.iscoroutinefunction(func_or_coro):
-            return _asyncio.run(func_or_coro(*args, **kwargs))
-        else:
-            result = func_or_coro(*args, **kwargs)
-            if _inspect.iscoroutine(result):
-                return _asyncio.run(result)
-            sync()
-            return result
-    finally:
-        pass   # keep scheduler alive for subsequent task() calls
-
-
 from ._channel import (
     Chan,
     chan,

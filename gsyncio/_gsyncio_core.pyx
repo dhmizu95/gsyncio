@@ -1082,17 +1082,22 @@ def spawn_batch_ultra_fast(funcs_and_args, int store_fiber_ids=0):
 
 def sleep_ns(uint64_t ns):
     """Sleep for nanoseconds using native timer (fast path)"""
-    scheduler_sleep_ns(ns)
+    with nogil:
+        scheduler_sleep_ns(ns)
 
 
 def sleep_ms(int ms):
     """Sleep for milliseconds using native timer"""
-    scheduler_sleep_ns(ms * 1000000)
+    cdef uint64_t ns = ms * 1000000
+    with nogil:
+        scheduler_sleep_ns(ns)
 
 
 def sleep_us(int us):
     """Sleep for microseconds using native timer"""
-    scheduler_sleep_ns(us * 1000)
+    cdef uint64_t ns = us * 1000
+    with nogil:
+        scheduler_sleep_ns(ns)
 
 
 def current_fiber_id():
@@ -1144,12 +1149,19 @@ def task(func, *args):
     return _task_registry.spawn(func, *args)
 
 
-def task_batch():
-    """Create a task batch for efficient bulk spawning"""
+def task_batch(funcs_and_args):
+    """Spawn multiple tasks in a batch using the global task registry
+
+    Args:
+        funcs_and_args: List of (func, args) tuples
+
+    Returns:
+        Number of tasks spawned
+    """
     global _task_registry
     if not _task_registry:
         init_scheduler()
-    return TaskBatch(_task_registry)
+    return _task_registry.spawn_batch(funcs_and_args)
 
 
 def sync():
@@ -1182,14 +1194,28 @@ def task_completed_count():
     return _task_registry.completed_count
 
 
-def run(func, *args):
-    """Run a function in the gsyncio runtime"""
+def run(func_or_coro, *args, **kwargs):
+    """
+    Run a function or coroutine in the gsyncio runtime.
+
+    Handles plain sync callables, coroutine functions, and already-created
+    coroutines (asyncio-compatible), so callers never need a Python-level
+    wrapper around this entry point.
+    """
+    import asyncio
+    import inspect
     init_scheduler()
-    try:
-        func(*args)
+    if inspect.iscoroutine(func_or_coro):
+        return asyncio.run(func_or_coro)
+    elif inspect.iscoroutinefunction(func_or_coro):
+        return asyncio.run(func_or_coro(*args, **kwargs))
+    else:
+        result = func_or_coro(*args, **kwargs)
+        if inspect.iscoroutine(result):
+            return asyncio.run(result)
         sync()
-    finally:
-        shutdown_scheduler(wait=True)
+        return result
+    # scheduler stays alive for subsequent task() calls
 
 
 # ============================================

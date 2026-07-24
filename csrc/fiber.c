@@ -301,6 +301,10 @@ fiber_t* fiber_current(void) {
     return g_current_fiber;
 }
 
+void fiber_set_current(fiber_t* f) {
+    g_current_fiber = f;
+}
+
 int fiber_start(fiber_t* fiber) {
     if (!fiber || fiber->state != FIBER_NEW) {
         return -1;
