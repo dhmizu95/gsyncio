@@ -613,6 +613,7 @@ cdef class TaskRegistry:
             Py_DECREF(payload)
             raise RuntimeError("Failed to spawn task")
         cdef uint64_t fid = handle.fiber_id
+        free(handle)  # task_spawn() heap-allocates this; caller only needs fiber_id
         return fid
 
     def spawn_batch(self, tasks):
