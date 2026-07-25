@@ -130,21 +130,46 @@ int c_task_lookup(const char* name) {
 /* Task Execution (GIL-free)                    */
 /* ============================================ */
 
+/* A batch's wrappers and arg boxes live in one arena (one malloc each
+ * instead of two mallocs per task). Fibers from the same batch finish
+ * at different times, so the arena can't be freed until the LAST one
+ * completes - `remaining` tracks that with a simple atomic refcount. */
+typedef struct c_task_arena {
+    void* wrappers;          /* count * sizeof(c_task_wrapper_t), see below */
+    int* args;                /* count ints, one per task */
+    _Atomic size_t remaining; /* fibers not yet finished (or never spawned) */
+} c_task_arena_t;
+
 /* Wrapper for C task execution */
 typedef struct {
     c_task_func_t func;
     void* arg;
     int result;
+    c_task_arena_t* arena;  /* NULL for individually-malloc'd wrappers */
 } c_task_wrapper_t;
+
+static void arena_release(c_task_arena_t* arena) {
+    if (atomic_fetch_sub(&arena->remaining, 1) == 1) {
+        free(arena->wrappers);
+        free(arena->args);
+        free(arena);
+    }
+}
 
 static void c_task_wrapper(void* arg) {
     c_task_wrapper_t* wrapper = (c_task_wrapper_t*)arg;
     wrapper->func(wrapper->arg);
-    /* Nothing reads wrapper->result back (fire-and-forget), and nobody
-     * else owns wrapper/wrapper->arg after this point - free them here
-     * or every spawn leaks its arg box + wrapper struct forever. */
-    free(wrapper->arg);
-    free(wrapper);
+    /* Nothing reads wrapper->result back (fire-and-forget). */
+    if (wrapper->arena) {
+        /* wrapper/arg are slices of the batch arena, not their own
+         * allocation - release our slot instead of freeing directly. */
+        arena_release(wrapper->arena);
+    } else {
+        /* Individually malloc'd (c_task_spawn/_int/_int_int path) -
+         * nobody else owns these, free them here or they leak forever. */
+        free(wrapper->arg);
+        free(wrapper);
+    }
 }
 
 int c_task_execute(int task_id, void* arg) {
@@ -188,7 +213,8 @@ uint64_t c_task_spawn(int task_id, void* arg) {
     wrapper->func = func;
     wrapper->arg = arg;
     wrapper->result = 0;
-    
+    wrapper->arena = NULL;
+
     /* Spawn fiber - NO GIL NEEDED! */
     uint64_t fid = scheduler_spawn(c_task_wrapper, wrapper);
     
@@ -238,28 +264,41 @@ size_t c_task_spawn_batch_int(int task_id, const int* values, size_t count) {
     c_task_func_t func = g_c_task_registry.tasks[task_id].func;
     pthread_mutex_unlock(&g_c_task_registry.mutex);
 
+    /* One arena for the whole batch: 3 mallocs total instead of 2*count.
+     * Each task gets a slice (wrappers[i], args[i]) instead of its own
+     * malloc'd wrapper + arg box. */
+    c_task_arena_t* arena = (c_task_arena_t*)malloc(sizeof(c_task_arena_t));
+    if (!arena) {
+        return 0;
+    }
+    c_task_wrapper_t* wrappers = (c_task_wrapper_t*)malloc(count * sizeof(c_task_wrapper_t));
+    int* args = (int*)malloc(count * sizeof(int));
+    if (!wrappers || !args) {
+        free(wrappers);
+        free(args);
+        free(arena);
+        return 0;
+    }
+    arena->wrappers = wrappers;
+    arena->args = args;
+    memcpy(args, values, count * sizeof(int));
+    /* Optimistic: assume every slot spawns. Slots that fail to spawn
+     * (scheduler_spawn returns 0, so c_task_wrapper never runs for them)
+     * release their own share immediately below instead. */
+    atomic_store(&arena->remaining, count);
+
     size_t spawned = 0;
     for (size_t i = 0; i < count; i++) {
-        int* arg = (int*)malloc(sizeof(int));
-        if (!arg) {
-            continue;
-        }
-        *arg = values[i];
-
-        c_task_wrapper_t* wrapper = (c_task_wrapper_t*)malloc(sizeof(c_task_wrapper_t));
-        if (!wrapper) {
-            free(arg);
-            continue;
-        }
+        c_task_wrapper_t* wrapper = &wrappers[i];
         wrapper->func = func;
-        wrapper->arg = arg;
+        wrapper->arg = &args[i];
         wrapper->result = 0;
+        wrapper->arena = arena;
 
         if (scheduler_spawn(c_task_wrapper, wrapper) > 0) {
             spawned++;
         } else {
-            free(wrapper);
-            free(arg);
+            arena_release(arena);
         }
     }
 

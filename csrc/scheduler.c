@@ -1019,9 +1019,17 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
     
     fiber_t* f = NULL;
 
+    /* Round-robin worker selection - computed BEFORE pool allocation so
+     * we can allocate from the shard matching the worker that will
+     * actually run this fiber. Allocating from a mismatched shard
+     * starves it and forces the pool to keep growing instead of
+     * reusing freed fibers (see fiber_pool_alloc()'s doc comment). */
+    size_t worker_idx = atomic_fetch_add(&g_scheduler->next_worker, 1) % g_scheduler->num_workers;
+    int worker_id = (int)worker_idx;
+
     /* Try fiber pool first for faster allocation */
     if (g_scheduler->fiber_pool) {
-        f = fiber_pool_alloc((fiber_pool_t*)g_scheduler->fiber_pool);
+        f = fiber_pool_alloc((fiber_pool_t*)g_scheduler->fiber_pool, worker_id);
         if (f) {
             /* Initialize fiber fields */
             f->func = entry;
@@ -1070,10 +1078,6 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
     scheduler_atomic_inc_fibers_spawned();
     /* Increment atomic task count - this is what sync() waits on */
     scheduler_atomic_inc_task_count();
-
-    /* Atomic round-robin worker selection */
-    size_t worker_idx = atomic_fetch_add(&g_scheduler->next_worker, 1) % g_scheduler->num_workers;
-    int worker_id = (int)worker_idx;
 
     /* Sharded counter increment - uses worker_id for low contention */
     scheduler_sharded_inc_task_count((uint32_t)worker_id);
@@ -1167,10 +1171,12 @@ int scheduler_spawn_batch_add(spawn_batch_t* batch, void (*entry)(void*), void* 
         batch->capacity = new_capacity;
     }
     
-    /* Allocate fiber from pool */
+    /* Allocate fiber from pool. No specific target worker is known yet
+     * at add-time (this batch API assigns workers later, on submit),
+     * so fall back to the calling thread's shard. */
     fiber_t* f = NULL;
     if (g_scheduler->fiber_pool) {
-        f = fiber_pool_alloc((fiber_pool_t*)g_scheduler->fiber_pool);
+        f = fiber_pool_alloc((fiber_pool_t*)g_scheduler->fiber_pool, -1);
         if (f) {
             f->func = entry;
             f->arg = user_data;

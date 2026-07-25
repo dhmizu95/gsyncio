@@ -546,10 +546,18 @@ size_t task_batch_fast_spawn_nogil(task_batch_fast_t* batch, task_registry_t* re
         wrapper->registry = reg;
         wrapper->task_id = atomic_fetch_add(&reg->task_count, 1);
 
+        /* Round-robin worker selection - computed BEFORE pool allocation
+         * so we can allocate from the shard matching the worker that
+         * will actually run this fiber (see fiber_pool_alloc()'s doc
+         * comment: mismatched alloc/free shards starve the pool and
+         * force it to keep growing instead of reusing fibers). */
+        size_t worker_idx = atomic_fetch_add(&g_scheduler->next_worker, 1) % g_scheduler->num_workers;
+        int worker_id = (int)worker_idx;
+
         /* Try fiber pool first (fast path) */
         fiber_t* f = NULL;
         if (g_scheduler->fiber_pool) {
-            f = fiber_pool_alloc((fiber_pool_t*)g_scheduler->fiber_pool);
+            f = fiber_pool_alloc((fiber_pool_t*)g_scheduler->fiber_pool, worker_id);
         }
 
         /* Fall back to direct allocation */
@@ -598,9 +606,8 @@ size_t task_batch_fast_spawn_nogil(task_batch_fast_t* batch, task_registry_t* re
         
         g_scheduler->stats.total_fibers_created++;
 
-        /* Schedule fiber with atomic round-robin */
-        size_t worker_idx = atomic_fetch_add(&g_scheduler->next_worker, 1) % g_scheduler->num_workers;
-        int worker_id = (int)worker_idx;
+        /* Schedule onto the SAME worker we allocated this fiber's shard
+         * for above - keeps alloc and schedule consistent. */
         scheduler_schedule(f, worker_id);
 
         /* Store fiber ID if requested */

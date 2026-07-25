@@ -65,14 +65,21 @@ void fiber_pool_destroy(fiber_pool_t* pool);
 /* ============================================ */
 
 /**
- * Allocate a fiber from the pool. Picks a shard based on the calling
- * thread's worker ID (or a stable per-thread hash if called from a
- * non-worker thread), so concurrent allocators mostly avoid contending
- * on the same lock.
+ * Allocate a fiber from the pool.
+ *
  * @param pool Pool to allocate from
+ * @param worker_hint The worker ID that will actually run this fiber
+ *   (i.e. what scheduler_schedule() will be called with), or -1 if not
+ *   known yet. Passing the real target worker matters: fiber_pool_free()
+ *   always returns a fiber to the shard matching whichever worker ran
+ *   it, so allocating from that SAME shard is what makes fibers actually
+ *   get reused. Allocating from a mismatched shard (e.g. always the
+ *   calling thread's own shard when the caller isn't the target worker)
+ *   starves that shard's free list, forcing constant pool growth while
+ *   the correct shard's freed fibers just pile up unused.
  * @return Fiber, or NULL if pool exhausted
  */
-fiber_t* fiber_pool_alloc(fiber_pool_t* pool);
+fiber_t* fiber_pool_alloc(fiber_pool_t* pool, int worker_hint);
 
 /**
  * Free a fiber back to the pool. Picks a shard the same way as

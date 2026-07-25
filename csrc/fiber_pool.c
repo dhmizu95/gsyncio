@@ -38,11 +38,19 @@ static void init_debug_flag(void) {
 #define FIBER_POOL_MAX_SIZE (100 * 1024 * 1024) /* 100M fibers */
 #define FIBER_POOL_LAZY_STACK 1         /* Lazy allocate stacks when used */
 
-/* Which shard the current thread should use. Reuses the scheduler's
- * existing worker-ID tracking (same mechanism as the sharded task/
- * completion counters), so this needs no new thread-local state. */
+/* Which shard the current thread should use when no specific target
+ * worker is known. Reuses the scheduler's existing worker-ID tracking
+ * (same mechanism as the sharded task/completion counters), so this
+ * needs no new thread-local state. */
 static inline size_t current_shard_index(void) {
     return (size_t)(scheduler_get_current_worker_id() % FIBER_POOL_NUM_SHARDS);
+}
+
+static inline size_t shard_index_for(int worker_hint) {
+    if (worker_hint >= 0) {
+        return (size_t)worker_hint % FIBER_POOL_NUM_SHARDS;
+    }
+    return current_shard_index();
 }
 
 fiber_pool_t* fiber_pool_create(size_t initial_size, fiber_stack_mode_t stack_mode) {
@@ -127,10 +135,10 @@ static fiber_t* alloc_stack_for(fiber_t* f) {
     return f;
 }
 
-fiber_t* fiber_pool_alloc(fiber_pool_t* pool) {
+fiber_t* fiber_pool_alloc(fiber_pool_t* pool, int worker_hint) {
     if (!pool) return NULL;
 
-    fiber_pool_shard_t* shard = &pool->shards[current_shard_index()];
+    fiber_pool_shard_t* shard = &pool->shards[shard_index_for(worker_hint)];
 
     pthread_mutex_lock(&shard->mutex);
 
