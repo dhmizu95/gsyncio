@@ -793,6 +793,43 @@ cdef void _c_fiber_entry_chunk(void* arg) noexcept nogil:
             del chunk
 
 
+cdef void _c_coro_chunk_entry(void* arg) noexcept nogil:
+    """C callback for a CHUNK of (coroutine, Future) pairs - one GIL
+    acquisition and one fiber for the whole chunk instead of one fiber
+    per coroutine (mirrors _c_fiber_entry_chunk above, adapted for
+    driving coroutines to completion instead of one-shot calls).
+
+    Each coroutine gets driven with a single coro.send(None): every
+    gsyncio-native awaitable (Future, sleep, channel, WaitGroup) blocks
+    synchronously in C when called on a fiber, so that one send()
+    transitively blocks to completion - no real Python-level suspend
+    needed (see gs.run()'s docstring for the full reasoning). A
+    coroutine that awaits something non-native truly yields instead of
+    raising StopIteration; that's reported as an error on its own
+    Future rather than crashing the whole chunk.
+    """
+    if arg != NULL:
+        with gil:
+            chunk = <object>arg
+            Py_DECREF(chunk)  # Balanced INCREF from spawn
+            for coro, future in chunk:
+                try:
+                    try:
+                        coro.send(None)
+                    except StopIteration as e:
+                        future.set_result(e.value)
+                    else:
+                        future.set_exception(RuntimeError(
+                            "coroutine awaited something that isn't "
+                            "gsyncio-native while running under gsyncio's "
+                            "native driver - no asyncio event loop is "
+                            "running to service it"
+                        ))
+                except BaseException as e:
+                    future.set_exception(e)
+            del chunk
+
+
 # ============================================
 # Module-level functions
 # ============================================
@@ -1066,6 +1103,52 @@ def spawn_batch_fast(funcs_and_args):
         Py_INCREF(chunk)
         scheduler_spawn(_c_fiber_entry_chunk, <void*>chunk)
         i += chunk_size
+
+
+def spawn_coro_batch(coros):
+    """Batch-drive a list of bare coroutines, one Future each.
+
+    Same chunking idea as spawn_batch_fast(), adapted for coroutines:
+    each chunk's fiber acquires the GIL ONCE and drives every coroutine
+    in its chunk to completion (via _c_coro_chunk_entry) instead of
+    paying one fiber-spawn + one GIL acquisition per coroutine. This is
+    what gather() uses internally for coroutines passed to it directly -
+    NOT what create_task() uses, since create_task() has to hand back a
+    Future immediately for a single coroutine, before there's a batch of
+    anything to chunk.
+
+    Args:
+        coros: List of coroutine objects (not yet started)
+
+    Returns:
+        List of Future objects, one per coroutine, same order as input.
+    """
+    if g_scheduler == NULL:
+        init_scheduler(num_workers=4)
+
+    cdef size_t count = len(coros)
+    if count == 0:
+        return []
+
+    futures = [Future() for _ in range(count)]
+    pairs = list(zip(coros, futures))
+
+    cdef size_t workers = num_workers()
+    if workers == 0:
+        workers = 1
+    cdef size_t chunk_size = count // (workers * 8)
+    if chunk_size < 1:
+        chunk_size = 1
+
+    cdef object chunk
+    cdef size_t i = 0
+    while i < count:
+        chunk = pairs[i:i + chunk_size]
+        Py_INCREF(chunk)
+        scheduler_spawn(_c_coro_chunk_entry, <void*>chunk)
+        i += chunk_size
+
+    return futures
 
 
 def spawn_batch_ultra_fast(funcs_and_args, int store_fiber_ids=0):

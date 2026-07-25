@@ -21,6 +21,7 @@ try:
         spawn_batch,
         spawn_batch_fast,
         spawn_batch_ultra_fast,
+        spawn_coro_batch,
         sleep_ns,
         sleep_us,
         sleep_ms,

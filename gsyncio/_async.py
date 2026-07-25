@@ -18,9 +18,11 @@ from typing import Any, Coroutine, List, Optional, Awaitable
 
 try:
     from ._gsyncio_core import GSocket, sleep_ns as _c_sleep_ns
+    from ._gsyncio_core import spawn_coro_batch as _spawn_coro_batch
     _HAS_NATIVE = True
 except ImportError:
     _HAS_NATIVE = False
+    _spawn_coro_batch = None
 
 from .core import Future, sleep_ms, sleep_ns, init_scheduler, shutdown_scheduler, _HAS_CYTHON, task as _task
 
@@ -82,15 +84,32 @@ async def gather(*awaitables: Awaitable,
                  return_exceptions: bool = False) -> List[Any]:
     """Concurrently await multiple awaitables.
 
-    Bare coroutines get wrapped into their own fiber via create_task()
-    (true concurrency, each on its own OS thread). Anything already
-    awaitable (a gsyncio Future, a raw asyncio Task/Future, any object
-    with __await__) is awaited as-is - deferring to whatever is actually
-    driving this coroutine (gsyncio's native driver, or an ambient
-    asyncio loop if this is itself called from asyncio-driven code).
+    Bare coroutines are batched: gather() sees the whole set up front
+    (unlike create_task(), which has to hand back a Future for one
+    coroutine immediately, before any batch exists), so they're driven
+    in chunks via spawn_coro_batch() - one fiber and one GIL acquisition
+    per chunk instead of one of each per coroutine. This is the same
+    chunking idea as spawn_batch_fast() (see its docstring), just for
+    coroutines instead of plain calls. Falls back to create_task() one
+    at a time if the native batch path isn't available (pure-Python
+    fallback build). Anything already awaitable (a gsyncio Future, a raw
+    asyncio Task/Future, any object with __await__) is awaited as-is -
+    deferring to whatever is actually driving this coroutine (gsyncio's
+    native driver, or an ambient asyncio loop if this is itself called
+    from asyncio-driven code).
     """
-    prepared = [create_task(a) if inspect.iscoroutine(a) else a
-                for a in awaitables]
+    awaitables = list(awaitables)
+    coro_indices = [i for i, a in enumerate(awaitables) if inspect.iscoroutine(a)]
+
+    prepared = list(awaitables)
+    if coro_indices:
+        if _spawn_coro_batch is not None:
+            batched_futures = _spawn_coro_batch([awaitables[i] for i in coro_indices])
+            for i, fut in zip(coro_indices, batched_futures):
+                prepared[i] = fut
+        else:
+            for i in coro_indices:
+                prepared[i] = create_task(awaitables[i])
 
     results = []
     for a in prepared:
