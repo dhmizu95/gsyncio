@@ -221,24 +221,7 @@ void fiber_pool_free(fiber_pool_t* pool, fiber_t* fiber) {
     atomic_fetch_sub(&pool->allocated, 1);
 }
 
-size_t fiber_pool_available(fiber_pool_t* pool) {
-    if (!pool) return 0;
-    size_t total = 0;
-    for (size_t s = 0; s < FIBER_POOL_NUM_SHARDS; s++) {
-        total += atomic_load(&pool->shards[s].available);
-    }
-    return total;
-}
-
-size_t fiber_pool_allocated(fiber_pool_t* pool) {
-    return pool ? atomic_load(&pool->allocated) : 0;
-}
-
 size_t fiber_pool_capacity(fiber_pool_t* pool) {
     return pool ? atomic_load(&pool->capacity) : 0;
 }
 
-int fiber_pool_verify_counters(fiber_pool_t* pool) {
-    (void)pool;
-    return 1;
-}

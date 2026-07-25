@@ -164,31 +164,6 @@ int worker_manager_check_scale(worker_manager_t* manager, size_t current_queue_d
     return scale_change;
 }
 
-int worker_manager_scale_to(worker_manager_t* manager, size_t target_workers) {
-    if (!manager) {
-        return -1;
-    }
-
-    if (target_workers < manager->min_workers) {
-        target_workers = manager->min_workers;
-    }
-    if (target_workers > manager->max_workers) {
-        target_workers = manager->max_workers;
-    }
-
-    if (target_workers == manager->current_workers) {
-        return 0;
-    }
-
-    int change = (int)(target_workers - manager->current_workers);
-    manager->current_workers = target_workers;
-    manager->last_scale_time_ms = worker_manager_get_time_ms();
-    
-    fprintf(stderr, "[WorkerManager] Manual scale: %zu workers\n", target_workers);
-    
-    return change;
-}
-
 size_t worker_manager_get_recommended_workers(worker_manager_t* manager) {
     if (!manager) {
         return WORKER_MANAGER_MIN_WORKERS;
@@ -219,38 +194,6 @@ size_t worker_manager_get_recommended_workers(worker_manager_t* manager) {
 /* ============================================ */
 /* Metrics & Monitoring                         */
 /* ============================================ */
-
-void worker_manager_record_spawn(worker_manager_t* manager) {
-    if (manager) {
-        manager->total_tasks_spawned++;
-    }
-}
-
-void worker_manager_record_completion(worker_manager_t* manager) {
-    if (manager) {
-        manager->total_tasks_completed++;
-    }
-}
-
-void worker_manager_record_steal(worker_manager_t* manager) {
-    if (manager) {
-        manager->total_work_steals++;
-    }
-}
-
-void worker_manager_record_idle(worker_manager_t* manager, size_t worker_id, uint64_t idle_time_ms) {
-    (void)worker_id;
-    if (manager) {
-        manager->total_idle_time_ms += idle_time_ms;
-    }
-}
-
-void worker_manager_record_busy(worker_manager_t* manager, size_t worker_id, uint64_t busy_time_ms) {
-    (void)worker_id;
-    if (manager) {
-        manager->total_busy_time_ms += busy_time_ms;
-    }
-}
 
 double worker_manager_get_utilization(worker_manager_t* manager) {
     if (!manager) {

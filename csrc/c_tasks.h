@@ -143,7 +143,6 @@ uint64_t c_task_spawn_int(int task_id, int value);
  * @param arg2 Second integer argument
  * @return Fiber ID on success, 0 on failure
  */
-uint64_t c_task_spawn_int_int(int task_id, int arg1, int arg2);
 
 /**
  * Spawn a batch of C tasks with integer arguments, GIL-free.

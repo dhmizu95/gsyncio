@@ -144,19 +144,6 @@ static void timer_pool_init(size_t capacity) {
     }
 }
 
-static timer_node_t* timer_pool_alloc(void) {
-    timer_node_t* node = (timer_node_t*)atomic_load(&g_timer_pool.free_list);
-    while (node != NULL) {
-        timer_node_t* next = node->next;  /* Regular load - node->next is not atomic */
-        if (atomic_compare_exchange_weak(&g_timer_pool.free_list, &node, next)) {
-            return node;
-        }
-        node = (timer_node_t*)atomic_load(&g_timer_pool.free_list);
-    }
-    /* Pool exhausted - fall back to malloc */
-    return (timer_node_t*)malloc(sizeof(timer_node_t));
-}
-
 static void timer_pool_free(timer_node_t* node) {
     if (!node) return;
 
@@ -758,33 +745,6 @@ static fiber_t* steal_from_worker(worker_t* thief, int victim_id) {
     return f;
 }
 
-static int get_random_victim(worker_t* w) {
-    scheduler_t* sched = g_scheduler;
-    if (sched->num_workers <= 1) {
-        return -1;
-    }
-
-    /* Use worker ID and thread address for seed - more robust initialization */
-    static _Thread_local unsigned int seed = 0;
-    if (seed == 0) {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        seed = (unsigned int)((uintptr_t)w ^ (uint64_t)ts.tv_nsec ^ (w->id + 1));
-        if (seed == 0) seed = 1;  /* Ensure non-zero */
-    }
-
-    int victim = w->last_victim;
-    int attempts = 0;
-
-    do {
-        victim = (victim + 1 + (rand_r(&seed) % (sched->num_workers - 1))) % sched->num_workers;
-        attempts++;
-    } while (victim == w->id && attempts < (int)sched->num_workers);
-
-    w->last_victim = victim;
-    return victim;
-}
-
 int scheduler_init(scheduler_config_t* config) {
     /* Install crash handler first */
     install_crash_handler();
@@ -1218,150 +1178,6 @@ void scheduler_schedule(fiber_t* f, int worker_id) {
 /* Batch Scheduling Implementation              */
 /* ============================================ */
 
-spawn_batch_t* scheduler_create_spawn_batch(size_t initial_capacity) {
-    if (initial_capacity == 0) {
-        initial_capacity = 16;
-    }
-    
-    spawn_batch_t* batch = (spawn_batch_t*)calloc(1, sizeof(spawn_batch_t));
-    if (!batch) {
-        return NULL;
-    }
-    
-    batch->fibers = (fiber_t**)calloc(initial_capacity, sizeof(fiber_t*));
-    if (!batch->fibers) {
-        free(batch);
-        return NULL;
-    }
-    
-    batch->capacity = initial_capacity;
-    batch->count = 0;
-    
-    return batch;
-}
-
-void scheduler_destroy_spawn_batch(spawn_batch_t* batch) {
-    if (!batch) {
-        return;
-    }
-    
-    /* Free any fibers that were added but not submitted */
-    for (size_t i = 0; i < batch->count; i++) {
-        if (batch->fibers[i]) {
-            if (batch->fibers[i]->pool) {
-                fiber_pool_free(batch->fibers[i]->pool, batch->fibers[i]);
-            } else {
-                fiber_free(batch->fibers[i]);
-            }
-        }
-    }
-    
-    free(batch->fibers);
-    free(batch);
-}
-
-int scheduler_spawn_batch_add(spawn_batch_t* batch, void (*entry)(void*), void* user_data) {
-    if (!batch || !entry || !g_scheduler) {
-        return -1;
-    }
-    
-    /* Grow capacity if needed */
-    if (batch->count >= batch->capacity) {
-        size_t new_capacity = batch->capacity * 2;
-        fiber_t** new_fibers = (fiber_t**)realloc(batch->fibers, new_capacity * sizeof(fiber_t*));
-        if (!new_fibers) {
-            return -1;
-        }
-        batch->fibers = new_fibers;
-        batch->capacity = new_capacity;
-    }
-    
-    /* Allocate fiber from pool. No specific target worker is known yet
-     * at add-time (this batch API assigns workers later, on submit),
-     * so fall back to the calling thread's shard. */
-    fiber_t* f = NULL;
-    if (g_scheduler->fiber_pool) {
-        f = fiber_pool_alloc((fiber_pool_t*)g_scheduler->fiber_pool, -1);
-        if (f) {
-            f->func = entry;
-            f->arg = user_data;
-            f->parent = fiber_current();
-            
-            /* Lazy stack allocation */
-            if (!f->stack_base) {
-                size_t stack_size = g_scheduler->config.stack_size > 0 ? 
-                    g_scheduler->config.stack_size : FIBER_DEFAULT_STACK_SIZE;
-                size_t alloc_size = stack_size;
-#if FIBER_USE_GUARD_PAGES == 1
-                alloc_size += 4096;
-#endif
-                f->stack_base = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                
-                if (f->stack_base == MAP_FAILED) {
-                    fiber_pool_free((fiber_pool_t*)g_scheduler->fiber_pool, f);
-                    return -1;
-                }
-                
-#if FIBER_USE_GUARD_PAGES == 1
-                mprotect(f->stack_base, 4096, PROT_NONE);
-                f->stack_ptr = (char*)f->stack_base + stack_size + 4096;
-#else
-                f->stack_ptr = (char*)f->stack_base + stack_size;
-#endif
-                f->stack_size = stack_size;
-                f->stack_capacity = stack_size;
-            }
-        }
-    }
-    
-    /* Fall back to direct allocation */
-    if (!f) {
-        f = fiber_create(entry, user_data, g_scheduler->config.stack_size);
-    }
-    
-    if (!f) {
-        return -1;
-    }
-    
-    batch->fibers[batch->count++] = f;
-    g_scheduler->stats.total_fibers_created++;
-    
-    return 0;
-}
-
-void scheduler_spawn_batch_submit(spawn_batch_t* batch) {
-    if (!batch || batch->count == 0 || !g_scheduler) {
-        return;
-    }
-    
-    scheduler_t* sched = g_scheduler;
-    
-    /* Submit all fibers with a single lock acquisition */
-    pthread_mutex_lock(&sched->mutex);
-    
-    for (size_t i = 0; i < batch->count; i++) {
-        fiber_t* f = batch->fibers[i];
-        if (!f) continue;
-        
-        /* Atomic round-robin worker selection */
-        size_t worker_idx = atomic_fetch_add(&sched->next_worker, 1) % sched->num_workers;
-        int worker_id = (int)worker_idx;
-        
-        worker_t* w = &sched->workers[worker_id];
-        push_local(w, f);
-        
-        /* FIX: Increment atomic task count for each fiber in batch */
-        scheduler_atomic_inc_task_count();
-        scheduler_atomic_inc_fibers_spawned();
-    }
-    
-    pthread_cond_broadcast(&sched->cond);
-    pthread_mutex_unlock(&sched->mutex);
-    
-    /* Reset batch */
-    batch->count = 0;
-}
-
 void scheduler_block(void* reason) {
     scheduler_t* sched = g_scheduler;
     if (!sched) {
@@ -1672,101 +1488,6 @@ void scheduler_stop(void) {
     }
 }
 
-void scheduler_set_backend(scheduler_backend_t backend) {
-    if (!g_scheduler) {
-        return;
-    }
-    
-#ifdef __linux__
-    if (backend == SCHEDULER_BACKEND_IOURING && !g_scheduler->io_uring_enabled) {
-        if (io_uring_init(&g_scheduler->io_uring_ring, 256) == 0) {
-            g_scheduler->io_uring_enabled = true;
-            g_scheduler->backend = SCHEDULER_BACKEND_IOURING;
-        }
-    } else if (backend == SCHEDULER_BACKEND_EPOLL) {
-        if (g_scheduler->io_uring_enabled) {
-            io_uring_destroy(&g_scheduler->io_uring_ring);
-            g_scheduler->io_uring_enabled = false;
-        }
-        g_scheduler->backend = SCHEDULER_BACKEND_EPOLL;
-    }
-#else
-    (void)backend;
-#endif
-}
-
-scheduler_backend_t scheduler_get_backend(void) {
-    return g_scheduler ? g_scheduler->backend : SCHEDULER_BACKEND_DEFAULT;
-}
-
-int scheduler_submit_io(io_request_t *req) {
-    if (!g_scheduler || !req) {
-        return -1;
-    }
-    
-#ifdef __linux__
-    if (g_scheduler->io_uring_enabled) {
-        io_uring_submission_t *sub = (io_uring_submission_t*)malloc(sizeof(io_uring_submission_t));
-        if (!sub) return -1;
-        
-        sub->user_data = req->user_data;
-        sub->op = req->op;
-        sub->fd = req->fd;
-        sub->buf = req->buf;
-        sub->len = req->len;
-        sub->offset = req->offset;
-        sub->fiber = req->fiber;
-        
-        pthread_mutex_lock(&g_scheduler->io_uring_mutex);
-        sub->next = g_scheduler->pending_submissions;
-        g_scheduler->pending_submissions = sub;
-        pthread_mutex_unlock(&g_scheduler->io_uring_mutex);
-        
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&g_scheduler->io_uring_ring);
-        if (!sqe) {
-            return -1;
-        }
-        
-        switch (req->op) {
-            case IO_OP_READ:
-                sqe->opcode = IORING_OP_READ;
-                sqe->addr = (uint64_t)req->buf;
-                sqe->len = req->len;
-                sqe->off = req->offset;
-                break;
-            case IO_OP_WRITE:
-                sqe->opcode = IORING_OP_WRITE;
-                sqe->addr = (uint64_t)req->write_buf;
-                sqe->len = req->len;
-                sqe->off = req->offset;
-                break;
-            case IO_OP_ACCEPT:
-                sqe->opcode = IORING_OP_ACCEPT;
-                sqe->addr = (uint64_t)req->addr;
-                sqe->len = req->addrlen;
-                break;
-            case IO_OP_CONNECT:
-                sqe->opcode = IORING_OP_CONNECT;
-                sqe->addr = (uint64_t)req->addr;
-                sqe->len = req->addrlen;
-                break;
-            default:
-                sqe->opcode = IORING_OP_NOP;
-                break;
-        }
-        
-        sqe->fd = req->fd;
-        sqe->user_data = req->user_data;
-        
-        g_scheduler->stats.total_io_submitted++;
-        return 0;
-    }
-#endif
-    
-    (void)req;
-    return -1;
-}
-
 int scheduler_wait_io(int fd, uint32_t events, int64_t timeout_ns) {
     if (!g_scheduler) {
         return -1;
@@ -1852,63 +1573,6 @@ void scheduler_wake_io(int fd, uint32_t events) {
     }
 }
 
-int scheduler_add_timer(uint64_t deadline_ns, fiber_t *fiber) {
-    if (!g_scheduler || !fiber) {
-        return -1;
-    }
-    
-    timer_node_t *node = (timer_node_t*)malloc(sizeof(timer_node_t));
-    if (!node) return -1;
-    
-    node->deadline_ns = deadline_ns;
-    node->fiber = fiber;
-    node->active = true;
-    
-    pthread_mutex_lock(&g_scheduler->timers_mutex);
-    node->next = g_scheduler->timers;
-    g_scheduler->timers = node;
-    pthread_mutex_unlock(&g_scheduler->timers_mutex);
-    
-    return 0;
-}
-
-void scheduler_cancel_timer(fiber_t *fiber) {
-    if (!g_scheduler || !fiber) {
-        return;
-    }
-    
-    pthread_mutex_lock(&g_scheduler->timers_mutex);
-    timer_node_t *node = g_scheduler->timers;
-    while (node) {
-        if (node->fiber == fiber) {
-            node->active = false;
-            break;
-        }
-        node = node->next;
-    }
-    pthread_mutex_unlock(&g_scheduler->timers_mutex);
-}
-
-int scheduler_register_fd(int fd, fiber_t *fiber, uint32_t events) {
-    if (!g_scheduler || fd < 0 || fd >= (int)g_scheduler->fd_table_size) {
-        return -1;
-    }
-    
-    g_scheduler->fd_table[fd].fiber = fiber;
-    g_scheduler->fd_table[fd].events = events;
-    g_scheduler->fd_table[fd].active = true;
-    
-    return 0;
-}
-
-void scheduler_unregister_fd(int fd) {
-    if (!g_scheduler || fd < 0 || fd >= (int)g_scheduler->fd_table_size) {
-        return;
-    }
-    
-    g_scheduler->fd_table[fd].active = false;
-    g_scheduler->fd_table[fd].fiber = NULL;
-}
 /* ============================================ */
 /* Worker Manager Integration                   */
 /* ============================================ */
@@ -1916,33 +1580,6 @@ void scheduler_unregister_fd(int fd) {
 /**
  * Background thread for worker scaling decisions
  */
-static void* worker_manager_loop(scheduler_t *sched) {
-    while (sched->running) {
-        /* Check if scaling is needed */
-        size_t queue_depth = 0;
-        
-        pthread_mutex_lock(&sched->mutex);
-        fiber_t* f = sched->ready_queue;
-        while (f) {
-            queue_depth++;
-            f = f->next_ready;
-            if (queue_depth > 1000) break;  /* Cap counting */
-        }
-        pthread_mutex_unlock(&sched->mutex);
-        
-        /* Check scaling */
-        worker_manager_check_scale(&sched->worker_manager, queue_depth);
-        
-        /* Sleep for check interval */
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = WORKER_MANAGER_CHECK_INTERVAL_MS * 1000000;
-        nanosleep(&ts, NULL);
-    }
-    
-    return NULL;
-}
-
 void scheduler_check_worker_scaling(void) {
     if (!g_scheduler) return;
     
@@ -1994,15 +1631,3 @@ size_t scheduler_get_recommended_workers(void) {
  * @param count Number of tasks
  * @return 0 on success, -1 on failure
  */
-int scheduler_spawn_batch_python(python_task_t* tasks, size_t count) {
-    /* Note: This function is a placeholder for future optimization.
-     * Currently, batch spawning is handled more efficiently from Python
-     * using spawn_batch() which reuses pooled payloads.
-     * 
-     * The C-level batch spawn would need proper Python callback integration
-     * which requires careful GIL management.
-     */
-    (void)tasks;
-    (void)count;
-    return -1;  /* Not implemented - use Python spawn_batch() instead */
-}

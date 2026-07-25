@@ -194,34 +194,4 @@ int io_uring_connect(io_uring_t *ring, int fd, const struct sockaddr *addr, sock
     return 0;
 }
 
-int io_uring_poll_add(io_uring_t *ring, int fd, uint32_t poll_mask, uint64_t user_data) {
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    if (!sqe) return -1;
-    
-    sqe->opcode = IORING_OP_POLL_ADD;
-    sqe->fd = fd;
-    sqe->poll_events = poll_mask;
-    sqe->user_data = user_data;
-    return 0;
-}
-
-int io_uring_nop(io_uring_t *ring, uint64_t user_data) {
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    if (!sqe) return -1;
-    
-    sqe->opcode = IORING_OP_NOP;
-    sqe->user_data = user_data;
-    return 0;
-}
-
-int io_uring_cancel(io_uring_t *ring, uint64_t user_data, uint64_t user_data2) {
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    if (!sqe) return -1;
-    
-    sqe->opcode = IORING_OP_ASYNC_CANCEL;
-    sqe->addr = user_data;
-    sqe->user_data = user_data2;
-    return 0;
-}
-
 #endif

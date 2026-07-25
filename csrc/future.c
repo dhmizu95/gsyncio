@@ -164,24 +164,6 @@ void* future_result(future_t* f) {
     return result;
 }
 
-int future_result_nowait(future_t* f, void** out_result) {
-    if (!f || !out_result) {
-        return -1;
-    }
-    
-    pthread_mutex_lock(&f->mutex);
-    
-    if (f->state == FUTURE_PENDING) {
-        pthread_mutex_unlock(&f->mutex);
-        return -1;  /* Still pending */
-    }
-    
-    *out_result = f->result;
-    pthread_mutex_unlock(&f->mutex);
-    
-    return 0;
-}
-
 int future_set_exception(future_t* f, void* exc) {
     if (!f) {
         return -1;
@@ -232,41 +214,6 @@ void* future_exception(future_t* f) {
     pthread_mutex_unlock(&f->mutex);
     
     return exc;
-}
-
-int future_add_callback(future_t* f, future_callback_t callback, void* user_data) {
-    if (!f || !callback) {
-        return -1;
-    }
-    
-    pthread_mutex_lock(&f->mutex);
-    
-    /* If already done, invoke callback immediately */
-    if (f->state != FUTURE_PENDING) {
-        pthread_mutex_unlock(&f->mutex);
-        callback(f, user_data);
-        return 0;
-    }
-    
-    /* Grow callback array if needed */
-    if (f->callback_count >= f->callback_capacity) {
-        size_t new_capacity = f->callback_capacity == 0 ? 4 : f->callback_capacity * 2;
-        void** new_callbacks = (void**)realloc(f->callbacks, new_capacity * sizeof(void*));
-        if (!new_callbacks) {
-            pthread_mutex_unlock(&f->mutex);
-            return -1;
-        }
-        f->callbacks = new_callbacks;
-        f->callback_capacity = new_capacity;
-    }
-    
-    /* Store callback and user_data together */
-    /* For simplicity, we just store the callback - user_data would need a struct */
-    f->callbacks[f->callback_count++] = (void*)callback;
-    
-    pthread_mutex_unlock(&f->mutex);
-    
-    return 0;
 }
 
 void future_wait(future_t* f) {

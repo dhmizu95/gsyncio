@@ -126,36 +126,7 @@ static channel_item_t* channel_dequeue(channel_t* ch) {
 }
 
 /* Internal: wake up a waiting sender */
-static void channel_wake_sender(channel_t* ch, void* value) {
-    fiber_t* waiter = ch->send_waiters;
-    if (!waiter) {
-        return;
-    }
-    
-    /* Remove from waiters list */
-    ch->send_waiters = waiter->next_ready;
-    
-    /* Set result and resume */
-    waiter->result = NULL;  /* Send succeeded */
-    fiber_unpark(waiter);
-}
-
 /* Internal: wake up a waiting receiver */
-static void* channel_wake_receiver(channel_t* ch) {
-    fiber_t* waiter = ch->recv_waiters;
-    if (!waiter) {
-        return NULL;
-    }
-    
-    /* Remove from waiters list */
-    ch->recv_waiters = waiter->next_ready;
-    
-    /* Resume fiber */
-    fiber_unpark(waiter);
-    
-    return waiter->result;
-}
-
 int channel_send(channel_t* ch, void* value) {
     if (!ch || ch->closed) {
         return -1;

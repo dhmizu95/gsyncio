@@ -131,13 +131,6 @@ fiber_t* fiber_create(void (*func)(void*), void* arg, size_t stack_size);
 void fiber_free(fiber_t* fiber);
 
 /**
- * Start executing a fiber
- * @param fiber Fiber to start
- * @return 0 on success, -1 on failure
- */
-int fiber_start(fiber_t* fiber);
-
-/**
  * Yield execution to scheduler
  */
 void fiber_yield(void);
@@ -190,13 +183,6 @@ uint64_t fiber_id(fiber_t* fiber);
  * @return Current state
  */
 fiber_state_t fiber_state(fiber_t* fiber);
-
-/**
- * Get fiber by ID
- * @param id Fiber ID
- * @return Fiber, or NULL if not found
- */
-fiber_t* fiber_get_by_id(uint64_t id);
 
 /* ============================================ */
 /* Fiber Parking (for async I/O)               */

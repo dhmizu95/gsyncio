@@ -109,7 +109,6 @@ int worker_manager_check_scale(worker_manager_t* manager, size_t current_queue_d
  * @param target_workers Target number of workers
  * @return 0 on success, -1 on failure
  */
-int worker_manager_scale_to(worker_manager_t* manager, size_t target_workers);
 
 /**
  * Get recommended worker count based on workload
@@ -126,19 +125,16 @@ size_t worker_manager_get_recommended_workers(worker_manager_t* manager);
  * Record task spawn event
  * @param manager Manager
  */
-void worker_manager_record_spawn(worker_manager_t* manager);
 
 /**
  * Record task completion event
  * @param manager Manager
  */
-void worker_manager_record_completion(worker_manager_t* manager);
 
 /**
  * Record work steal event
  * @param manager Manager
  */
-void worker_manager_record_steal(worker_manager_t* manager);
 
 /**
  * Record worker idle time
@@ -146,7 +142,6 @@ void worker_manager_record_steal(worker_manager_t* manager);
  * @param worker_id Worker ID
  * @param idle_time_ms Idle time in milliseconds
  */
-void worker_manager_record_idle(worker_manager_t* manager, size_t worker_id, uint64_t idle_time_ms);
 
 /**
  * Record worker busy time
@@ -154,7 +149,6 @@ void worker_manager_record_idle(worker_manager_t* manager, size_t worker_id, uin
  * @param worker_id Worker ID
  * @param busy_time_ms Busy time in milliseconds
  */
-void worker_manager_record_busy(worker_manager_t* manager, size_t worker_id, uint64_t busy_time_ms);
 
 /**
  * Get utilization percentage (0-100)

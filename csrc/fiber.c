@@ -305,21 +305,6 @@ void fiber_set_current(fiber_t* f) {
     g_current_fiber = f;
 }
 
-int fiber_start(fiber_t* fiber) {
-    if (!fiber || fiber->state != FIBER_NEW) {
-        return -1;
-    }
-    
-    fiber->state = FIBER_READY;
-    
-    /* Add to scheduler */
-    if (g_scheduler) {
-        scheduler_schedule(fiber, -1);
-    }
-    
-    return 0;
-}
-
 void fiber_yield(void) {
     fiber_t* current = g_current_fiber;
     if (!current) {
@@ -399,25 +384,3 @@ bool fiber_is_parked(fiber_t* fiber) {
     return fiber->state == FIBER_WAITING;
 }
 
-fiber_t* fiber_get_by_id(uint64_t id) {
-    if (!g_fiber_table_capacity) return NULL;
-    
-    pthread_mutex_lock(&g_fiber_table_mutex);
-    
-    uint64_t h = hash_id(id);
-    size_t idx = h % g_fiber_table_capacity;
-    size_t start_idx = idx;
-    
-    while (g_fiber_table[idx]) {
-        if (g_fiber_table[idx] != (fiber_t*)-1 && g_fiber_table[idx]->id == id) {
-            fiber_t* f = g_fiber_table[idx];
-            pthread_mutex_unlock(&g_fiber_table_mutex);
-            return f;
-        }
-        idx = (idx + 1) % g_fiber_table_capacity;
-        if (idx == start_idx) break;
-    }
-    
-    pthread_mutex_unlock(&g_fiber_table_mutex);
-    return NULL;
-}

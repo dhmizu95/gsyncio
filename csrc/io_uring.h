@@ -38,9 +38,6 @@ int io_uring_read(io_uring_t *ring, int fd, void *buf, uint64_t nbytes, uint64_t
 int io_uring_write(io_uring_t *ring, int fd, const void *buf, uint64_t nbytes, uint64_t offset, uint64_t user_data);
 int io_uring_accept(io_uring_t *ring, int fd, struct sockaddr *addr, socklen_t *addrlen, uint64_t user_data);
 int io_uring_connect(io_uring_t *ring, int fd, const struct sockaddr *addr, socklen_t addrlen, uint64_t user_data);
-int io_uring_poll_add(io_uring_t *ring, int fd, uint32_t poll_mask, uint64_t user_data);
-int io_uring_nop(io_uring_t *ring, uint64_t user_data);
-int io_uring_cancel(io_uring_t *ring, uint64_t user_data, uint64_t user_data2);
 
 #define IOURING_READ  1
 #define IOURING_WRITE 2

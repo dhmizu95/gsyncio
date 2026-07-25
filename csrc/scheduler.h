@@ -321,10 +321,6 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data);
 void scheduler_schedule(fiber_t* f, int worker_id);
 
 /* Batch scheduling APIs */
-spawn_batch_t* scheduler_create_spawn_batch(size_t initial_capacity);
-void scheduler_destroy_spawn_batch(spawn_batch_t* batch);
-int scheduler_spawn_batch_add(spawn_batch_t* batch, void (*entry)(void*), void* user_data);
-void scheduler_spawn_batch_submit(spawn_batch_t* batch);
 
 void scheduler_block(void* reason);
 void scheduler_unblock(fiber_t* f);
@@ -339,21 +335,14 @@ size_t scheduler_num_workers(void);
 void scheduler_run(void);
 void scheduler_stop(void);
 
-void scheduler_set_backend(scheduler_backend_t backend);
-scheduler_backend_t scheduler_get_backend(void);
 
-int scheduler_submit_io(io_request_t *req);
 int scheduler_wait_io(int fd, uint32_t events, int64_t timeout_ns);
 void scheduler_wake_io(int fd, uint32_t events);
 
-int scheduler_add_timer(uint64_t deadline_ns, fiber_t *fiber);
-void scheduler_cancel_timer(fiber_t *fiber);
 
 /* Native sleep - sleep for specified nanoseconds without asyncio */
 void scheduler_sleep_ns(uint64_t ns);
 
-int scheduler_register_fd(int fd, fiber_t *fiber, uint32_t events);
-void scheduler_unregister_fd(int fd);
 
 /* Worker management functions */
 void scheduler_check_worker_scaling(void);
@@ -369,7 +358,6 @@ typedef struct {
     uint64_t fiber_id;
 } python_task_t;
 
-int scheduler_spawn_batch_python(python_task_t* tasks, size_t count);
 
 #ifdef __cplusplus
 }

@@ -312,7 +312,6 @@ cdef extern from "task.h":
     size_t task_completed_count(task_registry_t* reg) nogil
     task_registry_t* task_get_registry() nogil
     void task_set_registry(task_registry_t* reg) nogil
-    void task_reset_registry(task_registry_t* reg) nogil
 
     # Batch operations
     task_batch_t* task_batch_create(size_t capacity) nogil
@@ -578,19 +577,6 @@ cdef class SelectState:
         if self._sel:
             select_set_default(self._sel, index)
 
-    def try_select(self):
-        """Try select without blocking"""
-        if not self._sel:
-            return None
-        cdef select_result_t result = select_try(self._sel)
-        if result.success:
-            return {
-                'case_index': result.case_index,
-                'value': <object>result.value if result.value else None,
-                'success': True
-            }
-        return None
-
     def execute(self):
         """Execute select (blocks until a case is ready)"""
         if not self._sel:
@@ -665,10 +651,6 @@ cdef class TaskRegistry:
         """Wait for all tasks with timeout"""
         cdef uint64_t timeout_ns = <uint64_t>(timeout_s * 1000000000)
         return task_sync_timeout(self._reg, timeout_ns) == 0
-
-    def reset(self):
-        """Reset registry state for reuse"""
-        task_reset_registry(self._reg)
 
     @property
     def active_count(self):
@@ -1320,10 +1302,6 @@ def c_task_shutdown():
     """Shutdown C task system"""
     c_tasks_shutdown()
 
-def c_task_register_py(name, func_ptr):
-    """Register a C task function (for internal use)"""
-    return c_task_register(name, <void*>func_ptr)
-
 def c_task_lookup_py(name):
     """Lookup C task by name"""
     cdef bytes name_bytes = name.encode('utf-8') if isinstance(name, str) else name
@@ -1346,36 +1324,6 @@ def c_task_spawn_sum_squares(int n):
 def c_task_spawn_count_primes(int n):
     """Spawn count_primes C task - GIL-free!"""
     return c_task_spawn_int(c_task_lookup(b"count_primes"), n)
-
-def c_task_spawn_batch_sum_squares(values):
-    """Batch-spawn sum_squares C tasks - GIL released for the whole batch.
-
-    Combines spawn()'s low per-task spawn overhead (the task
-    is looked up once, not once per call) with c_task's GIL-free
-    execution, for the best of both spawn rate and sync() time.
-    """
-    cdef int task_id = c_task_lookup(b"sum_squares")
-    if task_id < 0:
-        raise RuntimeError("sum_squares task not registered")
-
-    cdef size_t count = len(values)
-    if count == 0:
-        return 0
-
-    cdef int* carr = <int*>malloc(count * sizeof(int))
-    if not carr:
-        raise MemoryError("Failed to allocate argument buffer")
-
-    cdef size_t i
-    for i in range(count):
-        carr[i] = values[i]
-
-    cdef size_t spawned
-    with nogil:
-        spawned = c_task_spawn_batch_int(task_id, carr, count)
-
-    free(carr)
-    return spawned
 
 def c_task_get_stats_py():
     """Get C task statistics"""

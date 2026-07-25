@@ -108,8 +108,6 @@ ssize_t gsocket_send(gsocket_t *sock, const void *buf, size_t len);
 
 int gsocket_close(gsocket_t *sock);
 
-int gsocket_getpeername(gsocket_t *sock, struct sockaddr *addr, socklen_t *addrlen);
-int gsocket_getsockname(gsocket_t *sock, struct sockaddr *addr, socklen_t *addrlen);
 
 int gsocket_async_connect(gsocket_t *sock, const char *host, uint16_t port);
 gsocket_t* gsocket_async_accept(gsocket_t *server_sock);

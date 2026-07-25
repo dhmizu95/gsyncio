@@ -106,23 +106,16 @@ struct evloop_s {
 };
 
 int evloop_init(evloop_t *loop, int worker_count);
-void evloop_destroy(evloop_t *loop);
 
-int evloop_add_io(evloop_t *loop, int fd, uint32_t events, evloop_io_callback_t callback, void *arg);
 void evloop_remove_io(evloop_t *loop, int fd);
 
 int evloop_add_timer(evloop_t *loop, evloop_timer_t *timer, uint64_t interval_ns, 
                     evloop_timer_type_t type, evloop_timer_callback_t callback, void *arg);
-void evloop_remove_timer(evloop_t *loop, evloop_timer_t *timer);
 
-int evloop_run(evloop_t *loop);
-void evloop_stop(evloop_t *loop);
 
 uint64_t evloop_now_ns(void);
 void evloop_update_time(evloop_t *loop);
 
-int evloop_register_fd(evloop_t *loop, int fd, uint64_t user_data);
-int evloop_unregister_fd(evloop_t *loop, int fd);
 
 int evloop_read_async(evloop_t *loop, int fd, void *buf, size_t len, uint64_t offset,
                       evloop_io_completion_t completion, void *arg);
@@ -133,10 +126,6 @@ int evloop_accept_async(evloop_t *loop, int fd, struct sockaddr *addr, socklen_t
 int evloop_connect_async(evloop_t *loop, int fd, const struct sockaddr *addr, socklen_t addrlen,
                          evloop_io_completion_t completion, void *arg);
 
-int evloop_wait_io(evloop_t *loop, int fd, uint32_t events);
-void evloop_wake_io(evloop_t *loop, int fd, uint32_t events);
 
-void evloop_set_backend(evloop_t *loop, evloop_backend_t backend);
-evloop_backend_t evloop_get_backend(evloop_t *loop);
 
 #endif

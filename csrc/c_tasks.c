@@ -253,17 +253,6 @@ uint64_t c_task_spawn_int(int task_id, int value) {
     return c_task_spawn(task_id, arg);
 }
 
-uint64_t c_task_spawn_int_int(int task_id, int arg1, int arg2) {
-    /* Pack two integers */
-    int* args = (int*)malloc(2 * sizeof(int));
-    if (!args) {
-        return 0;
-    }
-    args[0] = arg1;
-    args[1] = arg2;
-    return c_task_spawn(task_id, args);
-}
-
 size_t c_task_spawn_batch_int(int task_id, const int* values, size_t count) {
     if (task_id < 0 || task_id >= (int)g_c_task_registry.count || !values || count == 0) {
         return 0;

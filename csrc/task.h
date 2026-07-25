@@ -165,12 +165,6 @@ task_registry_t* task_get_registry(void);
  */
 void task_set_registry(task_registry_t* reg);
 
-/**
- * Reset task registry state (for reuse)
- * @param reg Task registry
- */
-void task_reset_registry(task_registry_t* reg);
-
 #ifdef __cplusplus
 }
 #endif

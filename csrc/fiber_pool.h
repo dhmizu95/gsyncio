@@ -112,8 +112,6 @@ void fiber_pool_free(fiber_pool_t* pool, fiber_t* fiber);
 /* Statistics                                  */
 /* ============================================ */
 
-size_t fiber_pool_available(fiber_pool_t* pool);
-size_t fiber_pool_allocated(fiber_pool_t* pool);
 size_t fiber_pool_capacity(fiber_pool_t* pool);
 
 /**
@@ -121,7 +119,6 @@ size_t fiber_pool_capacity(fiber_pool_t* pool);
  * @param pool Pool to verify
  * @return 1 if consistent, 0 if inconsistent (debug only)
  */
-int fiber_pool_verify_counters(fiber_pool_t* pool);
 
 #ifdef __cplusplus
 }

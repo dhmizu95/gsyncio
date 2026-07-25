@@ -420,14 +420,4 @@ void task_set_registry(task_registry_t* reg) {
     g_task_registry = reg;
 }
 
-void task_reset_registry(task_registry_t* reg) {
-    if (!reg) {
-        return;
-    }
-
-    atomic_store(&reg->active_count, 0);
-    atomic_store(&reg->completion_count, 0);
-    atomic_store(&reg->task_count, 0);
-    reg->all_done = 0;
-}
 

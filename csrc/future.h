@@ -110,7 +110,6 @@ void* future_result(future_t* f);
  * @param out_result Output for result
  * @return 0 if ready, -1 if still pending
  */
-int future_result_nowait(future_t* f, void** out_result);
 
 /**
  * Set future exception
@@ -134,7 +133,6 @@ void* future_exception(future_t* f);
  * @param user_data User data for callback
  * @return 0 on success, -1 on error
  */
-int future_add_callback(future_t* f, future_callback_t callback, void* user_data);
 
 /**
  * Wait for future to complete

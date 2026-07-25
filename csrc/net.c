@@ -29,10 +29,6 @@ void net_shutdown(void) {
     g_net_initialized = 0;
 }
 
-void net_set_evloop(evloop_t *loop) {
-    g_evloop = loop;
-}
-
 static int set_nonblocking(int fd, bool nonblocking) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) {
@@ -318,20 +314,6 @@ int gsocket_close(gsocket_t *sock) {
     
     sock->state = SOCKET_STATE_CLOSED;
     return 0;
-}
-
-int gsocket_getpeername(gsocket_t *sock, struct sockaddr *addr, socklen_t *addrlen) {
-    if (!sock || sock->fd < 0) {
-        return -1;
-    }
-    return getpeername(sock->fd, addr, addrlen);
-}
-
-int gsocket_getsockname(gsocket_t *sock, struct sockaddr *addr, socklen_t *addrlen) {
-    if (!sock || sock->fd < 0) {
-        return -1;
-    }
-    return getsockname(sock->fd, addr, addrlen);
 }
 
 int gsocket_async_connect(gsocket_t *sock, const char *host, uint16_t port) {
