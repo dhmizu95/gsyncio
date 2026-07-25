@@ -24,7 +24,7 @@ extern "C" {
 #define FIBER_INITIAL_STACK_SIZE 2048   /* 2KB initial stack */
 #define FIBER_MAX_STACK_SIZE 65536      /* 64KB max stack */
 #define FIBER_STACK_GROW_STEP 4096      /* Grow by 4KB */
-#define FIBER_DEFAULT_STACK_SIZE 8192   /* 8KB default - safer for Python 3.12 */
+#define FIBER_DEFAULT_STACK_SIZE 4096   /* 4KB default. ponytail: no guard pages/growth in this build, so real (non-noop) task bodies can silently corrupt memory past this size - see plans/CRASH_FIX_PROGRESS.md. Bump back to 8192 if crashes reappear. */
 #define FIBER_USE_GUARD_PAGES 0         /* Disable guard pages to reach 1M+ system limit */
 #define FIBER_POOL_LAZY_ALLOC 1         /* Lazy stack allocation for memory efficiency */
 
