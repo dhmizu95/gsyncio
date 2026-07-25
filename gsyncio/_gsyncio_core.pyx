@@ -728,6 +728,25 @@ cdef void _c_fiber_entry(void* arg) noexcept nogil:
                 del payload
 
 
+cdef void _c_fiber_entry_chunk(void* arg) noexcept nogil:
+    """C callback for a CHUNK of (func, args) tasks - one GIL acquisition
+    for the whole chunk instead of one per task. A single task raising
+    doesn't stop the rest of the chunk from running (same isolation as
+    giving each task its own fiber).
+    """
+    if arg != NULL:
+        with gil:
+            chunk = <object>arg
+            Py_DECREF(chunk) # Balanced INCREF from spawn
+            for func, args in chunk:
+                try:
+                    func(*args)
+                except:
+                    import sys
+                    print(f"Fiber exception: {sys.exc_info()[1]}", file=sys.stderr)
+            del chunk
+
+
 # ============================================
 # Module-level functions
 # ============================================
@@ -970,19 +989,37 @@ def spawn_batch_fast(funcs_and_args):
     For maximum performance when you know all spawns will succeed.
     Does not return fiber IDs (saves allocation overhead).
 
+    Tasks are spawned in chunks rather than one fiber per task: each
+    fiber's entry point (_c_fiber_entry_chunk) acquires the GIL ONCE and
+    runs every task in its chunk before releasing it, instead of paying
+    one PyGILState_Ensure/Release pair per task. Chunk size targets ~8
+    chunks per worker, enough fibers for the work-stealing scheduler to
+    balance load without going back to one-fiber-per-task GIL overhead.
+
     Args:
         funcs_and_args: List of (func, args) tuples
     """
     if g_scheduler == NULL:
         init_scheduler(num_workers=4)
 
-    cdef object payload
+    cdef size_t count = len(funcs_and_args)
+    if count == 0:
+        return
 
-    # Spawn all tasks without error checking or return values
-    for func, args in funcs_and_args:
-        payload = _get_payload(func, args)
-        Py_INCREF(payload)
-        scheduler_spawn(_c_fiber_entry, <void*>payload)
+    cdef size_t workers = num_workers()
+    if workers == 0:
+        workers = 1
+    cdef size_t chunk_size = count // (workers * 8)
+    if chunk_size < 1:
+        chunk_size = 1
+
+    cdef object chunk
+    cdef size_t i = 0
+    while i < count:
+        chunk = list(funcs_and_args[i:i + chunk_size])
+        Py_INCREF(chunk)
+        scheduler_spawn(_c_fiber_entry_chunk, <void*>chunk)
+        i += chunk_size
 
 
 def spawn_batch_ultra_fast(funcs_and_args, int store_fiber_ids=0):

@@ -191,4 +191,39 @@ trailing `sync()` (0/100 and 3/100 respectively, identical for both
 lock types), 15x the item #1/#2 repro scripts (all synced) clean, a
 `gdb` pass.
 
-#4-#5 not started.
+**#4 (batched GIL acquisition) - done.**
+
+Implemented in `gsyncio/_gsyncio_core.pyx`: added `_c_fiber_entry_chunk`,
+a fiber entry point that takes a LIST of (func, args) tuples instead of
+a single one, acquires the GIL ONCE, and loops through every task in
+its chunk before releasing it (still isolating exceptions per-task, so
+one raising task doesn't stop the rest of its chunk). `spawn_batch_fast`
+now chunks its input (~8 chunks per worker, so `chunk_size = count //
+(num_workers * 8)`, minimum 1) and spawns one fiber per chunk instead
+of one fiber per task.
+
+This is a change in parallelism granularity, not just a constant-factor
+speedup: instead of N independently-scheduled fibers, there are now
+~`8 * num_workers` fibers, each running a slice of tasks back-to-back
+under one GIL hold. Verified this doesn't silently drop or duplicate
+work (a script that recorded exactly-once execution across n = 0, 1, 5,
+100, 1000, 12345, 100000, including an exception-isolation check with a
+raising task mixed into a batch - all passed). The trade-off: a worker
+now holds the GIL for an entire chunk's worth of Python calls at once,
+so less fine-grained interleaving with other Python-level work compared
+to one-fiber-per-task. Fine for cheap/uniform tasks (the common case for
+this API); something to keep in mind if a batch mixes cheap tasks with
+occasional expensive/blocking ones.
+
+Result: n=100k, `spawn_batch_fast` (no-op tasks) went from ~33-43k/s
+to **~11,700-11,900k/s** (~280x). Spawn phase alone dropped from
+~83-149ms to ~1.1ms since only ~96 fibers get created instead of
+100,000.
+
+Verified: 33/33 pytest suite, a dedicated correctness script (exactly-
+once execution + exception isolation, described above), 30x repeated
+runs of a dedicated chunked-batch stress script (0 failures), a `gdb`
+pass, plus the full existing #1/#2/#3 repro-script regression suite
+(15x, all synced properly, 0 failures).
+
+#5 not started.
