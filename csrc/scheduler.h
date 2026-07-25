@@ -8,11 +8,20 @@
 #ifndef SCHEDULER_H
 #define SCHEDULER_H
 
+/* pthread_spinlock_t is a POSIX optional (glibc needs _GNU_SOURCE or
+ * _XOPEN_SOURCE>=600) - define before <pthread.h> so this header is safe
+ * for any .c file to include first, regardless of its own feature macros
+ * (see fiber_pool.h, which needs the same thing for the same reason). */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "fiber.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdatomic.h>
+#include <pthread.h>
 #include <sys/socket.h>
 
 #ifdef __linux__
@@ -122,6 +131,7 @@ typedef struct deque {
     size_t capacity;
     size_t top;
     size_t bottom;
+    pthread_spinlock_t resize_lock;  /* guards data/capacity across a grow() */
 } deque_t;
 
 typedef struct worker {

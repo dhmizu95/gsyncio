@@ -292,6 +292,7 @@ static int deque_init(deque_t* dq, size_t capacity) {
     dq->capacity = capacity;
     dq->top = 0;
     dq->bottom = 0;
+    pthread_spin_init(&dq->resize_lock, PTHREAD_PROCESS_PRIVATE);
     return 0;
 }
 
@@ -301,28 +302,42 @@ static void push_top(deque_t* dq, fiber_t* f) {
 
     /* Check if we need to resize */
     if (b - t >= dq->capacity) {
-        size_t new_capacity = dq->capacity * 2;
-        /* CRITICAL: deque resize must be thread-safe as thieves read dq->data */
-        /* For now, we take the global scheduler lock to safely resize */
-        if (g_scheduler) pthread_mutex_lock(&g_scheduler->mutex);
-        
-        fiber_t** new_data = (fiber_t**)realloc(dq->data, new_capacity * sizeof(fiber_t*));
+        size_t old_capacity = dq->capacity;
+        size_t new_capacity = old_capacity * 2;
+
+        /* dq->data/dq->capacity are read by pop_top()/steal_bottom() on
+         * other threads without any lock of their own - this spinlock is
+         * the only thing making a resize safe against them (they take it
+         * too, see below). A plain realloc() is not enough on its own:
+         * the buffer is a circular ring indexed by (i & (capacity-1)), so
+         * if the live [t, b) window has wrapped around the end of the
+         * old array, growing the mask reshuffles which slot each index
+         * maps to. Elements have to be copied out in logical order into
+         * the new array under the *new* mask, not just byte-copied. */
+        pthread_spin_lock(&dq->resize_lock);
+
+        fiber_t** new_data = (fiber_t**)calloc(new_capacity, sizeof(fiber_t*));
         if (!new_data) {
-            if (g_scheduler) pthread_mutex_unlock(&g_scheduler->mutex);
+            pthread_spin_unlock(&dq->resize_lock);
             return;
         }
+        for (size_t i = t; i < b; i++) {
+            new_data[i & (new_capacity - 1)] = dq->data[i & (old_capacity - 1)];
+        }
+        fiber_t** old_data = dq->data;
         dq->data = new_data;
         dq->capacity = new_capacity;
-        
-        if (g_scheduler) pthread_mutex_unlock(&g_scheduler->mutex);
+
+        pthread_spin_unlock(&dq->resize_lock);
+        free(old_data);
     }
 
     /* Store fiber FIRST (before updating bottom) */
     dq->data[b & (dq->capacity - 1)] = f;
-    
+
     /* Full memory barrier to ensure store is visible before bottom update */
     atomic_thread_fence(memory_order_seq_cst);
-    
+
     /* Now increment bottom */
     atomic_store_explicit(&dq->bottom, b + 1, memory_order_release);
 }
@@ -337,7 +352,15 @@ static fiber_t* pop_top(deque_t* dq) {
         return NULL;  /* Empty */
     }
 
+    /* Snapshot data/capacity under the same lock push_top()'s resize uses -
+     * push_top() may be growing the ring on another thread right now (the
+     * push side runs on whichever thread called gs.task()/scheduler_spawn,
+     * not necessarily this deque's own worker thread), and dq->data is a
+     * plain pointer with no atomicity of its own. Uncontended in the
+     * overwhelmingly common case (no resize in flight). */
+    pthread_spin_lock(&dq->resize_lock);
     fiber_t* f = dq->data[t & (dq->capacity - 1)];
+    pthread_spin_unlock(&dq->resize_lock);
 
     /* CAS to claim this slot: a concurrent steal_bottom() (or another
      * owner-side pop) may be racing for the same element. Without this,
@@ -360,7 +383,10 @@ static fiber_t* steal_bottom(deque_t* dq) {
         return NULL;  /* Empty */
     }
 
+    /* See pop_top() - same resize race applies to thieves. */
+    pthread_spin_lock(&dq->resize_lock);
     fiber_t* f = dq->data[t & (dq->capacity - 1)];
+    pthread_spin_unlock(&dq->resize_lock);
 
     /* Same CAS as pop_top() - see comment there. */
     if (!atomic_compare_exchange_strong_explicit(&dq->top, &t, t + 1,

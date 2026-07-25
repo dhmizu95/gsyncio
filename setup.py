@@ -66,6 +66,7 @@ C_SOURCES = [
 CFLAGS = [
     '-O3',
     '-std=c11',
+    '-D_GNU_SOURCE',  # pthread_spinlock_t etc. - some .c files pull in <pthread.h> before any local header can define this
     '-pthread',
     '-fPIC',
     '-Wall',
