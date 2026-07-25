@@ -507,6 +507,7 @@ void scheduler_sleep_ns(uint64_t ns) {
      * make progress on the scheduler's other worker threads.
      */
     (void)current;
+    scheduler_note_blocking_wait_begin();
     uint64_t deadline = get_time_ns() + ns;
     for (;;) {
         uint64_t now = get_time_ns();
@@ -519,6 +520,7 @@ void scheduler_sleep_ns(uint64_t ns) {
         req.tv_nsec = (long)(remaining % 1000000000ULL);
         nanosleep(&req, NULL);
     }
+    scheduler_note_blocking_wait_end();
 }
 
 static void* worker_thread(void* arg) {
@@ -817,11 +819,21 @@ int scheduler_init(scheduler_config_t* config) {
     sched->num_workers = sched->config.num_workers;
     sched->backend = sched->config.backend;
 
-    sched->workers = (worker_t*)calloc(sched->num_workers, sizeof(worker_t));
+    /* Pre-allocate headroom for dynamic growth (see
+     * scheduler_note_blocking_wait_begin()) so growth never has to
+     * realloc `workers` - existing worker threads hold raw pointers
+     * into this array (passed to pthread_create, tracked elsewhere),
+     * and a realloc that moves the array would invalidate those
+     * mid-flight. Only `num_workers` of these slots are actually
+     * started below; the rest are zeroed and inert until grown into. */
+    sched->workers_capacity = sched->num_workers * 16;
+    sched->workers = (worker_t*)calloc(sched->workers_capacity, sizeof(worker_t));
     if (!sched->workers) {
         free(sched);
         return -1;
     }
+    pthread_mutex_init(&sched->growth_mutex, NULL);
+    atomic_store(&sched->blocked_workers, 0);
 
     for (size_t i = 0; i < sched->num_workers; i++) {
         worker_t* w = &sched->workers[i];
@@ -946,6 +958,85 @@ int scheduler_init(scheduler_config_t* config) {
     return 0;
 }
 
+/* Assumes sched->growth_mutex is held. Starts one more worker thread in
+ * the next unused pre-allocated slot, or does nothing if already at
+ * workers_capacity (accepting the small residual risk of exhaustion at
+ * extreme nesting depths rather than growing without bound). */
+static void scheduler_grow_workers_locked(scheduler_t* sched) {
+    if (sched->num_workers >= sched->workers_capacity) {
+        return;
+    }
+
+    size_t i = sched->num_workers;
+    worker_t* w = &sched->workers[i];
+    w->id = (int)i;
+    atomic_store(&w->running, false);
+    atomic_store(&w->started, false);
+    atomic_store(&w->stopped, false);
+    w->current_fiber = NULL;
+    w->tasks_executed = 0;
+    w->steals_attempted = 0;
+    w->steals_successful = 0;
+
+    w->deque = (deque_t*)calloc(1, sizeof(deque_t));
+    if (!w->deque) {
+        return;  /* Couldn't grow - caller proceeds without the extra worker */
+    }
+    if (deque_init(w->deque, 65536) != 0) {
+        free(w->deque);
+        w->deque = NULL;
+        return;
+    }
+
+    atomic_store(&w->running, true);
+    if (pthread_create(&w->thread, NULL, worker_thread, w) != 0) {
+        atomic_store(&w->running, false);
+        free(w->deque->data);
+        free(w->deque);
+        w->deque = NULL;
+        return;
+    }
+
+#ifdef __linux__
+    size_t num_cpus = get_num_cpus();
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(i % num_cpus, &cpuset);
+    pthread_setaffinity_np(w->thread, sizeof(cpuset), &cpuset);
+#endif
+
+    /* Publish last: readers iterating 0..num_workers must never see this
+     * slot before it's fully initialized and its thread is live. */
+    sched->num_workers = i + 1;
+    DEBUG_LOG("Grew worker pool to %zu workers (blocked-wait pressure)", sched->num_workers);
+}
+
+void scheduler_note_blocking_wait_begin(void) {
+    scheduler_t* sched = g_scheduler;
+    if (!sched || !fiber_current()) {
+        return;  /* Only worker threads occupy a pool slot */
+    }
+
+    size_t blocked = atomic_fetch_add(&sched->blocked_workers, 1) + 1;
+    if (blocked >= sched->num_workers) {
+        pthread_mutex_lock(&sched->growth_mutex);
+        /* Re-check under the lock: another thread may have already grown
+         * the pool between our check above and acquiring this lock. */
+        if (atomic_load(&sched->blocked_workers) >= sched->num_workers) {
+            scheduler_grow_workers_locked(sched);
+        }
+        pthread_mutex_unlock(&sched->growth_mutex);
+    }
+}
+
+void scheduler_note_blocking_wait_end(void) {
+    scheduler_t* sched = g_scheduler;
+    if (!sched || !fiber_current()) {
+        return;
+    }
+    atomic_fetch_sub(&sched->blocked_workers, 1);
+}
+
 void scheduler_shutdown(bool wait_for_completion) {
     scheduler_t* sched = g_scheduler;
     if (!sched || !sched->initialized) {
@@ -976,7 +1067,8 @@ void scheduler_shutdown(bool wait_for_completion) {
     
     pthread_mutex_destroy(&sched->mutex);
     pthread_cond_destroy(&sched->cond);
-    
+    pthread_mutex_destroy(&sched->growth_mutex);
+
     if (sched->fd_table) {
         free(sched->fd_table);
     }

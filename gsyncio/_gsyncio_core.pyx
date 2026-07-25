@@ -123,6 +123,8 @@ cdef extern from "scheduler.h":
     void scheduler_run() nogil
     void scheduler_stop() nogil
     void scheduler_sleep_ns(uint64_t ns) nogil
+    void scheduler_note_blocking_wait_begin() nogil
+    void scheduler_note_blocking_wait_end() nogil
 
     # Debug/Diagnostic functions
     int scheduler_workers_running() nogil
@@ -190,7 +192,7 @@ cdef extern from "future.h":
     void* future_result(future_t* f)
     int future_set_exception(future_t* f, void* exc)
     void* future_exception(future_t* f)
-    void future_wait(future_t* f)
+    void future_wait(future_t* f) nogil
     void future_await(future_t* f)
 
 # ============================================
@@ -358,7 +360,25 @@ cdef class Future:
     def result(self, timeout=None):
         """Get the result of the future"""
         if not future_is_done(self._future):
+            # scheduler_note_blocking_wait_begin()/_end() bracket the
+            # actual block so the scheduler can grow the worker pool if
+            # every worker looks like it might end up blocked at once
+            # (prevents the nested create_task()+gather() deadlock -
+            # see plans/ - a task waiting on children can otherwise
+            # starve the pool of the very workers needed to run them).
+            #
+            # No `with nogil:` here: future_wait() -> future_result()
+            # already releases/reacquires the GIL internally around its
+            # own pthread_cond_wait (Py_BEGIN/END_ALLOW_THREADS in
+            # future.c) - wrapping the call in `with nogil:` too would
+            # release the GIL a second time before it's ever been
+            # reacquired, corrupting the interpreter (crashes inside
+            # PyEval_SaveThread - confirmed via gdb). begin()/end() are
+            # declared nogil (safe to call without the GIL), not
+            # *required* to run inside a nogil block.
+            scheduler_note_blocking_wait_begin()
             future_wait(self._future)
+            scheduler_note_blocking_wait_end()
 
         if future_has_exception(self._future):
             exc = <object>future_exception(self._future)
@@ -371,7 +391,9 @@ cdef class Future:
     def exception(self, timeout=None):
         """Get the exception of the future"""
         if not future_is_done(self._future):
+            scheduler_note_blocking_wait_begin()
             future_wait(self._future)
+            scheduler_note_blocking_wait_end()
 
         return <object>future_exception(self._future)
 

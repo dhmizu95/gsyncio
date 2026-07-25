@@ -234,6 +234,18 @@ uint64_t scheduler_sharded_get_task_count(void);
 /* Get current worker ID (thread-local) */
 uint32_t scheduler_get_current_worker_id(void);
 
+/* Dynamic worker growth: call around any real blocking wait performed by
+ * a worker thread (future_wait, a long sleep). If every worker looks
+ * like it might end up blocked simultaneously, spawns one more worker
+ * OS thread so there's always someone free to make progress on other
+ * ready work - prevents thread-pool-exhaustion deadlocks from nested
+ * blocking (e.g. a task that awaits child tasks). Grow-only: workers
+ * added this way are never torn down, they just idle like any other
+ * worker once no longer needed. Safe to call from a non-worker thread
+ * (no-op) or when the scheduler isn't initialized (no-op). */
+void scheduler_note_blocking_wait_begin(void);
+void scheduler_note_blocking_wait_end(void);
+
 /* Debug/Diagnostic functions */
 bool scheduler_workers_running(void);
 size_t scheduler_total_queued_fibers(void);
@@ -241,7 +253,20 @@ void scheduler_print_debug_info(void);
 
 typedef struct scheduler {
     worker_t* workers;
-    size_t num_workers;
+    size_t num_workers;      /* Currently active workers - grows, never shrinks.
+                               * Plain size_t: only ever written under
+                               * growth_mutex, and readers seeing a
+                               * slightly-stale value is always safe since
+                               * growth only ever widens the valid range. */
+    size_t workers_capacity; /* Pre-allocated size of `workers` - growth
+                               * fills unused slots in place, never
+                               * reallocates (existing threads hold raw
+                               * pointers into this array). */
+    _Atomic size_t blocked_workers; /* Worker threads currently blocked in
+                                      * a real wait (future_wait, sleep) -
+                                      * used to detect pool exhaustion and
+                                      * trigger growth before it deadlocks. */
+    pthread_mutex_t growth_mutex;   /* Serializes concurrent growth attempts */
     _Atomic size_t next_worker;  /* Atomic round-robin worker selection */
 
     _Atomic(fiber_t*) ready_queue;
