@@ -16,14 +16,33 @@
 #include <time.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 /* ============================================ */
 /* Global State                                 */
 /* ============================================ */
 
 static c_task_registry_t g_c_task_registry;
-static c_task_stats_t g_c_task_stats;
-static pthread_mutex_t g_stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Stats are sharded per-worker (same pattern as the scheduler's sharded
+ * task/completion counters and the fiber pool's per-worker free lists):
+ * every task completion used to take one global mutex, which turned
+ * into real contention once spawning/pooling overhead was cut down by
+ * the other fixes here. Each shard is cache-line aligned to avoid false
+ * sharing between shards updated by different cores. */
+#define C_TASK_STATS_NUM_SHARDS 64
+
+typedef struct {
+    _Atomic uint64_t c_tasks_spawned;
+    _Atomic uint64_t c_tasks_completed;
+    _Atomic uint64_t c_task_time_ns;
+} __attribute__((aligned(64))) c_task_stats_shard_t;
+
+static c_task_stats_shard_t g_stats_shards[C_TASK_STATS_NUM_SHARDS];
+
+static inline c_task_stats_shard_t* current_stats_shard(void) {
+    return &g_stats_shards[scheduler_get_current_worker_id() % C_TASK_STATS_NUM_SHARDS];
+}
 
 /* ============================================ */
 /* Lifecycle                                    */
@@ -31,21 +50,20 @@ static pthread_mutex_t g_stats_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int c_tasks_init(void) {
     memset(&g_c_task_registry, 0, sizeof(g_c_task_registry));
-    memset(&g_c_task_stats, 0, sizeof(g_c_task_stats));
+    memset(&g_stats_shards, 0, sizeof(g_stats_shards));
     pthread_mutex_init(&g_c_task_registry.mutex, NULL);
-    
+
     /* Pre-register common C tasks */
     c_task_register("sum_squares", c_task_sum_squares);
     c_task_register("count_primes", c_task_count_primes);
     c_task_register("array_fill", c_task_array_fill);
     c_task_register("array_copy", c_task_array_copy);
-    
+
     return 0;
 }
 
 void c_tasks_shutdown(void) {
     pthread_mutex_destroy(&g_c_task_registry.mutex);
-    pthread_mutex_destroy(&g_stats_mutex);
 }
 
 /* ============================================ */
@@ -219,9 +237,7 @@ uint64_t c_task_spawn(int task_id, void* arg) {
     uint64_t fid = scheduler_spawn(c_task_wrapper, wrapper);
     
     if (fid > 0) {
-        pthread_mutex_lock(&g_stats_mutex);
-        g_c_task_stats.total_c_tasks_spawned++;
-        pthread_mutex_unlock(&g_stats_mutex);
+        atomic_fetch_add(&current_stats_shard()->c_tasks_spawned, 1);
     }
     
     return fid;
@@ -303,9 +319,7 @@ size_t c_task_spawn_batch_int(int task_id, const int* values, size_t count) {
     }
 
     if (spawned > 0) {
-        pthread_mutex_lock(&g_stats_mutex);
-        g_c_task_stats.total_c_tasks_spawned += spawned;
-        pthread_mutex_unlock(&g_stats_mutex);
+        atomic_fetch_add(&current_stats_shard()->c_tasks_spawned, spawned);
     }
 
     return spawned;
@@ -339,10 +353,9 @@ int c_task_sum_squares(void* arg) {
     uint64_t elapsed_ns = (end.tv_sec - start.tv_sec) * 1000000000ULL +
                           (end.tv_nsec - start.tv_nsec);
 
-    pthread_mutex_lock(&g_stats_mutex);
-    g_c_task_stats.total_c_task_time_ns += elapsed_ns;
-    g_c_task_stats.total_c_tasks_completed++;
-    pthread_mutex_unlock(&g_stats_mutex);
+    c_task_stats_shard_t* shard = current_stats_shard();
+    atomic_fetch_add(&shard->c_task_time_ns, elapsed_ns);
+    atomic_fetch_add(&shard->c_tasks_completed, 1);
 
     return (int)sum;
 }
@@ -378,10 +391,9 @@ int c_task_count_primes(void* arg) {
     uint64_t elapsed_ns = (end.tv_sec - start.tv_sec) * 1000000000ULL + 
                           (end.tv_nsec - start.tv_nsec);
     
-    pthread_mutex_lock(&g_stats_mutex);
-    g_c_task_stats.total_c_task_time_ns += elapsed_ns;
-    g_c_task_stats.total_c_tasks_completed++;
-    pthread_mutex_unlock(&g_stats_mutex);
+    c_task_stats_shard_t* shard = current_stats_shard();
+    atomic_fetch_add(&shard->c_task_time_ns, elapsed_ns);
+    atomic_fetch_add(&shard->c_tasks_completed, 1);
     
     return count;
 }
@@ -407,10 +419,9 @@ int c_task_array_fill(void* arg) {
     uint64_t elapsed_ns = (end.tv_sec - start.tv_sec) * 1000000000ULL + 
                           (end.tv_nsec - start.tv_nsec);
     
-    pthread_mutex_lock(&g_stats_mutex);
-    g_c_task_stats.total_c_task_time_ns += elapsed_ns;
-    g_c_task_stats.total_c_tasks_completed++;
-    pthread_mutex_unlock(&g_stats_mutex);
+    c_task_stats_shard_t* shard = current_stats_shard();
+    atomic_fetch_add(&shard->c_task_time_ns, elapsed_ns);
+    atomic_fetch_add(&shard->c_tasks_completed, 1);
     
     return 0;
 }
@@ -435,10 +446,9 @@ int c_task_array_copy(void* arg) {
     uint64_t elapsed_ns = (end.tv_sec - start.tv_sec) * 1000000000ULL + 
                           (end.tv_nsec - start.tv_nsec);
     
-    pthread_mutex_lock(&g_stats_mutex);
-    g_c_task_stats.total_c_task_time_ns += elapsed_ns;
-    g_c_task_stats.total_c_tasks_completed++;
-    pthread_mutex_unlock(&g_stats_mutex);
+    c_task_stats_shard_t* shard = current_stats_shard();
+    atomic_fetch_add(&shard->c_task_time_ns, elapsed_ns);
+    atomic_fetch_add(&shard->c_tasks_completed, 1);
     
     return 0;
 }
@@ -449,14 +459,21 @@ int c_task_array_copy(void* arg) {
 
 void c_task_get_stats(c_task_stats_t* stats) {
     if (!stats) return;
-    
-    pthread_mutex_lock(&g_stats_mutex);
-    *stats = g_c_task_stats;
-    pthread_mutex_unlock(&g_stats_mutex);
+
+    memset(stats, 0, sizeof(*stats));
+    for (size_t i = 0; i < C_TASK_STATS_NUM_SHARDS; i++) {
+        stats->total_c_tasks_spawned += atomic_load(&g_stats_shards[i].c_tasks_spawned);
+        stats->total_c_tasks_completed += atomic_load(&g_stats_shards[i].c_tasks_completed);
+        stats->total_c_task_time_ns += atomic_load(&g_stats_shards[i].c_task_time_ns);
+    }
+    /* total_python_task* fields are never written anywhere (dead/
+     * vestigial counters) - stay zeroed, matching prior behavior. */
 }
 
 void c_task_reset_stats(void) {
-    pthread_mutex_lock(&g_stats_mutex);
-    memset(&g_c_task_stats, 0, sizeof(g_c_task_stats));
-    pthread_mutex_unlock(&g_stats_mutex);
+    for (size_t i = 0; i < C_TASK_STATS_NUM_SHARDS; i++) {
+        atomic_store(&g_stats_shards[i].c_tasks_spawned, 0);
+        atomic_store(&g_stats_shards[i].c_tasks_completed, 0);
+        atomic_store(&g_stats_shards[i].c_task_time_ns, 0);
+    }
 }

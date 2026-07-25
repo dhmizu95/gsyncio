@@ -226,4 +226,42 @@ runs of a dedicated chunked-batch stress script (0 failures), a `gdb`
 pass, plus the full existing #1/#2/#3 repro-script regression suite
 (15x, all synced properly, 0 failures).
 
-#5 not started.
+**#5 (sharded stats counters) - done, small/inconclusive performance win.**
+
+Implemented in `csrc/c_tasks.c`: replaced the single `g_stats_mutex` +
+`g_c_task_stats` (one global mutex protecting spawn/completion counters,
+taken on every single C-task spawn and completion) with 64 per-worker
+shards (`g_stats_shards[64]`, each cache-line aligned, each holding
+`_Atomic uint64_t` counters), matching the same sharding pattern already
+used for the scheduler's task/completion counters and the fiber pool's
+free lists. Shard selection reuses `scheduler_get_current_worker_id()`.
+`c_task_get_stats()` sums all shards (an eventually-consistent snapshot,
+same trade-off the scheduler's own `sharded_counter_get_total()` already
+accepts - fine for informational stats, not used for any correctness-
+critical wait condition). `c_task_reset_stats()` resets all shards.
+
+Verified correct: 33/33 pytest suite, a dedicated script asserting
+`c_tasks_spawned`/`c_tasks_completed` exactly match the task count at
+n = 1, 100, 1000, 12345, 100000 for both the individual and batch spawn
+paths (all exact matches, no drift), 20x the full #1-#4 repro-script
+regression suite (0 failures), a `gdb` pass.
+
+Performance: measured inconclusive. A same-environment A/B (10 runs
+each, mutex vs. sharded, n=100k) gave median ~105.8k/s for the mutex
+version vs. ~96.8k/s for the sharded version - within the two builds'
+own run-to-run noise (mutex ranged 87k-118k across its 10 runs; sharded
+was tighter at 93k-104k, suggesting more consistent latency even if not
+a higher median here). The machine had just rebooted during this
+measurement (load average 3+ on 12 cores minutes after boot), which
+likely dominates the signal. Kept the sharded version anyway: a global
+mutex protecting a per-task hot path can only ever be neutral-or-worse
+under contention, never better, so this is very unlikely to be an
+actual regression - more likely the stats mutex was already a small
+fraction of each task's total cost (dominated by the actual computation
++ fiber scheduling) compared to item #1's fiber-pool mutex, which was
+demonstrably hot (visible contention in `gdb` backtraces earlier this
+session) and delivered the ~2.2x win it did specifically because of
+that. Re-benchmark this specific item if it matters later, ideally on
+an idle/warm machine.
+
+All #1-#5 done.
