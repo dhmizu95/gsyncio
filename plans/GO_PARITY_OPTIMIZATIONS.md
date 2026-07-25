@@ -86,4 +86,64 @@ scripts that caught the earlier work-stealing-deque race and the
 ultra_fast double-free) at up to 100k tasks, plus a `gdb`-batch run -
 all clean, no crashes, no hangs.
 
-#2-#5 not started.
+**#2 (arena allocator for wrapper+arg) - done, with one caveat found along the way.**
+
+Implemented in `csrc/c_tasks.c`: `c_task_spawn_batch_int` now allocates
+one `c_task_arena_t` (wrappers array + args array + an atomic refcount)
+per batch instead of two `malloc`s per task. Each task gets a slice
+(`&wrappers[i]`, `&args[i]`) instead of its own allocation. Fibers from
+the same batch finish at different times, so the arena is freed only
+when the last one completes (`arena_release()` decrements the refcount,
+frees on reaching zero). Individually-spawned tasks (`c_task_spawn`/
+`_int`/`_int_int`) are unaffected - `wrapper->arena = NULL` for those,
+and `c_task_wrapper()` branches on that to free them the old way.
+
+While validating this, a leak-shaped regression from item #1 surfaced:
+RSS grew linearly and unboundedly (~15.6 MB per 50k-task batch, no
+plateau after 20+ iterations) - present on `spawn_batch_fast` too
+(untouched by item #2), proving it was item #1's fault, not the arena.
+Root cause: `fiber_pool_alloc()` picked a shard from the *calling*
+thread's identity, but the calling thread (Python/main) is almost never
+the worker that will actually run the fiber - so allocation and the
+later `fiber_pool_free()` (called by the real executing worker) almost
+never hit the same shard. One shard kept starving and growing forever
+while the other 11 accumulated free fibers nobody ever drew from.
+
+Fixed by passing the fiber's actual target worker ID into
+`fiber_pool_alloc(pool, worker_hint)` - computed from the existing
+round-robin worker selection in `scheduler_spawn()` and
+`task_batch_fast_spawn_nogil()` *before* allocating, instead of after.
+Cut growth ~8x (~1.8 MB per 50k-batch remaining). The residual growth
+was confirmed (via a temporary debug counter) to be real peak-in-flight
+concurrency under this specific stress pattern (spawning 50k tasks
+faster than 12 workers can drain them) landing on shards 4-11 only,
+not a leak - a growable pool legitimately has to grow to its peak
+concurrent usage at least once.
+
+Result: n=100k, `c_task_spawn_batch_sum_squares` went from ~191.1k/s
+(after item #1 alone) to ~222.6k/s - a further ~1.16x, ~2.5x
+cumulative from the pre-#1 baseline of ~87.7k/s.
+
+Verified: 33/33 pytest suite, the same repro scripts from item #1
+(15x clean + a `gdb` pass), plus two RSS-growth checks (before/after
+the shard-affinity fix) and a shard-distribution debug trace to confirm
+the residual growth's cause.
+
+**Known issue found, not fixed:** one intermittent crash (~1 in ~120
+runs) during interpreter shutdown - `Fatal Python error:
+PyGILState_Release: auto-releasing thread-state, but no thread-state
+for this thread`, happening in `Py_Finalize`/`PyGILState_Release`
+after all spawned work had already completed successfully. Could not
+reproduce again across 105 further runs (60 individual + 45 combined
+sequential). This looks like a pre-existing race between a worker
+thread's `with gil:` block in `_c_fiber_entry` (gsyncio/_gsyncio_core.pyx)
+and `gs.shutdown_scheduler(wait=True)` / interpreter teardown - i.e. a
+worker thread hasn't fully finished acquiring/releasing the GIL by the
+time `Py_Finalize` starts tearing down thread states. Not something
+introduced by items #1/#2 specifically (it's in the shutdown path, not
+the spawn/pool code either item touched), but flagging here since it
+surfaced during this work. Needs dedicated investigation - likely a
+`shutdown_scheduler(wait=True)` that doesn't actually guarantee every
+worker's in-flight GIL acquisition has settled before returning.
+
+#3-#5 not started.
