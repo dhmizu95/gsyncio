@@ -62,5 +62,28 @@ almost entirely scheduler bookkeeping, not GIL cost.
 
 ## Status
 
-Not started. Discussed and prioritized in conversation; awaiting a
-decision on which item(s) to implement.
+**#1 (sharded fiber pool) - done.**
+
+Implemented in `csrc/fiber_pool.c`/`csrc/fiber_pool.h`: the pool is now
+`FIBER_POOL_NUM_SHARDS` (64) independent shards, each with its own
+mutex + free list. Shard selection reuses the scheduler's existing
+`scheduler_get_current_worker_id()` (same mechanism already used for
+the sharded task/completion counters), so a worker frees the fiber it
+just ran back into its own shard, and whoever allocates next contends
+on a 1-of-64 lock instead of one pool-wide mutex. Growth (when a
+shard's free list is empty) uses a single lock-free atomic counter
+shared across all shards, so it never contends with any shard's lock
+either. No call-site or function-signature changes were needed
+(`fiber_pool_alloc(pool)`/`fiber_pool_free(pool, fiber)` kept their
+exact signatures) - the sharding is entirely internal.
+
+Result: n=100k, `c_task_spawn_batch_sum_squares` went from ~87.7k/s to
+~191.1k/s (~2.2x), individual `c_task_spawn_sum_squares` went from
+~73.6k/s to ~174.8k/s (~2.4x). Matches the predicted 2-5x range.
+
+Verified: 33/33 pytest suite, 15x repeated stress runs (the same repro
+scripts that caught the earlier work-stealing-deque race and the
+ultra_fast double-free) at up to 100k tasks, plus a `gdb`-batch run -
+all clean, no crashes, no hangs.
+
+#2-#5 not started.
