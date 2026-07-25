@@ -89,7 +89,7 @@ async def gather(*awaitables: Awaitable,
     coroutine immediately, before any batch exists), so they're driven
     in chunks via spawn_coro_batch() - one fiber and one GIL acquisition
     per chunk instead of one of each per coroutine. This is the same
-    chunking idea as spawn_batch_fast() (see its docstring), just for
+    chunking idea as spawn() (see its docstring), just for
     coroutines instead of plain calls. Falls back to create_task() one
     at a time if the native batch path isn't available (pure-Python
     fallback build). Anything already awaitable (a gsyncio Future, a raw

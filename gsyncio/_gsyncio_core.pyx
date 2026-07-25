@@ -16,6 +16,8 @@ from libc.string cimport memset, memcpy
 from cpython.ref cimport PyObject, Py_INCREF, Py_DECREF, Py_XINCREF, Py_XDECREF
 from cpython.object cimport PyObject
 
+import itertools
+
 # Use size_t and ssize_t from libc
 cdef extern from "stddef.h":
     ctypedef unsigned long size_t
@@ -940,25 +942,6 @@ cdef void _return_payload(payload) noexcept:
             _payload_pool_size += 1
 
 
-def spawn(func, *args):
-    """Spawn a new fiber/task - optimized with object pooling"""
-    global _task_registry, _payload_pool, _payload_pool_size
-
-    # Initialize scheduler if not already initialized
-    if g_scheduler == NULL:
-        init_scheduler(num_workers=4)  # Default to 4 workers
-
-    # Use pooled payload object (reduces allocation overhead)
-    cdef object payload = _get_payload(func, args)
-    Py_INCREF(payload)
-    cdef uint64_t fid = scheduler_spawn(_c_fiber_entry, <void*>payload)
-    if fid == 0:
-        Py_DECREF(payload)
-        _return_payload(payload)
-        raise RuntimeError("Failed to spawn fiber")
-    return fid
-
-
 def spawn_direct(func, args):
     """Ultra-fast direct spawn - bypasses Python wrapper entirely.
     
@@ -1054,7 +1037,7 @@ def spawn_batch(funcs_and_args):
     return results
 
 
-def spawn_batch_fast(funcs_and_args):
+def spawn(funcs_and_args):
     """Ultra-fast batch spawn - minimal error checking
 
     For maximum performance when you know all spawns will succeed.
@@ -1068,35 +1051,53 @@ def spawn_batch_fast(funcs_and_args):
     balance load without going back to one-fiber-per-task GIL overhead.
 
     Args:
-        funcs_and_args: List of (func, args) tuples
+        funcs_and_args: List of (func, args) tuples, OR any iterable/
+            generator of (func, args) pairs. Passing a generator avoids
+            materializing the whole batch in memory at once - it's
+            streamed in fixed-size chunks instead (ponytail: fixed
+            4096 chunk size since total count is unknown upfront; pass
+            a pre-sized list if you need the worker-count-tuned chunk
+            size the list path uses).
     """
     if g_scheduler == NULL:
         init_scheduler(num_workers=4)
 
-    cdef size_t count = len(funcs_and_args)
-    if count == 0:
-        return
-
     cdef size_t workers = num_workers()
     if workers == 0:
         workers = 1
-    cdef size_t chunk_size = count // (workers * 8)
-    if chunk_size < 1:
-        chunk_size = 1
 
     cdef object chunk
-    cdef size_t i = 0
-    while i < count:
-        chunk = list(funcs_and_args[i:i + chunk_size])
-        Py_INCREF(chunk)
-        scheduler_spawn(_c_fiber_entry_chunk, <void*>chunk)
-        i += chunk_size
+    cdef size_t i, count, chunk_size
+
+    if isinstance(funcs_and_args, (list, tuple)):
+        count = len(funcs_and_args)
+        if count == 0:
+            return
+        chunk_size = count // (workers * 8)
+        if chunk_size < 1:
+            chunk_size = 1
+        i = 0
+        while i < count:
+            chunk = list(funcs_and_args[i:i + chunk_size])
+            Py_INCREF(chunk)
+            scheduler_spawn(_c_fiber_entry_chunk, <void*>chunk)
+            i += chunk_size
+    else:
+        # Streamed path: consume a generator/iterator in bounded chunks
+        # so the full batch never sits materialized in memory at once.
+        it = iter(funcs_and_args)
+        while True:
+            chunk = list(itertools.islice(it, 4096))
+            if not chunk:
+                break
+            Py_INCREF(chunk)
+            scheduler_spawn(_c_fiber_entry_chunk, <void*>chunk)
 
 
 def spawn_coro_batch(coros):
     """Batch-drive a list of bare coroutines, one Future each.
 
-    Same chunking idea as spawn_batch_fast(), adapted for coroutines:
+    Same chunking idea as spawn(), adapted for coroutines:
     each chunk's fiber acquires the GIL ONCE and drives every coroutine
     in its chunk to completion (via _c_coro_chunk_entry) instead of
     paying one fiber-spawn + one GIL acquisition per coroutine. This is
@@ -1349,7 +1350,7 @@ def c_task_spawn_count_primes(int n):
 def c_task_spawn_batch_sum_squares(values):
     """Batch-spawn sum_squares C tasks - GIL released for the whole batch.
 
-    Combines spawn_batch_fast()'s low per-task spawn overhead (the task
+    Combines spawn()'s low per-task spawn overhead (the task
     is looked up once, not once per call) with c_task's GIL-free
     execution, for the best of both spawn rate and sync() time.
     """

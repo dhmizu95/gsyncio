@@ -315,16 +315,13 @@ def _spawn_thread(func, args):
     return t
 
 
-def spawn(func, *args):
-    return _spawn_thread(func, args)
-
 def spawn_direct(func, args):
     _spawn_thread(func, args)
 
 def spawn_batch(funcs_and_args: List) -> List:
     return [_spawn_thread(f, a) for f, a in funcs_and_args]
 
-def spawn_batch_fast(funcs_and_args: List):
+def spawn(funcs_and_args):
     for f, a in funcs_and_args:
         _spawn_thread(f, a)
 

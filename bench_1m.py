@@ -10,7 +10,7 @@ Tests task spawning throughput and sync() latency at scale:
   • 1,000,000 tasks
 
 Spawn modes tested:
-  • spawn_batch_fast()  – bulk spawn (no fiber-ID capture)
+  • spawn()  – bulk spawn (no fiber-ID capture)
 
 Also benchmarks:
   • Channel throughput (1M send/recv)
@@ -60,21 +60,21 @@ def _noop():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Benchmark: spawn_batch_fast() mode
+# Benchmark: spawn() mode
 # ─────────────────────────────────────────────────────────────────────────────
 
-def bench_spawn_batch_fast(n: int) -> dict:
+def bench_spawn_fast(n: int) -> dict:
     tasks = [(_noop, ()) for _ in range(n)]
     gc.disable()
     t0 = time.perf_counter()
-    gs.spawn_batch_fast(tasks)
+    gs.spawn(tasks)
     t_spawn = time.perf_counter()
     gs.sync()
     t_sync = time.perf_counter()
     gc.enable()
 
     return {
-        "mode": "spawn_batch_fast",
+        "mode": "spawn",
         "n": n,
         "spawn_s": t_spawn - t0,
         "sync_s": t_sync - t_spawn,
@@ -225,13 +225,13 @@ def main():
 
     COUNTS = [1_000, 10_000, 100_000, 1_000_000]
 
-    # ── 1. spawn_batch_fast() ────────────────────────────────────────────────
+    # ── 1. spawn() ────────────────────────────────────────────────
     print(SEPARATOR)
-    print("  spawn_batch_fast()  -- bulk, minimal error check")
+    print("  spawn()  -- bulk, minimal error check")
     print(SEPARATOR)
     for n in COUNTS:
         try:
-            r = bench_spawn_batch_fast(n)
+            r = bench_spawn_fast(n)
             print_task_result(r)
         except Exception as e:
             print(f"  ERROR n={_fmt(n)}: {e}\n")
