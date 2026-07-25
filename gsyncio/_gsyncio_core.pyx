@@ -301,12 +301,6 @@ cdef extern from "task.h":
         size_t count
         size_t capacity
 
-    # Fast batch spawn (ultra-low overhead)
-    ctypedef struct task_batch_fast_t:
-        size_t count
-        size_t capacity
-        int store_fiber_ids
-
     task_registry_t* task_registry_create() nogil
     void task_registry_destroy(task_registry_t* reg) nogil
     task_handle_t* task_spawn(task_registry_t* reg, void (*func)(void*), void* arg) nogil
@@ -323,12 +317,6 @@ cdef extern from "task.h":
     void task_batch_destroy(task_batch_t* batch) nogil
     int task_batch_add(task_batch_t* batch, void (*func)(void*), void* arg) nogil
     int task_batch_spawn(task_batch_t* batch, task_registry_t* reg) nogil
-
-    # Fast batch operations (no Python overhead)
-    task_batch_fast_t* task_batch_fast_create(size_t capacity) nogil
-    void task_batch_fast_destroy(task_batch_fast_t* batch, int free_args) nogil
-    int task_batch_fast_add(task_batch_fast_t* batch, void (*func)(void*), void* arg) nogil
-    size_t task_batch_fast_spawn_nogil(task_batch_fast_t* batch, task_registry_t* reg) nogil
 
 # ============================================
 # Python-visible classes
@@ -1149,106 +1137,6 @@ def spawn_coro_batch(coros):
         i += chunk_size
 
     return futures
-
-
-def spawn_batch_ultra_fast(funcs_and_args, int store_fiber_ids=0):
-    """Ultra-fast batch spawn with aggressive GIL release
-    
-    This is the fastest way to spawn multiple tasks:
-    1. Pre-allocates all Python objects BEFORE releasing GIL
-    2. Uses C arrays for storage (no Python dict/list overhead during spawn)
-    3. Releases GIL completely during the spawn loop using Py_BEGIN_ALLOW_THREADS
-    4. Single atomic operation to increment active count for all tasks
-    
-    Args:
-        funcs_and_args: List of (func, args) tuples
-        store_fiber_ids: Whether to store and return fiber IDs (slower)
-    
-    Returns:
-        If store_fiber_ids: list of fiber IDs
-        Otherwise: count of spawned tasks
-    
-    Example:
-        >>> def worker(n): print(n)
-        >>> tasks = [(worker, (i,)) for i in range(1000)]
-        >>> count = spawn_batch_ultra_fast(tasks)  # Spawns 1000 tasks with GIL released
-    """
-    global _task_registry
-    if g_scheduler == NULL:
-        init_scheduler(num_workers=4)
-    
-    if _task_registry is None:
-        _task_registry = TaskRegistry()
-    
-    cdef size_t count = len(funcs_and_args)
-    if count == 0:
-        return 0
-    
-    # Pre-allocate all Python objects BEFORE releasing GIL
-    cdef list payloads = []
-    cdef object payload
-    cdef task_batch_fast_t* batch
-    cdef size_t spawned
-    
-    # Pre-create all payloads while holding GIL
-    # This is the only Python-dependent part
-    for func, args in funcs_and_args:
-        payload = (func, args)
-        Py_INCREF(payload)
-        payloads.append(payload)
-    
-    # Create fast batch context
-    batch = task_batch_fast_create(count)
-    if not batch:
-        # No fiber will ever run for these payloads, so release the
-        # manual Py_INCREF above ourselves (the `payloads` list still
-        # holds its own reference and cleans that up on its own).
-        for p in payloads:
-            Py_DECREF(p)
-        raise MemoryError("Failed to create batch")
-
-    # Set up batch with function pointers and args
-    # Still holding GIL here for safety
-    for i, p in enumerate(payloads):
-        # _c_fiber_entry is the C function pointer
-        if task_batch_fast_add(batch, _c_fiber_entry, <void*>p) != 0:
-            # Clean up on error - same reasoning as above
-            task_batch_fast_destroy(batch, 0)
-            for p2 in payloads:
-                Py_DECREF(p2)
-            raise RuntimeError("Failed to add task to batch")
-    
-    # ============================================
-    # CRITICAL: Release GIL for the actual spawn
-    # ============================================
-    # This is where the magic happens - the entire spawn loop runs
-    # without holding the GIL, allowing true parallel task creation
-    cdef task_registry_t* reg_ptr
-    reg_ptr = (<TaskRegistry>_task_registry)._reg
-    with nogil:
-        # Spawn all tasks - NO GIL held here!
-        # This is pure C code running without Python overhead
-        spawned = task_batch_fast_spawn_nogil(batch, reg_ptr)
-    
-    # ============================================
-    
-    # Clean up batch structure (but not the Python payloads)
-    task_batch_fast_destroy(batch, 0)
-
-    # Do NOT decref payloads here: each spawned fiber's _c_fiber_entry
-    # already balances the manual Py_INCREF above with its own
-    # Py_DECREF. The `payloads` list still holds its own reference to
-    # each tuple and releases it automatically when this function
-    # returns - decrementing again here was a double-free (a fiber
-    # could dealloc the tuple mid-flight while another still ran).
-
-    # Return results
-    if store_fiber_ids:
-        # Note: fiber IDs not stored in current implementation
-        # Would need to add that to task_batch_fast_t if needed
-        return spawned
-    else:
-        return spawned
 
 
 def sleep_ns(uint64_t ns):

@@ -10,9 +10,7 @@ Tests task spawning throughput and sync() latency at scale:
   • 1,000,000 tasks
 
 Spawn modes tested:
-  • task()              – single spawn via global registry
   • spawn_batch_fast()  – bulk spawn (no fiber-ID capture)
-  • spawn_batch_ultra_fast() – GIL-released bulk spawn
 
 Also benchmarks:
   • Channel throughput (1M send/recv)
@@ -62,29 +60,6 @@ def _noop():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Benchmark: task() single-spawn mode
-# ─────────────────────────────────────────────────────────────────────────────
-
-def bench_task_single(n: int) -> dict:
-    gc.disable()
-    t0 = time.perf_counter()
-    for _ in range(n):
-        gs.task(_noop)
-    t_spawn = time.perf_counter()
-    gs.sync()
-    t_sync = time.perf_counter()
-    gc.enable()
-
-    return {
-        "mode": "task() single",
-        "n": n,
-        "spawn_s": t_spawn - t0,
-        "sync_s": t_sync - t_spawn,
-        "total_s": t_sync - t0,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Benchmark: spawn_batch_fast() mode
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -101,30 +76,6 @@ def bench_spawn_batch_fast(n: int) -> dict:
     return {
         "mode": "spawn_batch_fast",
         "n": n,
-        "spawn_s": t_spawn - t0,
-        "sync_s": t_sync - t_spawn,
-        "total_s": t_sync - t0,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Benchmark: spawn_batch_ultra_fast() mode (GIL-released)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def bench_spawn_batch_ultra_fast(n: int) -> dict:
-    tasks = [(_noop, ()) for _ in range(n)]
-    gc.disable()
-    t0 = time.perf_counter()
-    count = gs.spawn_batch_ultra_fast(tasks)
-    t_spawn = time.perf_counter()
-    gs.sync()
-    t_sync = time.perf_counter()
-    gc.enable()
-
-    return {
-        "mode": "ultra_fast",
-        "n": n,
-        "spawned": count,
         "spawn_s": t_spawn - t0,
         "sync_s": t_sync - t_spawn,
         "total_s": t_sync - t0,
@@ -274,18 +225,7 @@ def main():
 
     COUNTS = [1_000, 10_000, 100_000, 1_000_000]
 
-    # ── 1. task() single spawn ────────────────────────────────────────────────
-    print(SEPARATOR)
-    print("  task()  -- single spawn loop")
-    print(SEPARATOR)
-    for n in COUNTS:
-        try:
-            r = bench_task_single(n)
-            print_task_result(r)
-        except Exception as e:
-            print(f"  ERROR n={_fmt(n)}: {e}\n")
-
-    # ── 2. spawn_batch_fast() ────────────────────────────────────────────────
+    # ── 1. spawn_batch_fast() ────────────────────────────────────────────────
     print(SEPARATOR)
     print("  spawn_batch_fast()  -- bulk, minimal error check")
     print(SEPARATOR)
@@ -296,18 +236,7 @@ def main():
         except Exception as e:
             print(f"  ERROR n={_fmt(n)}: {e}\n")
 
-    # ── 3. spawn_batch_ultra_fast() ──────────────────────────────────────────
-    print(SEPARATOR)
-    print("  spawn_batch_ultra_fast()  -- GIL released during spawn")
-    print(SEPARATOR)
-    for n in COUNTS:
-        try:
-            r = bench_spawn_batch_ultra_fast(n)
-            print_task_result(r)
-        except Exception as e:
-            print(f"  ERROR n={_fmt(n)}: {e}\n")
-
-    # ── 4. C-native tasks (GIL-free) ─────────────────────────────────────────
+    # ── 2. C-native tasks (GIL-free) ─────────────────────────────────────────
     if gs._HAS_CYTHON:
         print(SEPARATOR)
         print("  C native tasks  -- GIL-free execution (sum_squares)")
@@ -319,7 +248,7 @@ def main():
             except Exception as e:
                 print(f"  ERROR n={_fmt(n)}: {e}\n")
 
-    # ── 5. Atomics ────────────────────────────────────────────────────────────
+    # ── 3. Atomics ────────────────────────────────────────────────────────────
     print(SEPARATOR)
     print("  Atomic counter  -- inc + dec throughput")
     print(SEPARATOR)
@@ -327,7 +256,7 @@ def main():
         r = bench_atomics(n)
         print_atomic_result(r)
 
-    # ── 6. Channel throughput ─────────────────────────────────────────────────
+    # ── 4. Channel throughput ─────────────────────────────────────────────────
     if gs._HAS_CYTHON:
         print(SEPARATOR)
         print("  Channel  -- buffered non-blocking send/recv")

@@ -328,10 +328,6 @@ def spawn_batch_fast(funcs_and_args: List):
     for f, a in funcs_and_args:
         _spawn_thread(f, a)
 
-def spawn_batch_ultra_fast(funcs_and_args: List, store_fiber_ids: int = 0) -> int:
-    spawn_batch_fast(funcs_and_args)
-    return len(funcs_and_args)
-
 
 # ── Sleep ─────────────────────────────────────────────────────────────────────
 def sleep_ms(ms: float):

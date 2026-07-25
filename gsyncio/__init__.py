@@ -61,7 +61,6 @@ try:
         spawn_direct,
         spawn_batch,
         spawn_batch_fast,
-        spawn_batch_ultra_fast,
         sleep_ns,
         sleep_us,
         sleep_ms,
@@ -105,7 +104,7 @@ except ImportError:
     from ._fallback import (          # all symbols pulled from fallback module
         Future, Channel, WaitGroup,
         init_scheduler, shutdown_scheduler, get_scheduler_stats,
-        spawn, spawn_direct, spawn_batch, spawn_batch_fast, spawn_batch_ultra_fast,
+        spawn, spawn_direct, spawn_batch, spawn_batch_fast,
         sleep_ns, sleep_us, sleep_ms,
         current_fiber_id, yield_execution, num_workers,
         task, sync, sync_timeout, task_count, task_completed_count, run,
@@ -204,7 +203,7 @@ __all__ = [
     "workers_running", "get_queued_fiber_count", "print_scheduler_debug",
 
     # Fiber primitives
-    "spawn", "spawn_direct", "spawn_batch", "spawn_batch_fast", "spawn_batch_ultra_fast",
+    "spawn", "spawn_direct", "spawn_batch", "spawn_batch_fast",
     "sleep_ns", "sleep_us", "sleep_ms",
     "current_fiber_id", "yield_execution", "num_workers",
 
