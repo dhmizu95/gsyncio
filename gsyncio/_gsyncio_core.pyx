@@ -393,13 +393,37 @@ cdef class Future:
         """Make future awaitable"""
         cdef fiber_t* current = fiber_current()
         if current:
-            # On a gsyncio fiber - use native await (fast path)
-            if not future_is_done(self._future):
-                future_await(self._future)
+            # On a gsyncio fiber. Deliberately NOT calling future_await()
+            # here: it registers this fiber on the future's waiting list
+            # and calls fiber_park(), which (see fiber_park()/fiber_yield()
+            # in fiber.c) only marks the fiber READY again and returns -
+            # there's no real stack-switch in this codebase's fiber model
+            # (fibers execute as plain calls on a worker's own OS thread,
+            # not stackful coroutines). Control falls straight back here
+            # while future_set_result() will *later* call fiber_unpark()
+            # on the same still-physically-executing fiber, rescheduling
+            # it onto a worker thread while it's already running -  two
+            # threads then race on the same fiber's continuation. self
+            # .result() below already blocks correctly (future_wait() ->
+            # future_result() uses a real pthread_cond_wait with the GIL
+            # properly released via Py_BEGIN_ALLOW_THREADS), so it's used
+            # directly instead.
+            #
+            # __await__ must return an iterator; a bare `return value`
+            # only does that if this function is itself compiled as a
+            # generator (decided from whether `yield`/`yield from`
+            # appears anywhere in its body - the `yield from` in the
+            # else branch below makes that true for both branches, so
+            # `return self.result()` here correctly becomes
+            # StopIteration(self.result()) instead of returning a plain
+            # value straight from a non-generator function, which raises
+            # "TypeError: __await__() returned non-iterator" the moment
+            # anything actually awaits this Future on a fiber.
             return self.result()
         else:
             # In an asyncio context - yield until done
-            return self._asyncio_await().__await__()
+            result = yield from self._asyncio_await().__await__()
+            return result
 
     async def _asyncio_await(self):
         import asyncio
@@ -1241,22 +1265,52 @@ def run(func_or_coro, *args, **kwargs):
     Run a function or coroutine in the gsyncio runtime.
 
     Handles plain sync callables, coroutine functions, and already-created
-    coroutines (asyncio-compatible), so callers never need a Python-level
-    wrapper around this entry point.
+    coroutines, so callers never need a Python-level wrapper around this
+    entry point. Coroutines are driven by gsyncio's own fiber scheduler,
+    not asyncio: every gsyncio-native awaitable (Future, sleep, channel,
+    WaitGroup) resolves via a true C-level block when running on a fiber,
+    so a coroutine running inside one never actually needs to yield
+    control back to Python - `coro.send(None)` blocks transitively all
+    the way to completion. See plans/GO_PARITY_OPTIMIZATIONS.md-adjacent
+    design notes: this only works for gsyncio-native awaitables; a
+    coroutine that awaits something asyncio-only (with no event loop
+    present to service it) raises a clear RuntimeError instead of hanging.
     """
-    import asyncio
     import inspect
     init_scheduler()
     if inspect.iscoroutine(func_or_coro):
-        return asyncio.run(func_or_coro)
+        coro = func_or_coro
     elif inspect.iscoroutinefunction(func_or_coro):
-        return asyncio.run(func_or_coro(*args, **kwargs))
+        coro = func_or_coro(*args, **kwargs)
     else:
         result = func_or_coro(*args, **kwargs)
-        if inspect.iscoroutine(result):
-            return asyncio.run(result)
-        sync()
-        return result
+        if not inspect.iscoroutine(result):
+            sync()
+            return result
+        coro = result
+
+    box = {}
+
+    def _driver():
+        try:
+            try:
+                coro.send(None)
+            except StopIteration as e:
+                box['value'] = e.value
+            else:
+                box['exc'] = RuntimeError(
+                    "coroutine awaited something that isn't gsyncio-native "
+                    "while running under gs.run() - no asyncio event loop "
+                    "is running to service it"
+                )
+        except BaseException as e:
+            box['exc'] = e
+
+    task(_driver)
+    sync()
+    if 'exc' in box:
+        raise box['exc']
+    return box.get('value')
     # scheduler stays alive for subsequent task() calls
 
 

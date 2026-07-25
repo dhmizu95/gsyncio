@@ -642,9 +642,22 @@ static void* worker_thread(void* arg) {
                     scheduler_atomic_dec_task_count();
                     scheduler_sharded_dec_task_count(scheduler_get_current_worker_id());
 
-                    if (f->parent) {
-                        scheduler_schedule(f->parent, -1);
-                    }
+                    /* Deliberately NOT rescheduling f->parent here: fibers
+                     * in this codebase run as plain calls on a worker's
+                     * own OS thread (no real stack-switching), so a
+                     * parent fiber that spawned this one may already be
+                     * physically executing elsewhere (e.g. blocked in
+                     * future_wait() waiting on a *different* child's
+                     * result). Rescheduling it here races another worker
+                     * thread against the parent's own still-live
+                     * execution - two threads then contend for the same
+                     * fiber's continuation, corrupting state (observed as
+                     * a null f->func crash under nested create_task()
+                     * calls). Nothing correctly depends on this: fibers
+                     * that need to wait for a child already do so via
+                     * Future.result() (future_wait() -> pthread_cond_wait,
+                     * a real blocking wait), not by being "woken" via
+                     * this parent-child link. */
 
                     if (f->pool) {
                         fiber_pool_free(f->pool, f);

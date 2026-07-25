@@ -79,29 +79,42 @@ class Future:
 
     def __await__(self):
         if not self.done:
-            import asyncio
-            try:
-                # Async context (asyncio event loop is running)
-                loop = asyncio.get_running_loop()
-                af   = loop.create_future()
+            if _HAS_CYTHON and current_fiber_id() != 0:
+                # On a native gsyncio fiber: self._inner.result() below
+                # already blocks via a true C-level fiber-park
+                # (future_wait()) when not done - the fiber-native path
+                # never needs asyncio at all.
+                pass
+            else:
+                # Not on a fiber. Don't just block this thread outright -
+                # if there's an ambient asyncio loop running (e.g. this
+                # Future is being awaited from code under pytest-asyncio,
+                # or any app that embeds gsyncio inside an asyncio loop),
+                # the thing that's supposed to complete this Future might
+                # be a sibling coroutine on that SAME loop/thread.
+                # Blocking the thread would starve it and deadlock -
+                # cooperating with the loop instead lets that sibling run.
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
 
-                def _on_done(fut):
-                    if not af.done():
-                        try:
-                            loop.call_soon_threadsafe(af.set_result,
-                                                      fut.result())
-                        except Exception as e:
-                            loop.call_soon_threadsafe(af.set_exception, e)
+                if loop is not None:
+                    af = loop.create_future()
 
-                self.add_callback(_on_done)
-                yield from af
+                    def _on_done(fut):
+                        if not af.done():
+                            try:
+                                loop.call_soon_threadsafe(af.set_result, fut.result())
+                            except Exception as e:
+                                loop.call_soon_threadsafe(af.set_exception, e)
 
-            except RuntimeError:
-                # No running loop — gsyncio fiber context or bare thread
-                if _HAS_CYTHON and current_fiber_id() != 0:
-                    while not self.done:
-                        yield_execution()
+                    self.add_callback(_on_done)
+                    yield from af
                 else:
+                    # No fiber, no ambient loop - nothing else needs this
+                    # thread free, so a plain blocking wait is safe.
                     import threading
                     ev = threading.Event()
                     self.add_callback(lambda _: ev.set())

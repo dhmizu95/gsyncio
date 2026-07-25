@@ -145,7 +145,6 @@ from ._async import (
     AsyncRange,
     AsyncIterator,
     AsyncContextManager,
-    _run_coroutine,
 )
 
 from ._channel import (

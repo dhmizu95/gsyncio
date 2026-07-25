@@ -80,9 +80,14 @@ class TestTaskSync:
         assert result == "hello"
 
     def test_run_async(self):
-        """gs.run() should handle an async main coroutine."""
+        """gs.run() should handle an async main coroutine.
+
+        Uses gs.sleep(), not asyncio.sleep(): gs.run() drives coroutines
+        on gsyncio's own fiber scheduler, not an asyncio event loop, so
+        only gsyncio-native awaitables resolve inside it.
+        """
         async def main():
-            await asyncio.sleep(0)
+            await gs.sleep(0)
             return 42
 
         result = gs.run(main())
@@ -155,6 +160,55 @@ class TestAsyncAwait:
         results = await gs.gather(ok(), failing(), return_exceptions=True)
         assert results[0] == 1
         assert isinstance(results[1], ValueError)
+
+    @pytest.mark.asyncio
+    async def test_create_task(self):
+        """gs.create_task wraps a coroutine in a Future that can be awaited."""
+        async def compute(n):
+            await gs.sleep(1)   # 1 ms — forces a real suspend/resume
+            return n * 3
+
+        task = gs.create_task(compute(7))
+        result = await task
+        assert result == 21
+
+    @pytest.mark.asyncio
+    async def test_create_task_gather(self):
+        """gs.create_task futures should compose with gs.gather, same as
+        asyncio.create_task tasks do in test_gather above."""
+        async def compute(n):
+            return n + 1
+
+        tasks   = [gs.create_task(compute(i)) for i in range(5)]
+        results = await gs.gather(*tasks)
+        assert sorted(results) == [1, 2, 3, 4, 5]
+
+    @pytest.mark.asyncio
+    async def test_wait_for_completes(self):
+        """wait_for should return the result when the awaitable finishes
+        well within the timeout."""
+        async def quick():
+            await gs.sleep(1)   # 1 ms
+            return "done"
+
+        result = await gs.wait_for(quick(), timeout=1.0)
+        assert result == "done"
+
+    @pytest.mark.asyncio
+    async def test_wait_for_timeout(self):
+        """wait_for should raise TimeoutError when the awaitable is slower
+        than the timeout.
+
+        Uses gs.sleep(), not asyncio.sleep(): wait_for() drives its
+        awaitable on gsyncio's own fiber scheduler via create_task(), not
+        an asyncio event loop, so only gsyncio-native awaitables resolve
+        inside it."""
+        async def slow():
+            await gs.sleep(1000)
+            return "too late"
+
+        with pytest.raises(asyncio.TimeoutError):
+            await gs.wait_for(slow(), timeout=0.05)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,6 +410,106 @@ class TestFuture:
         asyncio.create_task(completer())
         result = await f
         assert result == "done"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Native async/await - no ambient asyncio event loop at all
+#
+# These are deliberately plain `def` tests (no `async def`, no
+# @pytest.mark.asyncio) - pytest-asyncio never creates a loop for them.
+# Every other async test in this file runs *under* pytest-asyncio's own
+# real event loop, which proves gsyncio's async helpers can cooperate
+# with an ambient loop, not that they can run without one. These prove
+# the actual capability: gs.run() drives async def/await entirely on
+# gsyncio's own fiber scheduler.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNativeAsyncNoLoop:
+    """gs.run()-driven async/await with zero ambient asyncio loop."""
+
+    def test_run_returns_result(self):
+        async def main():
+            return 123
+
+        assert gs.run(main()) == 123
+
+    def test_run_propagates_exception(self):
+        async def main():
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            gs.run(main())
+
+    def test_run_with_native_sleep(self):
+        async def main():
+            start = time.time()
+            await gs.sleep(50)
+            return time.time() - start
+
+        elapsed = gs.run(main())
+        assert elapsed >= 0.04
+
+    def test_create_task_and_gather_inside_run(self):
+        async def compute(n):
+            await gs.sleep(1)
+            return n * n
+
+        async def main():
+            tasks = [gs.create_task(compute(i)) for i in range(10)]
+            return await gs.gather(*tasks)
+
+        results = gs.run(main())
+        assert results == [i * i for i in range(10)]
+
+    def test_gather_return_exceptions_inside_run(self):
+        async def ok():
+            return 1
+
+        async def failing():
+            raise ValueError("nope")
+
+        async def main():
+            return await gs.gather(ok(), failing(), return_exceptions=True)
+
+        results = gs.run(main())
+        assert results[0] == 1
+        assert isinstance(results[1], ValueError)
+
+    def test_wait_for_inside_run(self):
+        async def quick():
+            await gs.sleep(1)
+            return "done"
+
+        async def main():
+            return await gs.wait_for(quick(), timeout=1.0)
+
+        assert gs.run(main()) == "done"
+
+    def test_future_completed_by_sibling_task_inside_run(self):
+        """A Future set by one create_task()'d coroutine, awaited by the
+        main coroutine - the same pattern as test_future_await, but with
+        gsyncio's own scheduler providing the concurrency instead of an
+        asyncio loop."""
+        async def main():
+            f = gs.Future()
+
+            async def completer():
+                await gs.sleep(20)
+                f.set_result("done")
+
+            gs.create_task(completer())
+            return await f
+
+        assert gs.run(main()) == "done"
+
+    def test_mixing_raw_asyncio_raises_clear_error(self):
+        """Awaiting a non-gsyncio-native awaitable inside gs.run() has no
+        event loop to service it - should fail clearly, not hang."""
+        async def main():
+            await asyncio.sleep(0)
+
+        with pytest.raises(RuntimeError, match="isn't gsyncio-native"):
+            gs.run(main())
 
 
 # ─────────────────────────────────────────────────────────────────────────────

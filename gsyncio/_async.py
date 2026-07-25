@@ -1,54 +1,66 @@
 """
 gsyncio._async — Async/await helpers.
 
-Works with both the C extension and pure-Python fallback.
+Works with both the C extension and pure-Python fallback. Coroutines are
+driven by gsyncio's own fiber scheduler, not asyncio: gsyncio-native
+awaitables (Future, sleep, channel, WaitGroup) resolve via a true C-level
+block when running on a fiber, so a coroutine running inside one never
+actually needs to yield control back to Python - `coro.send(None)`
+blocks transitively all the way to completion. Only bare coroutines get
+wrapped into new fibers here; anything already awaitable (a gsyncio
+Future, a raw asyncio Task passed in by caller code that's itself
+running under a real asyncio loop) is awaited as-is, deferring to
+whatever is actually driving the surrounding coroutine.
 """
-import asyncio
 import inspect
+import time
 from typing import Any, Coroutine, List, Optional, Awaitable
 
 try:
-    from ._gsyncio_core import GSocket, gather_native, wait_for_native, sleep_ns as _c_sleep_ns
+    from ._gsyncio_core import GSocket, sleep_ns as _c_sleep_ns
     _HAS_NATIVE = True
 except ImportError:
     _HAS_NATIVE = False
 
-from .core import Future, sleep_ms, sleep_ns, init_scheduler, shutdown_scheduler, _HAS_CYTHON
+from .core import Future, sleep_ms, sleep_ns, init_scheduler, shutdown_scheduler, _HAS_CYTHON, task as _task
+
+
+def _drive_coro(coro) -> Any:
+    """Run *coro* to completion on the calling fiber.
+
+    Works because every gsyncio-native awaitable blocks synchronously in
+    C when called from a fiber - so this one `send(None)` transitively
+    blocks all the way to the coroutine's final return. If the coroutine
+    yields for real (it awaited something that isn't gsyncio-native),
+    there's no event loop here to service it - that's a usage error, not
+    something to silently hang on.
+    """
+    try:
+        coro.send(None)
+    except StopIteration as e:
+        return e.value
+    else:
+        raise RuntimeError(
+            "coroutine awaited something that isn't gsyncio-native while "
+            "running under gsyncio's native driver - no asyncio event "
+            "loop is running to service it"
+        )
 
 
 # ── create_task ───────────────────────────────────────────────────────────────
 def create_task(coro: Coroutine) -> Future:
-    """Wrap a coroutine in a gsyncio Future and schedule it."""
+    """Wrap a coroutine in a gsyncio Future and run it on its own fiber."""
     future = Future()
 
-    async def _run():
+    def _driver():
         try:
-            result = await coro
+            result = _drive_coro(coro)
             future.set_result(result)
-        except Exception as e:
+        except BaseException as e:
             future.set_exception(e)
 
-    try:
-        loop = asyncio.get_event_loop()
-        asyncio.ensure_future(_run(), loop=loop)
-    except RuntimeError:
-        # No running loop — run inline
-        asyncio.run(_run())
-
+    _task(_driver)
     return future
-
-
-# ── _run_coroutine ────────────────────────────────────────────────────────────
-def _run_coroutine(coro: Coroutine) -> Any:
-    """Run a coroutine to completion (creates/reuses event loop)."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError("closed")
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
 
 
 # ── sleep ─────────────────────────────────────────────────────────────────────
@@ -56,41 +68,53 @@ async def sleep(ms: float) -> None:
     """Sleep for *ms* milliseconds (fiber-aware when on a C fiber)."""
     from .core import current_fiber_id
     if _HAS_CYTHON and current_fiber_id() != 0:
-        # Running on a native gsyncio fiber — use C sleep
+        # Running on a native gsyncio fiber - real blocking C sleep.
         _c_sleep_ns(int(ms * 1_000_000))
-        await asyncio.sleep(0)   # yield control to event loop
     else:
-        await asyncio.sleep(ms / 1000.0)
+        # Not on a fiber (e.g. called directly from a plain thread or an
+        # ambient asyncio loop, without gs.run()/gs.create_task()) - a
+        # plain blocking sleep, no asyncio.
+        time.sleep(ms / 1000.0)
 
 
 # ── gather ────────────────────────────────────────────────────────────────────
 async def gather(*awaitables: Awaitable,
                  return_exceptions: bool = False) -> List[Any]:
-    """Concurrently await multiple awaitables."""
-    # Prefer asyncio.gather for true concurrency
-    tasks = []
-    for a in awaitables:
-        if asyncio.iscoroutine(a) or asyncio.isfuture(a):
-            tasks.append(a)
-        elif hasattr(a, '__await__'):
-            tasks.append(_wrap_awaitable(a))
+    """Concurrently await multiple awaitables.
+
+    Bare coroutines get wrapped into their own fiber via create_task()
+    (true concurrency, each on its own OS thread). Anything already
+    awaitable (a gsyncio Future, a raw asyncio Task/Future, any object
+    with __await__) is awaited as-is - deferring to whatever is actually
+    driving this coroutine (gsyncio's native driver, or an ambient
+    asyncio loop if this is itself called from asyncio-driven code).
+    """
+    prepared = [create_task(a) if inspect.iscoroutine(a) else a
+                for a in awaitables]
+
+    results = []
+    for a in prepared:
+        if return_exceptions:
+            try:
+                results.append(await a)
+            except Exception as e:
+                results.append(e)
         else:
-            tasks.append(_immediate(a))
-
-    return list(await asyncio.gather(*tasks, return_exceptions=return_exceptions))
-
-
-async def _wrap_awaitable(a):
-    return await a
-
-async def _immediate(v):
-    return v
+            results.append(await a)
+    return results
 
 
 # ── wait_for ──────────────────────────────────────────────────────────────────
 async def wait_for(fut: Awaitable, timeout: float) -> Any:
     """Wait for *fut* with a *timeout* in seconds."""
-    return await asyncio.wait_for(fut, timeout)
+    if inspect.iscoroutine(fut):
+        fut = create_task(fut)
+    deadline = time.monotonic() + timeout
+    while not fut.done:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("wait_for() timed out")
+        await sleep(1)
+    return fut.result()
 
 
 # ── ensure_future ─────────────────────────────────────────────────────────────
@@ -98,16 +122,6 @@ def ensure_future(coro_or_future) -> Future:
     if isinstance(coro_or_future, Future):
         return coro_or_future
     return create_task(coro_or_future)
-
-
-# ── run (async entry point) ───────────────────────────────────────────────────
-def run(main: Coroutine) -> Any:
-    """Run an async main coroutine inside a fresh scheduler."""
-    init_scheduler()
-    try:
-        return _run_coroutine(main)
-    finally:
-        shutdown_scheduler(wait=True)
 
 
 # ── AsyncRange / AsyncIterator / AsyncContextManager ─────────────────────────
@@ -177,8 +191,8 @@ def has_native_io() -> bool:
 
 
 __all__ = [
-    "create_task", "_run_coroutine", "sleep", "gather", "wait_for",
-    "ensure_future", "run", "async_range",
+    "create_task", "sleep", "gather", "wait_for",
+    "ensure_future", "async_range",
     "AsyncRange", "AsyncIterator", "AsyncContextManager",
     "create_tcp_socket", "create_udp_socket", "has_native_io",
 ]
