@@ -61,7 +61,7 @@ fiber_pool_t* fiber_pool_create(size_t initial_size, fiber_stack_mode_t stack_mo
 
     pool->stack_mode = stack_mode;
     for (size_t s = 0; s < FIBER_POOL_NUM_SHARDS; s++) {
-        pthread_mutex_init(&pool->shards[s].mutex, NULL);
+        pthread_spin_init(&pool->shards[s].lock, PTHREAD_PROCESS_PRIVATE);
         atomic_store(&pool->shards[s].free_list, NULL);
         atomic_store(&pool->shards[s].available, 0);
     }
@@ -92,7 +92,7 @@ void fiber_pool_destroy(fiber_pool_t* pool) {
 
     for (size_t s = 0; s < FIBER_POOL_NUM_SHARDS; s++) {
         fiber_pool_shard_t* shard = &pool->shards[s];
-        pthread_mutex_lock(&shard->mutex);
+        pthread_spin_lock(&shard->lock);
         fiber_t* f = (fiber_t*)atomic_load(&shard->free_list);
         while (f) {
             fiber_t* next = f->next_ready;
@@ -102,8 +102,8 @@ void fiber_pool_destroy(fiber_pool_t* pool) {
             free(f);
             f = next;
         }
-        pthread_mutex_unlock(&shard->mutex);
-        pthread_mutex_destroy(&shard->mutex);
+        pthread_spin_unlock(&shard->lock);
+        pthread_spin_destroy(&shard->lock);
     }
     free(pool);
 }
@@ -140,23 +140,23 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool, int worker_hint) {
 
     fiber_pool_shard_t* shard = &pool->shards[shard_index_for(worker_hint)];
 
-    pthread_mutex_lock(&shard->mutex);
+    pthread_spin_lock(&shard->lock);
 
     fiber_t* f = (fiber_t*)atomic_load(&shard->free_list);
     if (f) {
         atomic_store(&shard->free_list, f->next_ready);
         f->next_ready = NULL;
         atomic_fetch_sub(&shard->available, 1);
-        pthread_mutex_unlock(&shard->mutex);
+        pthread_spin_unlock(&shard->lock);
 
         if (!alloc_stack_for(f)) {
             /* mmap failed - hand the fiber back to its shard and bail,
              * same recovery behavior as before sharding. */
-            pthread_mutex_lock(&shard->mutex);
+            pthread_spin_lock(&shard->lock);
             f->next_ready = (fiber_t*)atomic_load(&shard->free_list);
             atomic_store(&shard->free_list, f);
             atomic_fetch_add(&shard->available, 1);
-            pthread_mutex_unlock(&shard->mutex);
+            pthread_spin_unlock(&shard->lock);
             return NULL;
         }
 
@@ -164,11 +164,11 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool, int worker_hint) {
         atomic_fetch_add(&pool->allocated, 1);
         return f;
     }
-    pthread_mutex_unlock(&shard->mutex);
+    pthread_spin_unlock(&shard->lock);
 
     /* Shard's free list is empty - grow instead of scanning other
      * shards. Growth is a single lock-free counter shared by all
-     * shards, so this never contends with any shard's mutex. */
+     * shards, so this never contends with any shard's lock. */
     size_t prev_capacity = atomic_fetch_add(&pool->capacity, 1);
     if (prev_capacity >= FIBER_POOL_MAX_SIZE) {
         atomic_fetch_sub(&pool->capacity, 1);
@@ -212,11 +212,11 @@ void fiber_pool_free(fiber_pool_t* pool, fiber_t* fiber) {
     }
 
     fiber_pool_shard_t* shard = &pool->shards[current_shard_index()];
-    pthread_mutex_lock(&shard->mutex);
+    pthread_spin_lock(&shard->lock);
     fiber->next_ready = (fiber_t*)atomic_load(&shard->free_list);
     atomic_store(&shard->free_list, fiber);
     atomic_fetch_add(&shard->available, 1);
-    pthread_mutex_unlock(&shard->mutex);
+    pthread_spin_unlock(&shard->lock);
 
     atomic_fetch_sub(&pool->allocated, 1);
 }

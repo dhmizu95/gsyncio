@@ -7,6 +7,13 @@
 #ifndef FIBER_POOL_H
 #define FIBER_POOL_H
 
+/* pthread_spinlock_t needs a POSIX feature test macro exposed before
+ * pthread.h is first included in a translation unit - glibc won't add
+ * it retroactively if pthread.h was already pulled in without it. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #include <pthread.h>
@@ -32,7 +39,17 @@ extern "C" {
 typedef struct fiber_pool_shard {
     _Atomic(void*) free_list;  /* Linked list of available fibers (reusing fiber->next_ready) */
     _Atomic size_t available;  /* Available fibers in this shard's free list */
-    pthread_mutex_t mutex;     /* Protects this shard's free list only */
+    pthread_spinlock_t lock;   /* Protects this shard's free list only.
+                                 * A spinlock, not a mutex: critical
+                                 * sections here are a few pointer writes,
+                                 * short enough that avoiding the mutex's
+                                 * futex/syscall path wins. A lock-free
+                                 * (CAS-loop) stack was considered instead
+                                 * but rejected - it needs tagged/versioned
+                                 * pointers to avoid the ABA problem, which
+                                 * is more risk than this pool needs given
+                                 * how much contention sharding already
+                                 * removed. */
 } __attribute__((aligned(64))) fiber_pool_shard_t;  /* cache-line aligned: avoid false sharing between shards */
 
 typedef struct fiber_pool {

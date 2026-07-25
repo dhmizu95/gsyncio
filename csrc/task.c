@@ -5,6 +5,13 @@
  * Optimized C implementation with batch spawning and lock-free tracking.
  */
 
+/* task.h pulls in pthread.h before fiber_pool.h gets a chance to - needs
+ * this defined first so pthread_spinlock_t (used by fiber_pool.h) is
+ * actually declared. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "task.h"
 #include "scheduler.h"
 #include "fiber.h"

@@ -146,4 +146,49 @@ surfaced during this work. Needs dedicated investigation - likely a
 `shutdown_scheduler(wait=True)` that doesn't actually guarantee every
 worker's in-flight GIL acquisition has settled before returning.
 
-#3-#5 not started.
+**#3 (spinlock instead of mutex) - done, after a detour.**
+
+The plan's original wording ("textbook CAS loop, no mutex needed") was
+rejected on reflection: a naive lock-free Treiber stack has the classic
+ABA problem (thread A reads `head=X`, gets preempted; thread B pops X,
+pops the next node, pushes X back with a *different* `next` - thread
+A's CAS then succeeds against stale state and corrupts the list).
+Fixing that properly needs tagged/versioned pointers (128-bit CAS) -
+too much added risk in a subsystem that had already produced three
+serious concurrency bugs this session. Implemented a `pthread_spinlock_t`
+per shard instead of `pthread_mutex_t`: still true mutual exclusion (zero
+ABA risk), just avoids the mutex's futex/syscall path for these very
+short (few-pointer-op) critical sections. `csrc/fiber_pool.c`/`.h`.
+
+**False alarm, corrected:** initial stress testing (100x repro.py, an
+ultra_fast repro script) showed 3/100 failures with the spinlock vs. a
+remembered ~0.9% mutex baseline, so the spinlock was reverted and
+blamed. That comparison turned out to be apples-to-oranges - the 0.9%
+figure came from a *mixed* sample across three different repro scripts
+during item #2's validation, not from repro.py alone. Re-measuring the
+*reverted* mutex build against repro.py alone also gave 3/100 - proving
+the spinlock was never the cause. Caught under `gdb` (attempt 54/60):
+`Fatal Python error: PyGILState_Release: auto-releasing thread-state,
+but no thread-state for this thread` / `Python runtime state:
+finalizing`. Actual root cause: `repro.py` spawns 10,000 fibers via
+`spawn_batch_ultra_fast` and exits *without calling `gs.sync()`* -
+letting the interpreter start finalizing while worker threads are still
+mid-flight acquiring/releasing the GIL in `_c_fiber_entry`
+(gsyncio/_gsyncio_core.pyx). Adding a trailing `gs.sync()` to the repro
+script: **0/100 failures**, both with the mutex and with the spinlock
+reinstated. This is a hazard of not synchronizing before process exit
+(a known general risk with native-thread Python extensions), not a
+gsyncio correctness bug, and not something either lock type causes or
+fixes. Worth hardening defensively at some point (e.g. an atexit hook
+that force-syncs), but that's separate from #1-#5 and not planned yet.
+
+Result: n=100k, `c_task_spawn_batch_sum_squares` went from ~222.6k/s
+(item #2, mutex) to ~248.2k/s (~1.11x further, ~2.8x cumulative from
+the pre-#1 baseline of ~87.7k/s).
+
+Verified: 33/33 pytest suite, 100x repro.py both with and without the
+trailing `sync()` (0/100 and 3/100 respectively, identical for both
+lock types), 15x the item #1/#2 repro scripts (all synced) clean, a
+`gdb` pass.
+
+#4-#5 not started.
