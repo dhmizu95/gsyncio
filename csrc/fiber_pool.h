@@ -113,6 +113,7 @@ void fiber_pool_free(fiber_pool_t* pool, fiber_t* fiber);
 /* ============================================ */
 
 size_t fiber_pool_capacity(fiber_pool_t* pool);
+void fiber_pool_diag_counts(size_t* primary, size_t* fallback, size_t* grows); /* TEMP diagnostic */
 
 /**
  * Verify pool counter consistency

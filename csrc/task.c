@@ -148,6 +148,35 @@ void task_wrapper(void* arg) {
     wrapper_free(wrapper);
 }
 
+uint64_t task_spawn_id(task_registry_t* reg, void (*func)(void*), void* arg) {
+    if (!reg || !func) {
+        return 0;
+    }
+
+    task_wrapper_arg_t* wrapper = wrapper_alloc();
+    if (!wrapper) {
+        return 0;
+    }
+    memset(wrapper, 0, sizeof(task_wrapper_arg_t));
+
+    wrapper->func = func;
+    wrapper->arg = arg;
+    wrapper->registry = reg;
+    wrapper->task_id = atomic_fetch_add(&reg->task_count, 1);
+
+    /* Counted before the spawn so a task that finishes immediately can
+     * never drive active_count negative. */
+    atomic_fetch_add(&reg->active_count, 1);
+
+    uint64_t fid = scheduler_spawn_ex(task_wrapper, wrapper, 1);
+    if (fid == 0) {
+        atomic_fetch_sub(&reg->active_count, 1);
+        wrapper_free(wrapper);
+        return 0;
+    }
+    return fid;
+}
+
 task_handle_t* task_spawn(task_registry_t* reg, void (*func)(void*), void* arg) {
     if (!reg || !func) {
         return NULL;
@@ -180,7 +209,7 @@ task_handle_t* task_spawn(task_registry_t* reg, void (*func)(void*), void* arg) 
     atomic_fetch_add(&reg->active_count, 1);
 
     /* Spawn fiber */
-    uint64_t fid = scheduler_spawn(task_wrapper, wrapper);
+    uint64_t fid = scheduler_spawn_ex(task_wrapper, wrapper, 1);
     handle->fiber_id = fid;
 
     if (fid == 0) {
@@ -316,7 +345,7 @@ int task_batch_spawn(task_batch_t* batch, task_registry_t* reg) {
         handle->wrapper_arg = wrapper;
 
         /* Spawn fiber */
-        uint64_t fid = scheduler_spawn(task_wrapper, wrapper);
+        uint64_t fid = scheduler_spawn_ex(task_wrapper, wrapper, 1);
         handle->fiber_id = fid;
 
         if (fid == 0) {

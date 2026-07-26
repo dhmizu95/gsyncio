@@ -1,6 +1,16 @@
 # cython: language_level=3
 # cython: boundscheck=False
 # cython: wraparound=False
+# cython: freethreading_compatible = True
+#
+# freethreading_compatible marks the module Py_MOD_GIL_NOT_USED. Without
+# it, importing this extension on a free-threaded CPython silently turns
+# the GIL back ON for the whole process ("has not declared that it can
+# run safely without the GIL"), which is the one configuration where
+# gsyncio's M:N scheduler could actually run Python task bodies on more
+# than one core. Shared state here is either immutable after init, C-side
+# and guarded by its own atomics/locks, or (the payload pool) guarded by
+# a threading.Lock.
 
 """
 _gsyncio_core.pyx - Cython wrapper for gsyncio C core
@@ -95,6 +105,7 @@ cdef extern from "scheduler.h":
         int backend
         fiber_stack_mode_t stack_mode
         size_t io_uring_entries
+        size_t num_gil_workers
 
     ctypedef struct scheduler_stats_t:
         uint64_t total_fibers_created
@@ -113,6 +124,8 @@ cdef extern from "scheduler.h":
     void scheduler_shutdown(int wait_for_completion) nogil
     scheduler_t* scheduler_get() nogil
     uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) nogil
+    uint64_t scheduler_spawn_ex(void (*entry)(void*), void* user_data, int gil_bound) nogil
+    size_t scheduler_num_gil_workers() nogil
     void scheduler_schedule(fiber_t* f, int worker_id) nogil
     void scheduler_block(void* reason) nogil
     void scheduler_unblock(fiber_t* f) nogil
@@ -306,6 +319,7 @@ cdef extern from "task.h":
     task_registry_t* task_registry_create() nogil
     void task_registry_destroy(task_registry_t* reg) nogil
     task_handle_t* task_spawn(task_registry_t* reg, void (*func)(void*), void* arg) nogil
+    uint64_t task_spawn_id(task_registry_t* reg, void (*func)(void*), void* arg) nogil
     void task_sync(task_registry_t* reg) nogil
     int task_sync_timeout(task_registry_t* reg, uint64_t timeout_ns) nogil
     size_t task_count(task_registry_t* reg) nogil
@@ -608,12 +622,13 @@ cdef class TaskRegistry:
         """Spawn a new task"""
         cdef object payload = (func, args)
         Py_INCREF(payload)
-        cdef task_handle_t* handle = task_spawn(self._reg, _c_task_entry, <void*>payload)
-        if not handle:
+        # task_spawn_id() skips the task_handle_t malloc/free that the
+        # handle-returning variant costs per task - nothing here needs
+        # anything from it but the fiber id.
+        cdef uint64_t fid = task_spawn_id(self._reg, _c_task_entry, <void*>payload)
+        if fid == 0:
             Py_DECREF(payload)
             raise RuntimeError("Failed to spawn task")
-        cdef uint64_t fid = handle.fiber_id
-        free(handle)  # task_spawn() heap-allocates this; caller only needs fiber_id
         return fid
 
     def spawn_batch(self, tasks):
@@ -810,6 +825,22 @@ cdef void _c_coro_chunk_entry(void* arg) noexcept nogil:
 # Global task registry
 _task_registry = None
 
+# Upper bound on how many tasks share one fiber in spawn()/gather().
+cdef size_t _MAX_SPAWN_CHUNK = 512
+
+
+def _gil_enabled():
+    """True on a normal CPython, False on a free-threaded (no-GIL) build.
+
+    sys._is_gil_enabled() exists from 3.13 on; anything older always has
+    the GIL.
+    """
+    import sys as _sys
+    checker = getattr(_sys, "_is_gil_enabled", None)
+    if checker is None:
+        return True
+    return bool(checker())
+
 # Object pool for task payloads (reduces allocation overhead)
 cdef object _payload_pool = []
 cdef size_t _payload_pool_size = 0
@@ -817,10 +848,18 @@ cdef size_t _PAYLOAD_POOL_MAX_SIZE = 1024
 import threading
 cdef object _payload_pool_lock = threading.Lock()  # Lock for protecting payload pool access
 
-def init_scheduler(size_t num_workers=0, size_t max_fibers=100000000, int work_stealing=1, int stack_mode=1):
+def init_scheduler(size_t num_workers=0, size_t max_fibers=100000000, int work_stealing=1,
+                   int stack_mode=1, size_t num_gil_workers=0):
     """Initialize the gsyncio scheduler (idempotent — safe to call multiple times).
-    
+
     stack_mode: 0 = Native (Fastest), 1 = Hybrid (Save memory maps)
+
+    num_gil_workers: how many worker threads may run Python task bodies.
+        0 = auto: 1 on a normal CPython, num_workers on a free-threaded
+        build. Raising this on a GIL-holding interpreter makes Python
+        tasks *slower*, not faster - every task boundary becomes a GIL
+        handoff between OS threads. Pure-C tasks are unaffected and keep
+        using every worker regardless.
     """
     global _task_registry
 
@@ -838,6 +877,15 @@ def init_scheduler(size_t num_workers=0, size_t max_fibers=100000000, int work_s
     config.backend = 0
     config.stack_mode = <fiber_stack_mode_t>stack_mode
     config.io_uring_entries = 256
+
+    # On a free-threaded build there is no GIL to hand off, so Python
+    # fibers can use every worker like C fibers do. On a normal build,
+    # confine them to one worker (see the docstring). SIZE_MAX means
+    # "all of them" - scheduler_init() clamps it to num_workers, which
+    # is only known there when num_workers was passed as 0 (auto).
+    if num_gil_workers == 0:
+        num_gil_workers = 1 if _gil_enabled() else <size_t>-1
+    config.num_gil_workers = num_gil_workers
 
     if scheduler_init(&config) != 0:
         raise RuntimeError("Failed to initialize scheduler")
@@ -959,7 +1007,7 @@ def spawn_direct(func, args):
     # The fiber entry point (_c_fiber_entry) will unpack (func, args) and call func(*args)
     cdef object payload = (func, args)
     Py_INCREF(payload)
-    cdef uint64_t fid = scheduler_spawn(_c_fiber_entry, <void*>payload)
+    cdef uint64_t fid = scheduler_spawn_ex(_c_fiber_entry, <void*>payload, 1)
     if fid == 0:
         Py_DECREF(payload)
         raise RuntimeError("Failed to spawn fiber")
@@ -1000,7 +1048,7 @@ def spawn_batch(funcs_and_args):
         # Use pooled payload (reduces allocation overhead)
         payload = _get_payload(func, args)
         Py_INCREF(payload)
-        fid = scheduler_spawn(_c_fiber_entry, <void*>payload)
+        fid = scheduler_spawn_ex(_c_fiber_entry, <void*>payload, 1)
         if fid == 0:
             Py_DECREF(payload)
             _return_payload(payload)
@@ -1059,11 +1107,19 @@ def spawn(funcs_and_args):
         chunk_size = count // (workers * 8)
         if chunk_size < 1:
             chunk_size = 1
+        # Cap the chunk. Sizing purely as count/(workers*8) means 1M tasks
+        # become 96 fibers of ~10,400 calls each: one slow task then
+        # stalls the 10,399 behind it, and the scheduler has almost no
+        # granularity left to balance with. The cap keeps the GIL
+        # amortisation (one acquisition per chunk, which is where nearly
+        # all the win comes from) while leaving enough units to schedule.
+        if chunk_size > _MAX_SPAWN_CHUNK:
+            chunk_size = _MAX_SPAWN_CHUNK
         i = 0
         while i < count:
             chunk = list(funcs_and_args[i:i + chunk_size])
             Py_INCREF(chunk)
-            scheduler_spawn(_c_fiber_entry_chunk, <void*>chunk)
+            scheduler_spawn_ex(_c_fiber_entry_chunk, <void*>chunk, 1)
             i += chunk_size
     else:
         # Streamed path: consume a generator/iterator in bounded chunks
@@ -1074,7 +1130,7 @@ def spawn(funcs_and_args):
             if not chunk:
                 break
             Py_INCREF(chunk)
-            scheduler_spawn(_c_fiber_entry_chunk, <void*>chunk)
+            scheduler_spawn_ex(_c_fiber_entry_chunk, <void*>chunk, 1)
 
 
 def spawn_coro_batch(coros):
@@ -1111,13 +1167,15 @@ def spawn_coro_batch(coros):
     cdef size_t chunk_size = count // (workers * 8)
     if chunk_size < 1:
         chunk_size = 1
+    if chunk_size > _MAX_SPAWN_CHUNK:
+        chunk_size = _MAX_SPAWN_CHUNK
 
     cdef object chunk
     cdef size_t i = 0
     while i < count:
         chunk = pairs[i:i + chunk_size]
         Py_INCREF(chunk)
-        scheduler_spawn(_c_coro_chunk_entry, <void*>chunk)
+        scheduler_spawn_ex(_c_coro_chunk_entry, <void*>chunk, 1)
         i += chunk_size
 
     return futures
@@ -1266,28 +1324,16 @@ def run(func_or_coro, *args, **kwargs):
             return result
         coro = result
 
-    box = {}
+    # Stepped, not run-to-completion: the coroutine may suspend (sleep,
+    # unresolved Future) and be resumed later, so sync() has to wait for
+    # the whole chain rather than just the first fiber. _suspend keeps a
+    # task-count token alive across each suspension for exactly that.
+    from ._suspend import step as _step, ResultBox as _ResultBox
 
-    def _driver():
-        try:
-            try:
-                coro.send(None)
-            except StopIteration as e:
-                box['value'] = e.value
-            else:
-                box['exc'] = RuntimeError(
-                    "coroutine awaited something that isn't gsyncio-native "
-                    "while running under gs.run() - no asyncio event loop "
-                    "is running to service it"
-                )
-        except BaseException as e:
-            box['exc'] = e
-
-    task(_driver)
+    box = _ResultBox()
+    task(_step, coro, box)
     sync()
-    if 'exc' in box:
-        raise box['exc']
-    return box.get('value')
+    return box.unwrap()
     # scheduler stays alive for subsequent task() calls
 
 

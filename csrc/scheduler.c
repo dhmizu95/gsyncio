@@ -7,6 +7,13 @@
 
 #define _GNU_SOURCE  /* For CPU_ZERO, CPU_SET, pthread_setaffinity_np */
 
+/* Python.h first, as CPython requires. The worker loop holds the GIL
+ * across a run of Python fibers (see GIL_RUN_MAX), which needs
+ * PyGILState_Ensure/Release. Note this header was previously absent, so
+ * the `#ifdef Py_BEGIN_ALLOW_THREADS` blocks in this file were compiling
+ * to nothing at all. */
+#include <Python.h>
+
 #include "scheduler.h"
 #include "fiber_pool.h"
 #include "fiber.h"
@@ -170,7 +177,18 @@ uint64_t scheduler_atomic_inc_task_count(void) {
 
 uint64_t scheduler_atomic_dec_task_count(void) {
     if (!g_scheduler) return 0;
-    return __atomic_sub_fetch(&g_scheduler->stats.atomic_task_count, 1, __ATOMIC_SEQ_CST);
+    uint64_t remaining = __atomic_sub_fetch(&g_scheduler->stats.atomic_task_count, 1,
+                                            __ATOMIC_SEQ_CST);
+    if (remaining == 0) {
+        /* Only on the last completion, so waiters (gs.sync()) can sleep
+         * on a condvar rather than polling. Taking the mutex here is
+         * what makes the waiter's "re-check under the lock, then wait"
+         * sequence race-free. */
+        pthread_mutex_lock(&g_scheduler->done_mutex);
+        pthread_cond_broadcast(&g_scheduler->done_cond);
+        pthread_mutex_unlock(&g_scheduler->done_mutex);
+    }
+    return remaining;
 }
 
 uint64_t scheduler_atomic_get_task_count(void) {
@@ -266,6 +284,43 @@ static fiber_t* pop_local(worker_t* w);
 static void process_io_completions(scheduler_t *sched);
 static void process_timers(scheduler_t *sched);
 static int select_victim_adaptive(worker_t* thief);
+static inline uint64_t worker_rand(worker_t* w);
+
+/* How many random victims an idle worker probes per steal round. */
+#define STEAL_SAMPLES 4
+
+/* Python fibers run back-to-back under one GIL acquisition, up to this
+ * many, before the worker drops the GIL and re-takes it. */
+#define GIL_RUN_MAX 128
+
+/* Idle backoff bounds for a worker that keeps finding no work. */
+#define IDLE_SLEEP_MIN_NS 1000000ULL    /* 1 ms  */
+#define IDLE_SLEEP_MAX_NS 20000000ULL   /* 20 ms */
+
+/* How long a worker spins watching its queues before parking.
+ *
+ * Parking is a futex round trip, so a worker that parks between two
+ * tasks arriving 6 us apart pays that syscall on every task - measured
+ * as a 18x regression on the nogil path (0.5 -> 9.4 us/task) when this
+ * was ~100. It has to exceed the inter-arrival gap of a producer feeding
+ * work round-robin to every worker. The cost of guessing high is only
+ * spinning: a worker that stays idle still ends up in the backoff ladder
+ * below, so a genuinely unused pool settles at roughly this spin per
+ * IDLE_SLEEP_MAX_NS nap - about 1% of a core each. */
+#define IDLE_SPIN_ITERS 4000
+
+/* Hint to the CPU that this is a spin-wait: lowers power draw and stops
+ * the spinning core from starving a sibling hyperthread that is doing
+ * real work. Falls back to a plain compiler barrier elsewhere. */
+static inline void cpu_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield" ::: "memory");
+#else
+    __asm__ __volatile__("" ::: "memory");
+#endif
+}
 
 /* Forward declaration of Python callback wrapper (from _gsyncio_core.pyx) */
 
@@ -401,6 +456,28 @@ static bool deque_empty(deque_t* dq) {
     size_t t = atomic_load_explicit(&dq->top, memory_order_acquire);
     size_t b = atomic_load_explicit(&dq->bottom, memory_order_acquire);
     return t >= b;
+}
+
+/* Anything this worker could pick up right now, checked with plain
+ * atomic loads (no locks) - used as the pre-park re-check. Deliberately
+ * does NOT consider other workers' queues: missing a steal opportunity
+ * only costs a wait, and the backoff timeout bounds it. */
+static inline bool worker_has_work(worker_t* w, scheduler_t* sched) {
+    if (w->gil_deque && !deque_empty(w->gil_deque)) return true;
+    if (!deque_empty(w->deque)) return true;
+    if (atomic_load_explicit(&sched->ready_queue, memory_order_relaxed)) return true;
+    if (!w->gil_deque &&
+        atomic_load_explicit(&sched->blocked_gil_workers,
+                             memory_order_relaxed) > 0) return true;
+    return false;
+}
+
+/* Book-keeping for a successful steal made outside steal_from_worker()
+ * (which does its own accounting). */
+static inline void thief_credit(worker_t* thief, scheduler_t* sched) {
+    thief->steals_attempted++;
+    thief->steals_successful++;
+    sched->stats.total_work_steals++;
 }
 
 static void process_io_completions(scheduler_t *sched) {
@@ -548,14 +625,62 @@ static void* worker_thread(void* arg) {
 
     // Warmup - do a quick spin to avoid cold-start latency
     for (int i = 0; i < 1000; i++) {
-        __asm__ __volatile__("" ::: "memory");
+        cpu_relax();
     }
 
+    /* Consecutive rounds this worker has found nothing to do; drives the
+     * idle backoff at the bottom of the loop. */
+    unsigned idle_rounds = 0;
+
+    /* GIL held across a run of Python fibers - see the acquire site. */
+    PyGILState_STATE gil_state;
+    int holding_gil = 0;
+    unsigned gil_run = 0;
+
     while (w->running && !w->stopped) {
+        /* Cap how long the GIL is held in one run, so a worker with a
+         * deep queue of Python fibers still lets other Python threads
+         * (including the one calling gs.task()) make progress. */
+        if (holding_gil && gil_run >= GIL_RUN_MAX) {
+            PyGILState_Release(gil_state);
+            holding_gil = 0;
+        }
+
         fiber_t* f = NULL;
 
+        /* 0. GIL work first, on the workers that are allowed to run it.
+         * Drained ahead of the local nogil deque so a GIL worker keeps
+         * executing Python back-to-back under one GIL acquisition rather
+         * than interleaving with nogil work it could have left to the
+         * other workers. */
+        if (w->gil_deque) {
+            f = pop_top(w->gil_deque);
+        }
+
         // 1. Try local queue first (fast path - no lock needed)
-        f = pop_local(w);
+        if (!f) {
+            f = pop_local(w);
+        }
+
+        /* 1b. A GIL worker balances against the *other* GIL workers
+         * before touching nogil work. Only reachable with more than one
+         * GIL worker (i.e. a free-threaded interpreter); with the default
+         * single GIL worker this loop has no other queue to look at.
+         * Note the plain deques below need no class check of their own:
+         * scheduler_schedule() never puts a GIL-bound fiber on one. */
+        if (!f && w->gil_deque && sched->config.work_stealing &&
+            sched->num_gil_workers > 1) {
+            for (size_t i = 1; i < sched->num_gil_workers; i++) {
+                worker_t* victim =
+                    &sched->workers[((size_t)w->id + i) % sched->num_gil_workers];
+                if (!victim->gil_deque) continue;
+                f = steal_bottom(victim->gil_deque);
+                if (f) {
+                    thief_credit(w, sched);
+                    break;
+                }
+            }
+        }
 
         // 2. Try adaptive work-stealing if no local work
         if (!f && sched->config.work_stealing) {
@@ -564,11 +689,38 @@ static void* worker_thread(void* arg) {
                 f = steal_from_worker(w, victim);
             }
 
+            /* Fallback: a few random probes. Deliberately NOT a scan of
+             * every worker - that ran on every idle iteration of every
+             * idle worker and cost more in cross-core traffic than the
+             * work it found. Anything missed here is picked up on the
+             * next loop, or by the condvar wake when work is pushed. */
             if (!f) {
-                for (size_t i = 0; i < sched->num_workers; i++) {
-                    int victim_id = (w->id + i + 1) % sched->num_workers;
+                size_t n = sched->num_workers;
+                for (int a = 0; a < STEAL_SAMPLES && !f; a++) {
+                    int victim_id = (int)(worker_rand(w) % n);
+                    if (victim_id == w->id) continue;
                     f = steal_from_worker(w, victim_id);
-                    if (f) break;
+                }
+            }
+        }
+
+        /* 2b. Stand in for a GIL worker that is parked in a blocking wait.
+         * Only reached when this worker found nothing of its own to do,
+         * and only while a GIL worker is actually blocked - so in the
+         * normal case this costs one relaxed atomic load. Without it, a
+         * single Python task that sleeps or waits on a Future would stall
+         * every other Python task until it woke up, since by default
+         * exactly one worker is allowed to run Python. */
+        if (!f && !w->gil_deque &&
+            atomic_load_explicit(&sched->blocked_gil_workers,
+                                 memory_order_relaxed) > 0) {
+            for (size_t i = 0; i < sched->num_gil_workers; i++) {
+                worker_t* victim = &sched->workers[i];
+                if (!victim->gil_deque) continue;
+                f = steal_bottom(victim->gil_deque);
+                if (f) {
+                    thief_credit(w, sched);
+                    break;
                 }
             }
         }
@@ -586,44 +738,154 @@ static void* worker_thread(void* arg) {
             }
         }
 
+        /* Nothing to run: give the GIL back before stealing, spinning or
+         * parking. Holding it here would block every other Python thread
+         * while this worker sits idle. */
+        if (!f && holding_gil) {
+            PyGILState_Release(gil_state);
+            holding_gil = 0;
+        }
+
         // 4. No work? Process timers and do a brief spin before sleeping
         if (!f) {
             process_timers(sched);
 
-            for (int spin = 0; spin < 100 && !w->stopped; spin++) {
-                __asm__ __volatile__("" ::: "memory");
-                f = pop_local(w);
-                if (f) break;
+            /* Spin on cheap ATOMIC LOADS only - never on a locked pop.
+             * The previous version called pop_local() (which takes the
+             * deque's spinlock and runs a seq_cst CAS) up to 100 times
+             * per idle round, on every idle worker. That is the single
+             * biggest reason an otherwise idle pool burned most of the
+             * machine: the idle workers were hammering the very locks
+             * the busy worker needed. Here the loop only reads
+             * top/bottom, and drops out to do a real pop when one of
+             * them actually looks non-empty. */
+            atomic_fetch_add(&sched->spinning_workers, 1);
+            for (int spin = 0; spin < IDLE_SPIN_ITERS && !w->stopped; spin++) {
+                cpu_relax();
 
-                // Check global queue (lock-free pop)
-                fiber_t* old_head = atomic_load(&sched->ready_queue);
-                while (old_head != NULL) {
-                    fiber_t* next = old_head->next_ready;
-                    if (atomic_compare_exchange_weak(&sched->ready_queue, &old_head, next)) {
-                        f = old_head;
-                        break;
+                /* This worker's own deques live on cache lines nobody
+                 * else writes in the common case, so polling them every
+                 * iteration is nearly free. */
+                if (w->gil_deque && !deque_empty(w->gil_deque)) {
+                    f = pop_top(w->gil_deque);
+                    if (f) break;
+                }
+                if (!deque_empty(w->deque)) {
+                    f = pop_local(w);
+                    if (f) break;
+                }
+
+                /* sched->ready_queue is written by every producer, so
+                 * every worker polling it each iteration turns one cache
+                 * line into an interconnect hot spot - with a dozen
+                 * spinners that costs far more than the rare global-queue
+                 * push it is watching for. Sample it occasionally
+                 * instead; the park below re-checks it anyway. */
+                if ((spin & 63) == 0 &&
+                    atomic_load_explicit(&sched->ready_queue,
+                                         memory_order_relaxed) != NULL) {
+                    fiber_t* old_head = atomic_load(&sched->ready_queue);
+                    while (old_head != NULL) {
+                        fiber_t* next = old_head->next_ready;
+                        if (atomic_compare_exchange_weak(&sched->ready_queue,
+                                                         &old_head, next)) {
+                            f = old_head;
+                            break;
+                        }
+                    }
+                    if (f) break;
+                }
+
+                /* Steal while spinning, not just after. This is what
+                 * makes it safe for wake_worker() to skip the futex when
+                 * somebody is already spinning: a spinner that only
+                 * watched its own deques would never notice work pushed
+                 * to a different worker, so the skipped wakeup would turn
+                 * into a stall. Sampled, for the same cache-line reason
+                 * as above. */
+                if ((spin & 255) == 0 && sched->config.work_stealing) {
+                    int victim_id = (int)(worker_rand(w) % sched->num_workers);
+                    if (victim_id != w->id) {
+                        f = steal_from_worker(w, victim_id);
+                        if (f) break;
                     }
                 }
-                if (f) break;
             }
+            atomic_fetch_sub(&sched->spinning_workers, 1);
         }
 
         // 5. Still no work? Wait on condition variable
         if (!f && !w->stopped) {
-            sched_yield();
-            struct timespec ts;
-            ts.tv_sec = 0;
-            ts.tv_nsec = 1000000; // 1ms timeout
-
-            pthread_mutex_lock(&sched->mutex);
-            // Re-check global queue under lock
-            if (sched->ready_queue) {
-                f = sched->ready_queue;
-                sched->ready_queue = f->next_ready;
-            } else {
-                pthread_cond_timedwait(&sched->cond, &sched->mutex, &ts);
+            /* Back off as idleness persists: a worker with nothing to do
+             * should cost nothing. Starts at 1 ms so latency is unchanged
+             * for a pool that is merely between tasks, and stretches to
+             * IDLE_SLEEP_MAX_NS for one that is genuinely unused - which
+             * is the normal state of the nogil workers when the program
+             * only runs Python tasks. Reset to the floor the moment this
+             * worker finds work again (see below). */
+            idle_rounds++;
+            uint64_t nap_ns = IDLE_SLEEP_MIN_NS << (idle_rounds > 5 ? 5 : idle_rounds - 1);
+            if (nap_ns > IDLE_SLEEP_MAX_NS) {
+                nap_ns = IDLE_SLEEP_MAX_NS;
             }
-            pthread_mutex_unlock(&sched->mutex);
+
+            struct timespec ts;
+
+            pthread_mutex_lock(&w->park_mutex);
+            atomic_store(&w->parked, 1);
+            atomic_fetch_add(&sched->parked_workers, 1);
+
+            /* Re-check AFTER publishing `parked`, under the same mutex a
+             * waker must take. Either we see the work here, or the waker
+             * sees parked==1 and signals - the window where both miss
+             * each other is closed by this ordering. */
+            if (!worker_has_work(w, sched)) {
+                clock_gettime(CLOCK_REALTIME, &ts);
+                uint64_t deadline = (uint64_t)ts.tv_sec * 1000000000ULL
+                                    + (uint64_t)ts.tv_nsec + nap_ns;
+                ts.tv_sec = (time_t)(deadline / 1000000000ULL);
+                ts.tv_nsec = (long)(deadline % 1000000000ULL);
+                pthread_cond_timedwait(&w->park_cond, &w->park_mutex, &ts);
+            }
+
+            atomic_fetch_sub(&sched->parked_workers, 1);
+            atomic_store(&w->parked, 0);
+            pthread_mutex_unlock(&w->park_mutex);
+        }
+
+        if (f) {
+            idle_rounds = 0;
+        }
+
+        /* Hold the GIL across a RUN of Python fibers instead of letting
+         * each one take and drop it.
+         *
+         * Every GIL-bound fiber body does PyGILState_Ensure/Release
+         * internally (Cython's `with gil`). Those calls are cheap when
+         * this thread already holds the GIL - they just nest - so
+         * acquiring once here and running a run of queued Python fibers
+         * under it removes an acquire/release pair per task. This is the
+         * same amortisation spawn() gets by packing many calls into one
+         * fiber, except it applies to gs.task(), where each task keeps
+         * its own fiber and its own error isolation. Measured: per-task
+         * GIL traffic was the gap between spawn()'s 0.07 us/task and
+         * gs.task()'s ~10 us/task.
+         *
+         * Released before anything that blocks or idles (below), so this
+         * never keeps the GIL from other Python threads while this
+         * worker has nothing to run. */
+        if (f && f->gil_bound && !holding_gil && !w->stopped) {
+            gil_state = PyGILState_Ensure();
+            holding_gil = 1;
+            gil_run = 0;
+        } else if (f && !f->gil_bound && holding_gil) {
+            /* A nogil fiber has no business running under the GIL - it
+             * would serialise against every Python thread for nothing. */
+            PyGILState_Release(gil_state);
+            holding_gil = 0;
+        }
+        if (holding_gil) {
+            gil_run++;
         }
 
         // 6. Execute found fiber
@@ -681,7 +943,11 @@ static void* worker_thread(void* arg) {
                     }
                     w->current_fiber = NULL;
                     fiber_set_current(NULL);
-                    sched_yield();
+                    /* No sched_yield() here: it was a syscall on the
+                     * completion path of every single task, and giving up
+                     * the CPU right after finishing one task is the
+                     * opposite of what this worker should do when its own
+                     * queue still has work queued behind it. */
                     continue;
                 }
                 /* Fiber resumed here after yield (from a yield inside its own func) */
@@ -696,6 +962,11 @@ static void* worker_thread(void* arg) {
             w->current_fiber = NULL;
             fiber_set_current(NULL);
         }
+    }
+
+    if (holding_gil) {
+        PyGILState_Release(gil_state);
+        holding_gil = 0;
     }
 
     return NULL;
@@ -719,22 +990,47 @@ static inline size_t deque_size(deque_t* dq) {
     return (b > t) ? (b - t) : 0;
 }
 
-/* Select victim based on load - steal from busiest worker */
+/* Cheap per-worker PRNG (xorshift64*) for randomized victim choice. */
+static inline uint64_t worker_rand(worker_t* w) {
+    uint64_t x = w->rng_state;
+    if (x == 0) {
+        x = 0x9E3779B97F4A7C15ULL ^ ((uint64_t)w->id + 1);
+    }
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    w->rng_state = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
+/* Select victim based on load - steal from busiest worker.
+ *
+ * Samples a bounded number of RANDOM victims rather than scanning every
+ * worker. The full scan this replaced was O(num_workers) cache-missing
+ * loads of two hot atomics per idle iteration, run by every idle worker
+ * in a tight loop - on 12 workers that is ~144 cross-core loads per
+ * round, and it lands on exactly the deques that a busy worker is trying
+ * to own. Randomized bounded sampling is what Go's scheduler does, for
+ * the same reason. */
 static int select_victim_adaptive(worker_t* thief) {
     scheduler_t* sched = g_scheduler;
-    if (sched->num_workers <= 1) {
+    size_t n = sched->num_workers;
+    if (n <= 1) {
         return -1;
     }
 
     size_t max_size = 0;
     int victim = -1;
 
-    /* Find worker with most work */
-    for (size_t i = 0; i < sched->num_workers; i++) {
-        if (i == (size_t)thief->id) continue;
+    size_t samples = n - 1 < STEAL_SAMPLES ? n - 1 : STEAL_SAMPLES;
+    for (size_t s = 0; s < samples; s++) {
+        size_t i = (size_t)(worker_rand(thief) % n);
+        if (i == (size_t)thief->id) {
+            i = (i + 1) % n;
+            if (i == (size_t)thief->id) continue;
+        }
 
-        worker_t* w = &sched->workers[i];
-        size_t size = deque_size(w->deque);
+        size_t size = deque_size(sched->workers[i].deque);
 
         /* Only consider stealing if worker has > 2 tasks */
         if (size > max_size && size >= 2) {
@@ -805,6 +1101,20 @@ int scheduler_init(scheduler_config_t* config) {
     sched->num_workers = sched->config.num_workers;
     sched->backend = sched->config.backend;
 
+    /* Workers [0, num_gil_workers) get a gil_deque and are the only ones
+     * that ever run Python. Default 1: under a normal (GIL-holding)
+     * CPython, a second GIL worker turns every task boundary into a
+     * cross-thread GIL handoff and makes things strictly worse. Clamped
+     * to num_workers so a 1-worker scheduler still runs Python. */
+    sched->num_gil_workers = sched->config.num_gil_workers;
+    if (sched->num_gil_workers == 0) {
+        sched->num_gil_workers = 1;
+    }
+    if (sched->num_gil_workers > sched->num_workers) {
+        sched->num_gil_workers = sched->num_workers;
+    }
+    atomic_store(&sched->next_gil_worker, 0);
+
     /* Pre-allocate headroom for dynamic growth (see
      * scheduler_note_blocking_wait_begin()) so growth never has to
      * realloc `workers` - existing worker threads hold raw pointers
@@ -832,6 +1142,11 @@ int scheduler_init(scheduler_config_t* config) {
         w->steals_attempted = 0;
         w->steals_successful = 0;
 
+        pthread_mutex_init(&w->park_mutex, NULL);
+        pthread_cond_init(&w->park_cond, NULL);
+        atomic_store(&w->parked, 0);
+        w->rng_state = 0;
+
         w->deque = (deque_t*)calloc(1, sizeof(deque_t));
         if (!w->deque) {
             for (size_t j = 0; j < i; j++) {
@@ -857,10 +1172,37 @@ int scheduler_init(scheduler_config_t* config) {
             free(sched);
             return -1;
         }
+
+        /* Only the GIL workers carry a second queue; gil_deque == NULL is
+         * what identifies a worker as nogil-only everywhere else. */
+        w->gil_deque = NULL;
+        if (i < sched->num_gil_workers) {
+            w->gil_deque = (deque_t*)calloc(1, sizeof(deque_t));
+            if (!w->gil_deque || deque_init(w->gil_deque, 65536) != 0) {
+                free(w->gil_deque);
+                free(w->deque->data);
+                free(w->deque);
+                for (size_t j = 0; j < i; j++) {
+                    if (sched->workers[j].gil_deque) {
+                        free(sched->workers[j].gil_deque->data);
+                        free(sched->workers[j].gil_deque);
+                    }
+                    if (sched->workers[j].deque) {
+                        free(sched->workers[j].deque->data);
+                        free(sched->workers[j].deque);
+                    }
+                }
+                free(sched->workers);
+                free(sched);
+                return -1;
+            }
+        }
     }
     
     pthread_mutex_init(&sched->mutex, NULL);
     pthread_cond_init(&sched->cond, NULL);
+    pthread_mutex_init(&sched->done_mutex, NULL);
+    pthread_cond_init(&sched->done_cond, NULL);
 
     /* Initialize worker manager */
     worker_manager_init(&sched->worker_manager, sched->num_workers);
@@ -963,6 +1305,14 @@ static void scheduler_grow_workers_locked(scheduler_t* sched) {
     w->tasks_executed = 0;
     w->steals_attempted = 0;
     w->steals_successful = 0;
+    w->rng_state = 0;
+    pthread_mutex_init(&w->park_mutex, NULL);
+    pthread_cond_init(&w->park_cond, NULL);
+    atomic_store(&w->parked, 0);
+    /* Grown workers are nogil-only: they exist to absorb blocking waits,
+     * and a GIL worker's queue is covered by the blocked_gil_workers
+     * stand-in path instead. */
+    w->gil_deque = NULL;
 
     w->deque = (deque_t*)calloc(1, sizeof(deque_t));
     if (!w->deque) {
@@ -1003,6 +1353,14 @@ void scheduler_note_blocking_wait_begin(void) {
         return;  /* Only worker threads occupy a pool slot */
     }
 
+    /* If the parking thread is one of the (by default: one) workers
+     * allowed to run Python, flag that the GIL queues need a stand-in,
+     * or Python work would sit undrained until this wait returns. */
+    int wid = scheduler_current_worker();
+    if (wid >= 0 && (size_t)wid < sched->num_gil_workers) {
+        atomic_fetch_add(&sched->blocked_gil_workers, 1);
+    }
+
     size_t blocked = atomic_fetch_add(&sched->blocked_workers, 1) + 1;
     if (blocked >= sched->num_workers) {
         pthread_mutex_lock(&sched->growth_mutex);
@@ -1019,6 +1377,10 @@ void scheduler_note_blocking_wait_end(void) {
     scheduler_t* sched = g_scheduler;
     if (!sched || !fiber_current()) {
         return;
+    }
+    int wid = scheduler_current_worker();
+    if (wid >= 0 && (size_t)wid < sched->num_gil_workers) {
+        atomic_fetch_sub(&sched->blocked_gil_workers, 1);
     }
     atomic_fetch_sub(&sched->blocked_workers, 1);
 }
@@ -1042,17 +1404,36 @@ void scheduler_shutdown(bool wait_for_completion) {
     }
     pthread_cond_broadcast(&sched->cond);
     pthread_mutex_unlock(&sched->mutex);
-    
+
+    /* Workers park on their own condvar now, so the broadcast above is
+     * not enough to reach them - without this, join() would stall for a
+     * full idle-backoff interval per sleeping worker. */
+    for (size_t i = 0; i < sched->num_workers; i++) {
+        worker_t* w = &sched->workers[i];
+        pthread_mutex_lock(&w->park_mutex);
+        pthread_cond_broadcast(&w->park_cond);
+        pthread_mutex_unlock(&w->park_mutex);
+    }
+
     for (size_t i = 0; i < sched->num_workers; i++) {
         pthread_join(sched->workers[i].thread, NULL);
         if (sched->workers[i].deque) {
             free(sched->workers[i].deque->data);
             free(sched->workers[i].deque);
         }
+        if (sched->workers[i].gil_deque) {
+            free(sched->workers[i].gil_deque->data);
+            free(sched->workers[i].gil_deque);
+            sched->workers[i].gil_deque = NULL;
+        }
+        pthread_cond_destroy(&sched->workers[i].park_cond);
+        pthread_mutex_destroy(&sched->workers[i].park_mutex);
     }
-    
+
     pthread_mutex_destroy(&sched->mutex);
     pthread_cond_destroy(&sched->cond);
+    pthread_mutex_destroy(&sched->done_mutex);
+    pthread_cond_destroy(&sched->done_cond);
     pthread_mutex_destroy(&sched->growth_mutex);
 
     if (sched->fd_table) {
@@ -1103,19 +1484,41 @@ scheduler_t* scheduler_get(void) {
     return g_scheduler;
 }
 
+size_t scheduler_num_gil_workers(void) {
+    return g_scheduler ? g_scheduler->num_gil_workers : 0;
+}
+
 uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
+    /* Default is the nogil form: pure-C callers (c_tasks) keep using
+     * every worker. Python bodies must go through scheduler_spawn_ex(). */
+    return scheduler_spawn_ex(entry, user_data, 0);
+}
+
+uint64_t scheduler_spawn_ex(void (*entry)(void*), void* user_data, int gil_bound) {
     if (!g_scheduler || !entry) {
         return 0;
     }
-    
+
     fiber_t* f = NULL;
 
     /* Round-robin worker selection - computed BEFORE pool allocation so
      * we can allocate from the shard matching the worker that will
      * actually run this fiber. Allocating from a mismatched shard
      * starves it and forces the pool to keep growing instead of
-     * reusing freed fibers (see fiber_pool_alloc()'s doc comment). */
-    size_t worker_idx = atomic_fetch_add(&g_scheduler->next_worker, 1) % g_scheduler->num_workers;
+     * reusing freed fibers (see fiber_pool_alloc()'s doc comment).
+     *
+     * GIL-bound fibers round-robin only over the GIL workers (default:
+     * just worker 0), so consecutive Python tasks stay on one OS thread
+     * and run under a single GIL acquisition instead of handing the GIL
+     * back and forth. nogil fibers still spread over every worker. */
+    size_t worker_idx;
+    if (gil_bound) {
+        worker_idx = atomic_fetch_add(&g_scheduler->next_gil_worker, 1)
+                     % g_scheduler->num_gil_workers;
+    } else {
+        worker_idx = atomic_fetch_add(&g_scheduler->next_worker, 1)
+                     % g_scheduler->num_workers;
+    }
     int worker_id = (int)worker_idx;
 
     /* Try fiber pool first for faster allocation */
@@ -1127,7 +1530,11 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
             f->arg = user_data;
             f->parent = fiber_current();
 
-            /* Lazy stack allocation - allocate now if needed */
+            /* Lazy stack allocation - allocate now if needed.
+             * Compiled out by default: fiber bodies run as plain calls
+             * on the worker's own stack, so this mmap was per-fiber
+             * waste. See FIBER_ALLOCATE_STACKS in fiber.h. */
+#if FIBER_ALLOCATE_STACKS == 1
             if (!f->stack_base) {
                 size_t stack_size = g_scheduler->config.stack_size > 0 ?
                     g_scheduler->config.stack_size : FIBER_DEFAULT_STACK_SIZE;
@@ -1153,6 +1560,7 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
                 f->stack_size = stack_size;
                 f->stack_capacity = stack_size;
             }
+#endif /* FIBER_ALLOCATE_STACKS */
         }
     }
 
@@ -1164,6 +1572,10 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
     if (!f) {
         return 0;
     }
+
+    /* Recorded on the fiber so a later reschedule (fiber_yield, unblock)
+     * can route it back to a worker of the right class. */
+    f->gil_bound = gil_bound ? 1 : 0;
 
     /* Lock-free atomic increment for spawn tracking */
     scheduler_atomic_inc_fibers_spawned();
@@ -1178,8 +1590,76 @@ uint64_t scheduler_spawn(void (*entry)(void*), void* user_data) {
     return fiber_id(f);
 }
 
+/* Wake one specific worker, and only if it is actually asleep.
+ *
+ * The relaxed load is the fast path: with a busy worker the answer is
+ * "not parked" and this costs nothing, versus the unconditional
+ * pthread_cond_signal() per spawn it replaces. Taking park_mutex when it
+ * *is* parked is what closes the lost-wakeup window against the parker,
+ * which sets `parked` and re-checks its queues under the same mutex. */
+static inline void wake_worker(worker_t* w) {
+    if (atomic_load_explicit(&w->parked, memory_order_relaxed)) {
+        pthread_mutex_lock(&w->park_mutex);
+        pthread_cond_signal(&w->park_cond);
+        pthread_mutex_unlock(&w->park_mutex);
+    }
+}
+
+/* Wake the owner of freshly pushed work - unless a worker is already
+ * spinning, in which case skip the futex entirely and let it steal the
+ * fiber. This is the common case for a producer feeding tasks faster
+ * than any single worker drains them, where waking the target per task
+ * costs a syscall per task. Correct because spinners steal (see the
+ * spin loop), and because a parked worker still has its backoff timeout
+ * as a backstop if the spinner happens to miss it. */
+static inline void wake_owner(scheduler_t* sched, worker_t* w) {
+    if (!atomic_load_explicit(&w->parked, memory_order_relaxed)) {
+        return;  /* already awake - nothing to do */
+    }
+    if (atomic_load_explicit(&sched->spinning_workers, memory_order_relaxed) > 0) {
+        return;  /* a spinner will pick it up */
+    }
+    wake_worker(w);
+}
+
+/* Wake any one sleeping worker - for pushes to the shared ready queue,
+ * which has no particular owner. */
+static void wake_any_worker(scheduler_t* sched) {
+    if (atomic_load_explicit(&sched->parked_workers, memory_order_relaxed) == 0) {
+        return;
+    }
+    for (size_t i = 0; i < sched->num_workers; i++) {
+        if (atomic_load_explicit(&sched->workers[i].parked, memory_order_relaxed)) {
+            wake_worker(&sched->workers[i]);
+            return;
+        }
+    }
+}
+
 void scheduler_schedule(fiber_t* f, int worker_id) {
     if (!g_scheduler || !f) {
+        return;
+    }
+
+    /* A GIL-bound fiber must never land on the global ready queue or on a
+     * plain worker deque: both are drained by nogil workers, which would
+     * put Python back on several OS threads at once and undo the whole
+     * point of the split. Route it to a GIL worker's gil_deque instead,
+     * picking one here if the caller didn't name a valid one. */
+    if (f->gil_bound) {
+        size_t g = g_scheduler->num_gil_workers;
+        if (g == 0) {
+            g = 1;  /* degenerate config - worker 0 still runs it */
+        }
+        size_t target;
+        if (worker_id >= 0 && (size_t)worker_id < g) {
+            target = (size_t)worker_id;
+        } else {
+            target = atomic_fetch_add(&g_scheduler->next_gil_worker, 1) % g;
+        }
+        worker_t* w = &g_scheduler->workers[target];
+        push_top(w->gil_deque ? w->gil_deque : w->deque, f);
+        wake_worker(w);
         return;
     }
 
@@ -1189,14 +1669,15 @@ void scheduler_schedule(fiber_t* f, int worker_id) {
         do {
             f->next_ready = old_head;
         } while (!atomic_compare_exchange_weak(&g_scheduler->ready_queue, &old_head, f));
-        
-        /* Wake up at least one worker */
-        pthread_cond_signal(&g_scheduler->cond);
+
+        /* No particular owner - wake whoever is asleep */
+        wake_any_worker(g_scheduler);
     } else {
         worker_t* w = &g_scheduler->workers[worker_id];
         push_local(w, f);
-        /* Signal worker maybe waiting on condition */
-        pthread_cond_signal(&g_scheduler->cond);
+        /* Wake exactly the worker that now owns this fiber - or nobody,
+         * if a spinner is already positioned to steal it. */
+        wake_owner(g_scheduler, w);
     }
 }
 
@@ -1276,48 +1757,33 @@ void scheduler_wait_all(void) {
         return;
     }
 
-    /* Wait using atomic task count - this is the authoritative count */
-    uint64_t spin_count = 0;
-    uint64_t last_task_count = 0;
-    uint64_t stuck_count = 0;
-    
-    while (scheduler_atomic_get_task_count() > 0) {
-        uint64_t current_count = scheduler_atomic_get_task_count();
-        
-        /* Check if we're stuck (task count not decreasing) */
-        if (current_count == last_task_count) {
-            stuck_count++;
-            /* After many spins with same count, log diagnostic */
-            if (stuck_count > 1000000) {
-                fprintf(stderr, "[gsyncio] scheduler_wait_all: stuck at %lu tasks\n", 
-                        (unsigned long)current_count);
-                stuck_count = 0;
-            }
-        } else {
-            last_task_count = current_count;
-            stuck_count = 0;
-        }
-        
-        /* Yield to allow workers to run - RELEASE GIL TO PREVENT DEADLOCK */
-        #ifdef Py_BEGIN_ALLOW_THREADS
-        Py_BEGIN_ALLOW_THREADS
-        #endif
-        
-        struct timespec ts = {0, 1000000}; // 1ms sleep to reduce CPU usage
-        nanosleep(&ts, NULL);
-        
-        #ifdef Py_END_ALLOW_THREADS
-        Py_END_ALLOW_THREADS
-        #endif
-        
-        /* Print diagnostic after many spins */
-        spin_count++;
-        if (spin_count > 1000) {  /* Reduced from 1M since we sleep now */
-            // Reduced verbosity to avoid flooding logs
-            // fprintf(stderr, "[gsyncio] scheduler_wait_all: task_count=%lu\n", current_count);
-            spin_count = 0;
-        }
+    /* Blocks on done_cond, which the last completing task broadcasts.
+     * The previous version polled the counter every millisecond, which
+     * put a 1 ms floor under every gs.sync() no matter how quick the
+     * work was, and burned a wakeup per millisecond while waiting.
+     *
+     * Callers reach here through Cython's `with nogil`, so the GIL is
+     * already released - the Py_BEGIN_ALLOW_THREADS that used to wrap
+     * the sleep here was releasing a lock this thread did not hold.
+     *
+     * The timed wait is a liveness backstop, not the mechanism: it
+     * covers the case where the count reached zero between our check
+     * and the wait despite the mutex, and bounds any lost wakeup. */
+    if (scheduler_atomic_get_task_count() == 0) {
+        return;
     }
+
+    pthread_mutex_lock(&sched->done_mutex);
+    while (scheduler_atomic_get_task_count() > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t deadline = (uint64_t)ts.tv_sec * 1000000000ULL
+                            + (uint64_t)ts.tv_nsec + 20000000ULL; /* 20 ms */
+        ts.tv_sec = (time_t)(deadline / 1000000000ULL);
+        ts.tv_nsec = (long)(deadline % 1000000000ULL);
+        pthread_cond_timedwait(&sched->done_cond, &sched->done_mutex, &ts);
+    }
+    pthread_mutex_unlock(&sched->done_mutex);
 }
 
 /* Debug/Diagnostic functions implementation */
@@ -1354,13 +1820,17 @@ size_t scheduler_total_queued_fibers(void) {
     }
     pthread_mutex_unlock(&sched->mutex);
     
-    /* Count per-worker local queues */
+    /* Count per-worker local queues (both classes) */
     for (size_t i = 0; i < sched->num_workers; i++) {
         if (!deque_empty(sched->workers[i].deque)) {
             total += deque_size(sched->workers[i].deque);
         }
+        if (sched->workers[i].gil_deque &&
+            !deque_empty(sched->workers[i].gil_deque)) {
+            total += deque_size(sched->workers[i].gil_deque);
+        }
     }
-    
+
     return total;
 }
 
@@ -1378,6 +1848,12 @@ void scheduler_print_debug_info(void) {
     fprintf(stderr, "Total queued fibers: %zu\n", scheduler_total_queued_fibers());
     fprintf(stderr, "Fibers spawned: %lu\n", sched->stats.atomic_fibers_spawned);
     fprintf(stderr, "Fibers completed: %lu\n", sched->stats.atomic_fibers_completed);
+    fprintf(stderr, "Fiber pool capacity (distinct fibers ever minted): %zu\n", fiber_pool_capacity((fiber_pool_t*)sched->fiber_pool));
+    {
+        size_t primary, fallback, grows;
+        fiber_pool_diag_counts(&primary, &fallback, &grows);
+        fprintf(stderr, "Alloc breakdown: primary_hit=%zu fallback_hit=%zu grow=%zu\n", primary, fallback, grows);
+    }
     
     for (size_t i = 0; i < sched->num_workers; i++) {
         worker_t* w = &sched->workers[i];

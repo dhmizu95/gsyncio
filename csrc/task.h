@@ -89,6 +89,12 @@ void task_registry_destroy(task_registry_t* reg);
  */
 task_handle_t* task_spawn(task_registry_t* reg, void (*func)(void*), void* arg);
 
+/* Spawn and return just the fiber id, with no task_handle_t allocated.
+ * task_spawn() heap-allocates a handle that the only caller (the Cython
+ * layer) reads one field from and immediately free()s - a malloc/free
+ * pair per task for nothing. Returns 0 on failure. */
+uint64_t task_spawn_id(task_registry_t* reg, void (*func)(void*), void* arg);
+
 /**
  * Task wrapper function (internal)
  * @param arg Wrapper argument

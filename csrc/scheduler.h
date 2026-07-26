@@ -137,6 +137,13 @@ typedef struct deque {
 typedef struct worker {
     int id;
     deque_t* deque;
+    /* Run queue for GIL-bound fibers. Allocated only on workers
+     * [0, num_gil_workers) - NULL on every other worker, which is also
+     * what marks a worker as "not a GIL worker". Kept separate from
+     * `deque` so nogil workers can steal freely from each other without
+     * ever picking up work that would make them contend for the GIL.
+     * See fiber_t::gil_bound for why the classes are split at all. */
+    deque_t* gil_deque;
     fiber_t* current_fiber;
     _Atomic bool running;
     _Atomic bool started;      /* Worker thread has started */
@@ -146,6 +153,19 @@ typedef struct worker {
     uint64_t steals_attempted;
     uint64_t steals_successful;
     int last_victim;
+    uint64_t rng_state;        /* xorshift state for random victim choice */
+
+    /* Per-worker parking. A single scheduler-wide condvar cannot wake a
+     * *particular* worker: signalling it wakes an arbitrary sleeper, so
+     * pushing work to worker 0 would typically wake one of the idle
+     * workers instead, which finds nothing and goes back to sleep. With
+     * one GIL worker and eleven idle ones that turned every spawn into a
+     * spurious wakeup - measured at ~10 of 12 cores busy while doing one
+     * core of actual work. Waking the exact target instead keeps idle
+     * workers asleep and makes the backoff below safe to lengthen. */
+    pthread_mutex_t park_mutex;
+    pthread_cond_t park_cond;
+    _Atomic int parked;
     jmp_buf yield_jump;  /* Jump buffer for fiber yields */
 } worker_t;
 
@@ -157,6 +177,12 @@ typedef struct scheduler_config {
     scheduler_backend_t backend;
     fiber_stack_mode_t stack_mode;
     size_t io_uring_entries;
+    /* How many worker threads are allowed to run GIL-bound fibers.
+     * 0 means "use the default" (1). Going above 1 only helps if the
+     * interpreter has no GIL (free-threaded CPython) - under a normal
+     * build, extra GIL workers make Python-bodied tasks slower, not
+     * faster. See fiber_t::gil_bound. */
+    size_t num_gil_workers;
 } scheduler_config_t;
 
 typedef struct scheduler_stats {
@@ -279,6 +305,30 @@ typedef struct scheduler {
     pthread_mutex_t growth_mutex;   /* Serializes concurrent growth attempts */
     _Atomic size_t next_worker;  /* Atomic round-robin worker selection */
 
+    size_t num_gil_workers;          /* Workers [0, this) serve gil_deque */
+    _Atomic size_t next_gil_worker;  /* Round-robin among the GIL workers */
+    /* Number of GIL workers currently parked in a real blocking wait
+     * (future_wait, a long sleep). While this is non-zero the GIL run
+     * queues would otherwise sit unserved - there is only one GIL worker
+     * by default - so idle nogil workers volunteer to drain them. Safe:
+     * a worker blocked in one of those waits has released the GIL, so a
+     * helper picking up Python work is not a second concurrent
+     * interpreter thread, it is the only one. */
+    _Atomic size_t blocked_gil_workers;
+
+    /* Workers currently parked on `cond` waiting for work. Lets
+     * scheduler_schedule() skip pthread_cond_signal() when nobody is
+     * asleep - otherwise every spawn pays a futex syscall. */
+    _Atomic size_t parked_workers;
+
+    /* Workers currently in the pre-park spin. Capped, so an idle pool
+     * keeps a couple of hot threads for low wake-up latency instead of
+     * putting every worker into a spin loop - which on a laptop-class
+     * CPU just triggers thermal throttling and makes everything slower
+     * and less predictable. Go bounds its spinning Ms for the same
+     * reason. */
+    _Atomic size_t spinning_workers;
+
     _Atomic(fiber_t*) ready_queue;
     fiber_t* blocked_queue;
 
@@ -294,6 +344,13 @@ typedef struct scheduler {
 
     pthread_mutex_t mutex;
     pthread_cond_t cond;
+
+    /* Signalled when the active task count reaches zero, so
+     * scheduler_wait_all() (i.e. gs.sync()) can block instead of waking
+     * every millisecond to re-read a counter. Only touched on the
+     * transition to zero, so it costs nothing per task. */
+    pthread_mutex_t done_mutex;
+    pthread_cond_t done_cond;
 
     void* fiber_pool;
 
@@ -328,7 +385,17 @@ void scheduler_shutdown(bool wait_for_completion);
 scheduler_t* scheduler_get(void);
 
 uint64_t scheduler_spawn(void (*entry)(void*), void* user_data);
+
+/* Same as scheduler_spawn(), but states whether the fiber body needs the
+ * GIL. scheduler_spawn() is the nogil form (gil_bound = 0) so pure-C
+ * callers keep their existing behavior; anything running Python must use
+ * this with gil_bound = 1 so it lands on a GIL worker. */
+uint64_t scheduler_spawn_ex(void (*entry)(void*), void* user_data, int gil_bound);
+
 void scheduler_schedule(fiber_t* f, int worker_id);
+
+/* Number of worker threads permitted to run GIL-bound fibers. */
+size_t scheduler_num_gil_workers(void);
 
 /* Batch scheduling APIs */
 

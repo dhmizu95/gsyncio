@@ -1,6 +1,9 @@
 # cython: language_level=3
 # cython: boundscheck=False
 # cython: wraparound=False
+# cython: freethreading_compatible = True
+# (see _gsyncio_core.pyx - an undeclared module re-enables the GIL
+#  process-wide on a free-threaded build)
 
 """
 _gsyncio_native_io.pyx - Python bindings for native I/O

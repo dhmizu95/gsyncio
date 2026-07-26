@@ -16,16 +16,27 @@ class Future:
     Compatible with both asyncio and gsyncio fiber contexts.
     """
 
+    # One Future exists per coroutine on the gather()/create_task() paths,
+    # so at a million coroutines these three fields are a million dicts
+    # and a million empty lists. __slots__ drops the per-instance dict and
+    # the callback list is created only if something actually registers
+    # one - which nothing does unless the Future is awaited before it
+    # resolves.
+    __slots__ = ("_inner", "_callbacks", "_done_flag")
+
     def __init__(self):
         self._inner     = _CFuture()
-        self._callbacks: List[Callable] = []
+        self._callbacks: Optional[List[Callable]] = None
         self._done_flag = False
 
     # ── Status ────────────────────────────────────────────────────────────────
 
     @property
     def done(self) -> bool:
-        return self._inner.done or self._done_flag
+        # _done_flag first: it is a plain Python bool, whereas _inner.done
+        # crosses into C and takes the future's pthread mutex. This is on
+        # the hot path of every await.
+        return self._done_flag or self._inner.done
 
     @property
     def cancelled(self) -> bool:
@@ -52,7 +63,11 @@ class Future:
         self._fire_callbacks()
 
     def _fire_callbacks(self):
-        for cb in self._callbacks:
+        cbs = self._callbacks
+        if not cbs:
+            return
+        self._callbacks = None
+        for cb in cbs:
             try:
                 cb(self)
             except Exception:
@@ -66,10 +81,14 @@ class Future:
                 cb(self)
             except Exception:
                 pass
+        elif self._callbacks is None:
+            self._callbacks = [cb]
         else:
             self._callbacks.append(cb)
 
     def remove_callback(self, cb: Callable[["Future"], None]) -> None:
+        if self._callbacks is None:
+            return
         try:
             self._callbacks.remove(cb)
         except ValueError:
@@ -79,6 +98,17 @@ class Future:
 
     def __await__(self):
         if not self.done:
+            from ._suspend import driver_active
+            if driver_active():
+                # A gsyncio coroutine driver is stepping us, so hand the
+                # Future up to it and suspend. It re-steps this coroutine
+                # via a done-callback, leaving the worker thread free
+                # meanwhile - the alternative below would block that
+                # thread until the Future resolved, which is what capped
+                # concurrency at the worker count.
+                yield self
+                return self._inner.result()
+
             if _HAS_CYTHON and current_fiber_id() != 0:
                 # On a native gsyncio fiber: self._inner.result() below
                 # already blocks via a true C-level fiber-park

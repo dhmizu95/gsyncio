@@ -26,6 +26,27 @@ extern "C" {
 #define FIBER_STACK_GROW_STEP 4096      /* Grow by 4KB */
 #define FIBER_DEFAULT_STACK_SIZE 8192   /* 8KB default - safer for Python 3.12 */
 #define FIBER_USE_GUARD_PAGES 0         /* Disable guard pages to reach 1M+ system limit */
+
+/* Whether fibers get their own mmap'd stack.
+ *
+ * 0, because nothing in this codebase runs on one. A fiber body is
+ * invoked as a plain call - worker_thread() does `f->func(f->arg)` on
+ * the worker's own OS stack - and fiber_yield() reschedules without any
+ * stack switch, so stack_base/stack_ptr were allocated, paged in, and
+ * freed without ever being touched.
+ *
+ * The cost was not theoretical: with STACK_MODE_HYBRID (the default the
+ * Python binding passes) every fiber allocation mmap'd 8KB and every
+ * free munmap'd it, so a million tasks meant a million mmap/munmap
+ * pairs. Both take the process-wide mmap_lock and munmap additionally
+ * triggers TLB shootdown IPIs to every core, which serialises all the
+ * workers in the kernel. Measured: 1M create_task() went from 14.6
+ * us/task (pool warm, stacks kept mapped) to 97.8 us/task once the pool
+ * had to keep minting and unmapping them.
+ *
+ * Set back to 1 if real stack-switching fibers are ever implemented -
+ * that is the only thing these fields are for. */
+#define FIBER_ALLOCATE_STACKS 0
 #define FIBER_POOL_LAZY_ALLOC 1         /* Lazy stack allocation for memory efficiency */
 
 /* ============================================ */
@@ -86,6 +107,20 @@ struct fiber {
 
     /* Thread affinity (0 = any) */
     int32_t affinity;
+
+    /* Does this fiber's body need the CPython GIL to run?
+     *
+     * Set at spawn time: 1 for anything that calls into Python (every
+     * gs.task()/gs.spawn()/coroutine fiber), 0 for pure-C bodies
+     * (c_tasks). The scheduler keeps the two classes on separate run
+     * queues and separate worker threads, because they want opposite
+     * things: nogil fibers scale with worker count, GIL-bound fibers are
+     * serialized by the interpreter anyway and get *slower* with every
+     * extra worker (each task boundary becomes a GIL handoff between OS
+     * threads - a futex sleep/wake pair). Measured on 12 cores: 0.86
+     * us/task nogil flat across 1-12 workers, vs 13 us/task on one
+     * worker and 87 us/task on twelve for a Python body. */
+    int32_t gil_bound;
 
     /* Fiber pool (for pooled allocation) */
     void* pool;

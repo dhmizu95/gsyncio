@@ -109,6 +109,11 @@ void fiber_pool_destroy(fiber_pool_t* pool) {
 }
 
 static fiber_t* alloc_stack_for(fiber_t* f) {
+#if FIBER_ALLOCATE_STACKS == 0
+    /* Fibers run as plain calls on the worker's stack - see
+     * FIBER_ALLOCATE_STACKS in fiber.h. Nothing reads these fields. */
+    return f;
+#else
 #if FIBER_POOL_LAZY_STACK == 1
     if (!f->stack_base) {
 #if FIBER_USE_GUARD_PAGES == 1
@@ -133,6 +138,18 @@ static fiber_t* alloc_stack_for(fiber_t* f) {
     }
 #endif
     return f;
+#endif /* FIBER_ALLOCATE_STACKS */
+}
+
+/* TEMP diagnostic counters - where allocations actually land. Not exposed
+ * anywhere permanent, just printed via scheduler_print_debug_info(). */
+static _Atomic size_t g_diag_primary_hits = 0;
+static _Atomic size_t g_diag_fallback_hits = 0;
+static _Atomic size_t g_diag_grows = 0;
+void fiber_pool_diag_counts(size_t* primary, size_t* fallback, size_t* grows) {
+    *primary = atomic_load(&g_diag_primary_hits);
+    *fallback = atomic_load(&g_diag_fallback_hits);
+    *grows = atomic_load(&g_diag_grows);
 }
 
 fiber_t* fiber_pool_alloc(fiber_pool_t* pool, int worker_hint) {
@@ -148,6 +165,7 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool, int worker_hint) {
         f->next_ready = NULL;
         atomic_fetch_sub(&shard->available, 1);
         pthread_spin_unlock(&shard->lock);
+        atomic_fetch_add(&g_diag_primary_hits, 1);
 
         if (!alloc_stack_for(f)) {
             /* mmap failed - hand the fiber back to its shard and bail,
@@ -166,9 +184,55 @@ fiber_t* fiber_pool_alloc(fiber_pool_t* pool, int worker_hint) {
     }
     pthread_spin_unlock(&shard->lock);
 
-    /* Shard's free list is empty - grow instead of scanning other
-     * shards. Growth is a single lock-free counter shared by all
-     * shards, so this never contends with any shard's lock. */
+    /* This shard's free list is empty. Before minting a brand-new fiber
+     * (which means a fresh mmap() for its stack), check whether another
+     * shard is sitting on spares - fiber_pool_free() returns a fiber to
+     * whichever worker actually *executed* it, not the shard it was
+     * originally handed out from, so a stolen task's fiber comes back on
+     * the thief's shard instead of this one. Under any real amount of
+     * work-stealing that leaves this shard permanently starved while
+     * fibers pile up elsewhere, even though the pool overall has plenty
+     * of reusable capacity (measured: 100K tasks minted ~105K distinct
+     * fibers - essentially zero reuse - before this fallback existed).
+     * Scan with trylock so a contended shard is just skipped rather than
+     * stalling this allocation. */
+    size_t primary = shard_index_for(worker_hint);
+    for (size_t i = 1; i < FIBER_POOL_NUM_SHARDS; i++) {
+        fiber_pool_shard_t* other = &pool->shards[(primary + i) % FIBER_POOL_NUM_SHARDS];
+        if (!atomic_load(&other->free_list)) {
+            continue;
+        }
+        if (pthread_spin_trylock(&other->lock) != 0) {
+            continue;
+        }
+        fiber_t* stolen = (fiber_t*)atomic_load(&other->free_list);
+        if (stolen) {
+            atomic_store(&other->free_list, stolen->next_ready);
+            stolen->next_ready = NULL;
+            atomic_fetch_sub(&other->available, 1);
+        }
+        pthread_spin_unlock(&other->lock);
+
+        if (stolen) {
+            if (!alloc_stack_for(stolen)) {
+                pthread_spin_lock(&other->lock);
+                stolen->next_ready = (fiber_t*)atomic_load(&other->free_list);
+                atomic_store(&other->free_list, stolen);
+                atomic_fetch_add(&other->available, 1);
+                pthread_spin_unlock(&other->lock);
+                return NULL;
+            }
+            stolen->state = FIBER_NEW;
+            atomic_fetch_add(&pool->allocated, 1);
+            atomic_fetch_add(&g_diag_fallback_hits, 1);
+            return stolen;
+        }
+    }
+    atomic_fetch_add(&g_diag_grows, 1);
+
+    /* Nobody has a spare - grow. Growth is a single lock-free counter
+     * shared by all shards, so this never contends with any shard's
+     * lock. */
     size_t prev_capacity = atomic_fetch_add(&pool->capacity, 1);
     if (prev_capacity >= FIBER_POOL_MAX_SIZE) {
         atomic_fetch_sub(&pool->capacity, 1);

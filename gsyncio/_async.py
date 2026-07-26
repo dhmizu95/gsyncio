@@ -18,64 +18,72 @@ from typing import Any, Coroutine, List, Optional, Awaitable
 
 try:
     from ._gsyncio_core import GSocket, sleep_ns as _c_sleep_ns
-    from ._gsyncio_core import spawn_coro_batch as _spawn_coro_batch
+    from ._gsyncio_core import spawn as _spawn
     _HAS_NATIVE = True
 except ImportError:
     _HAS_NATIVE = False
-    _spawn_coro_batch = None
+    _spawn = None
 
-from .core import Future, sleep_ms, sleep_ns, init_scheduler, shutdown_scheduler, _HAS_CYTHON, task as _task
+from .core import sleep_ms, sleep_ns, init_scheduler, shutdown_scheduler, _HAS_CYTHON, task as _task
+
+# The Python-level Future, NOT core's C Future. The C one's __await__
+# resolves by calling self.result() -> future_wait() -> pthread_cond_wait,
+# i.e. it blocks the worker thread until the future completes. Awaiting a
+# C Future from a driven coroutine therefore skipped the suspension
+# machinery entirely and serialised the whole drain on one worker
+# (measured: 74 us per await at 200k, versus 0.21 us for an await that
+# goes through the driver). The Python Future yields to the driver
+# instead - see _future.Future.__await__.
+from ._future import Future
+
+if _spawn is None:  # pure-Python fallback build has no chunked spawn
+    def _spawn(pairs):
+        for fn, args in pairs:
+            _task(fn, *args)
 
 
-def _drive_coro(coro) -> Any:
-    """Run *coro* to completion on the calling fiber.
-
-    Works because every gsyncio-native awaitable blocks synchronously in
-    C when called from a fiber - so this one `send(None)` transitively
-    blocks all the way to the coroutine's final return. If the coroutine
-    yields for real (it awaited something that isn't gsyncio-native),
-    there's no event loop here to service it - that's a usage error, not
-    something to silently hang on.
-    """
-    try:
-        coro.send(None)
-    except StopIteration as e:
-        return e.value
-    else:
-        raise RuntimeError(
-            "coroutine awaited something that isn't gsyncio-native while "
-            "running under gsyncio's native driver - no asyncio event "
-            "loop is running to service it"
-        )
+from ._suspend import step as _step, driver_active as _driver_active, _Sleep
 
 
 # ── create_task ───────────────────────────────────────────────────────────────
 def create_task(coro: Coroutine) -> Future:
-    """Wrap a coroutine in a gsyncio Future and run it on its own fiber."""
+    """Wrap a coroutine in a gsyncio Future and start it on a fiber.
+
+    The coroutine is *stepped*, not run to completion in place: if it
+    awaits something unresolved it suspends and frees the worker, and is
+    resumed later (see gsyncio._suspend).
+    """
     future = Future()
-
-    def _driver():
-        try:
-            result = _drive_coro(coro)
-            future.set_result(result)
-        except BaseException as e:
-            future.set_exception(e)
-
-    _task(_driver)
+    _task(_step, coro, future)
     return future
 
 
 # ── sleep ─────────────────────────────────────────────────────────────────────
 async def sleep(ms: float) -> None:
-    """Sleep for *ms* milliseconds (fiber-aware when on a C fiber)."""
+    """Sleep for *ms* milliseconds.
+
+    Inside a coroutine this genuinely suspends - the worker thread is
+    released and reused, so the number of concurrently sleeping
+    coroutines is not bounded by the worker count.
+
+    Called from a plain `gs.task()` function body there is nothing to
+    suspend (a function call has no resumable state, unlike a
+    coroutine), so it stays a real blocking sleep on that worker. That
+    is the Go-style path: use more workers, or use a coroutine.
+    """
+    if ms <= 0:
+        return
+    if _driver_active():
+        await _Sleep(int(ms * 1_000_000))
+        return
+
     from .core import current_fiber_id
     if _HAS_CYTHON and current_fiber_id() != 0:
-        # Running on a native gsyncio fiber - real blocking C sleep.
+        # On a fiber but not inside a driven coroutine - blocking C sleep.
         _c_sleep_ns(int(ms * 1_000_000))
     else:
-        # Not on a fiber (e.g. called directly from a plain thread or an
-        # ambient asyncio loop, without gs.run()/gs.create_task()) - a
-        # plain blocking sleep, no asyncio.
+        # Not on a fiber (plain thread, or an ambient asyncio loop
+        # without gs.run()/gs.create_task()) - plain blocking sleep.
         time.sleep(ms / 1000.0)
 
 
@@ -103,16 +111,37 @@ async def gather(*awaitables: Awaitable,
 
     prepared = list(awaitables)
     if coro_indices:
-        if _spawn_coro_batch is not None:
-            batched_futures = _spawn_coro_batch([awaitables[i] for i in coro_indices])
-            for i, fut in zip(coro_indices, batched_futures):
-                prepared[i] = fut
-        else:
-            for i in coro_indices:
-                prepared[i] = create_task(awaitables[i])
+        # Start every coroutine's FIRST step in chunked fibers: spawn()
+        # groups them so one GIL acquisition covers a whole chunk, which
+        # is where nearly all of the batching win came from. Coroutines
+        # that run straight through finish inside that chunk and cost
+        # nothing extra; ones that suspend park themselves and get their
+        # own fiber on resume. The old path used the C chunk driver,
+        # which did a single send() per coroutine and therefore could not
+        # let any of them suspend at all.
+        futs = [Future() for _ in coro_indices]
+        for i, fut in zip(coro_indices, futs):
+            prepared[i] = fut
+        _spawn([(_step, (awaitables[i], fut))
+                for i, fut in zip(coro_indices, futs)])
 
     results = []
     for a in prepared:
+        # Skip the await entirely for anything already resolved. By the
+        # time gather() starts collecting, the chunked spawn above has
+        # usually finished most of the batch, and `await` on a done
+        # Future still costs a generator object plus a yield/resume round
+        # trip through the driver for no reason.
+        if type(a) is Future and a.done:
+            if return_exceptions:
+                try:
+                    results.append(a.result())
+                except Exception as e:
+                    results.append(e)
+            else:
+                results.append(a.result())
+            continue
+
         if return_exceptions:
             try:
                 results.append(await a)

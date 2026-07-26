@@ -182,10 +182,16 @@ static void sigsegv_handler(int sig, siginfo_t* info, void* context) {
         _exit(1);
     }
     
-    /* Check if the fault is in the fiber's stack */
+    /* Check if the fault is in the fiber's stack. With
+     * FIBER_ALLOCATE_STACKS off there is no fiber stack to fault in -
+     * the fiber is running on the worker's own stack - so skip the
+     * range check rather than doing pointer arithmetic on NULL. */
     char* fault_addr = (char*)info->si_addr;
+    if (!fiber->stack_base) {
+        _exit(1);
+    }
     char* stack_bottom = (char*)fiber->stack_base - fiber->stack_capacity;
-    
+
     if (fault_addr >= stack_bottom && fault_addr < (char*)fiber->stack_base) {
         /* Stack overflow - in a full implementation, we'd grow the stack */
         fprintf(stderr, "Fiber %lu stack overflow\n", (unsigned long)fiber->id);
@@ -250,7 +256,10 @@ fiber_t* fiber_create(void (*func)(void*), void* arg, size_t stack_size) {
     fiber->stack_size = stack_size;
     fiber->stack_capacity = stack_size;
     
-    /* Allocate stack with guard page */
+    /* Allocate stack with guard page - compiled out by default, since a
+     * fiber body is a plain call on the worker's own stack and never
+     * touches this memory (see FIBER_ALLOCATE_STACKS in fiber.h). */
+#if FIBER_ALLOCATE_STACKS == 1
 #if FIBER_USE_GUARD_PAGES == 1
     size_t alloc_size = stack_size + 4096;
     fiber->stack_base = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -261,15 +270,20 @@ fiber_t* fiber_create(void (*func)(void*), void* arg, size_t stack_size) {
     size_t alloc_size = stack_size;
     fiber->stack_base = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 #endif
-    
+
     if (fiber->stack_base == MAP_FAILED) {
         free(fiber);
         return NULL;
     }
-    
+
     fiber->mmap_size = alloc_size;
     fiber->stack_ptr = (char*)fiber->stack_base + alloc_size;
-    
+#else
+    fiber->stack_base = NULL;
+    fiber->stack_ptr = NULL;
+    fiber->mmap_size = 0;
+#endif
+
     fiber_table_add(fiber);
     
     return fiber;
@@ -281,9 +295,9 @@ void fiber_free(fiber_t* fiber) {
     }
     
     fiber_table_remove(fiber);
-    
+
     if (fiber->stack_base && fiber->stack_base != MAP_FAILED) {
-        munmap(fiber->stack_base, fiber->stack_capacity + 4096);
+        munmap(fiber->stack_base, fiber->mmap_size);
     }
     
     free(fiber);
