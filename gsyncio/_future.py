@@ -22,12 +22,21 @@ class Future:
     # the callback list is created only if something actually registers
     # one - which nothing does unless the Future is awaited before it
     # resolves.
-    __slots__ = ("_inner", "_callbacks", "_done_flag")
+    __slots__ = ("_inner", "_callbacks", "_done_flag",
+                 "_cancelled", "cancel_requested", "waiter")
 
     def __init__(self):
         self._inner     = _CFuture()
         self._callbacks: Optional[List[Callable]] = None
         self._done_flag = False
+        self._cancelled = False
+        # Set by cancel(); read by the driver at the coroutine's next
+        # resume, where it becomes a CancelledError thrown into it.
+        self.cancel_requested = False
+        # Where this future's coroutine is currently parked, if it is.
+        # Lets cancel() wake a sleeping coroutine immediately instead of
+        # waiting out its timer.
+        self.waiter = None
 
     # ── Status ────────────────────────────────────────────────────────────────
 
@@ -40,11 +49,50 @@ class Future:
 
     @property
     def cancelled(self) -> bool:
-        return self._inner.cancelled
+        return self._cancelled
+
+    # ── Cancellation ──────────────────────────────────────────────────────────
+
+    def cancel(self) -> bool:
+        """Request cancellation of the coroutine behind this future.
+
+        Returns True if a cancellation was actually requested, False if
+        the future had already completed. The coroutine is not killed:
+        a CancelledError is raised *inside* it at its next resume, so its
+        `finally` blocks and cleanup still run. If it is parked on a
+        sleep, it is woken immediately rather than after the full delay.
+        """
+        if self.done:
+            return False
+        self.cancel_requested = True
+
+        # Wake it now if it is parked. resume_cancelled() claims the
+        # pending wakeup so the timer (or the future callback) that would
+        # otherwise resume it later steps aside.
+        waiter = self.waiter
+        if waiter is not None:
+            from ._suspend import resume_cancelled
+            resume_cancelled(waiter)
+        return True
+
+    def mark_cancelled(self) -> None:
+        """Complete this future in the cancelled state (driver-internal)."""
+        from ._suspend import CancelledError
+        self._cancelled = True
+        if not self._done_flag:
+            self._done_flag = True
+            try:
+                self._inner.set_exception(CancelledError())
+            except Exception:
+                pass
+        self._fire_callbacks()
 
     # ── Result access ─────────────────────────────────────────────────────────
 
     def result(self, timeout: Optional[float] = None) -> Any:
+        if self._cancelled:
+            from ._suspend import CancelledError
+            raise CancelledError()
         return self._inner.result(timeout)
 
     def exception(self, timeout: Optional[float] = None) -> Optional[Exception]:

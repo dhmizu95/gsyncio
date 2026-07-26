@@ -136,6 +136,7 @@ except ImportError:
 from ._async import (
     create_task,
     sleep,
+    yield_now,
     gather,
     wait_for,
     ensure_future,
@@ -144,6 +145,10 @@ from ._async import (
     AsyncIterator,
     AsyncContextManager,
 )
+
+# ── Async synchronization primitives + cancellation ──────────────────────────
+from ._sync import Semaphore, BoundedSemaphore, Lock, Event
+from ._suspend import CancelledError
 
 from ._channel import (
     Chan,
@@ -219,7 +224,11 @@ __all__ = [
     "set_energy_efficient_mode", "get_worker_utilization", "get_recommended_workers",
 
     # Async/await
-    "create_task", "sleep", "gather", "wait_for",
+    "create_task", "sleep", "yield_now", "gather", "wait_for",
+
+    # Async synchronization + cancellation
+    "Semaphore", "BoundedSemaphore", "Lock", "Event", "CancelledError",
+
     "ensure_future", "async_range", "AsyncRange", "AsyncIterator", "AsyncContextManager",
     "gather_native", "wait_for_native",
 

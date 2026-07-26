@@ -52,6 +52,15 @@ def driver_active() -> bool:
     return getattr(_local, "active", 0) > 0
 
 
+class CancelledError(BaseException):
+    """Raised inside a coroutine whose task was cancelled.
+
+    Derives from BaseException, not Exception, for the same reason
+    asyncio's does: a bare `except Exception` in user code must not
+    accidentally swallow a cancellation and keep the task alive.
+    """
+
+
 class _Sleep:
     """Awaitable that asks the driver to resume us after `delay_ns`."""
 
@@ -62,6 +71,51 @@ class _Sleep:
 
     def __await__(self):
         yield self
+
+
+class _Yield:
+    """Awaitable that gives other ready work a turn, then resumes.
+
+    The cooperative yield point the async model was missing. Without it
+    `await sleep(0)` returned straight away, so two coroutines gathered
+    together ran strictly one after the other (A0 A1 A2 B0 B1 B2) instead
+    of interleaving - there was no way for a coroutine to voluntarily let
+    anything else run, and hence no fairness point at all.
+    """
+
+    __slots__ = ()
+
+    def __await__(self):
+        yield self
+
+
+class _Waiter:
+    """One pending resume, claimed exactly once.
+
+    A suspended coroutine can be woken by two different things racing:
+    its timer coming due, and cancel() trying to wake it early. Both must
+    not call step() on the same coroutine - a coroutine cannot be resumed
+    twice concurrently. `claim()` makes exactly one of them win.
+    """
+
+    __slots__ = ("coro", "future", "fired")
+
+    def __init__(self, coro, future):
+        self.coro = coro
+        self.future = future
+        self.fired = False
+
+    def claim(self) -> bool:
+        with _CLAIM_LOCK:
+            if self.fired:
+                return False
+            self.fired = True
+            return True
+
+
+# Guards _Waiter.fired only. Taken on resume and on cancel - never on the
+# path of a coroutine that runs straight through without suspending.
+_CLAIM_LOCK = threading.Lock()
 
 
 # ── timer wheel ──────────────────────────────────────────────────────────────
@@ -88,12 +142,12 @@ class _TimerWheel:
                         target=self._run, name="gsyncio-timers", daemon=True)
                     self._thread.start()
 
-    def add(self, delay_ns: int, coro, future) -> None:
+    def add(self, delay_ns: int, waiter) -> None:
         self._ensure_thread()
         deadline = time.monotonic_ns() + max(0, delay_ns)
         with self._cv:
             self._seq += 1
-            heapq.heappush(self._heap, (deadline, self._seq, coro, future))
+            heapq.heappush(self._heap, (deadline, self._seq, waiter))
             # Only worth waking the thread if this is the new earliest
             # deadline; otherwise it is already sleeping for less time.
             if self._heap[0][1] == self._seq:
@@ -114,8 +168,14 @@ class _TimerWheel:
                 # Drain everything already due in one pass so a large
                 # batch of same-deadline sleepers costs one wake-up.
                 while self._heap and self._heap[0][0] <= now:
-                    _, _, coro, future = heapq.heappop(self._heap)
-                    due.append((step, (coro, future)))
+                    _, _, waiter = heapq.heappop(self._heap)
+                    # Skip anything cancel() already woke: it resumed the
+                    # coroutine and released the token itself, so touching
+                    # either here would step the coroutine twice and
+                    # double-release. The `finally` below releases exactly
+                    # one token per entry we DID claim.
+                    if waiter.claim():
+                        due.append((step, (waiter.coro, waiter.future)))
 
             if not due:
                 continue
@@ -157,6 +217,46 @@ def _pending_token_release():
         _dec_tasks()
 
 
+def _register_waiter(future, waiter) -> None:
+    """Record where a coroutine is parked, so cancel() can reach it.
+
+    Best-effort: anything without the attribute (a ResultBox from
+    gs.run(), say) simply isn't cancellable, which is fine - nobody holds
+    a handle to it.
+    """
+    try:
+        future.waiter = waiter
+    except AttributeError:
+        pass
+
+
+def _set_cancelled(future) -> None:
+    """Complete a future as cancelled rather than as a plain exception."""
+    marker = getattr(future, "mark_cancelled", None)
+    if marker is not None:
+        marker()
+    else:
+        future.set_exception(CancelledError())
+
+
+def resume_cancelled(waiter) -> None:
+    """Wake a parked coroutine early to deliver a cancellation.
+
+    Called from Future.cancel(). Only proceeds if it wins the claim
+    against the pending timer, so the coroutine is stepped exactly once.
+    """
+    if not waiter.claim():
+        return False
+    from .core import task as _task
+    try:
+        _task(step, waiter.coro, waiter.future, None, CancelledError())
+    finally:
+        # Balances the token taken when the coroutine parked; the timer
+        # entry that still holds this waiter will now skip it.
+        _pending_token_release()
+    return True
+
+
 def step(coro, future, send_value=None, throw_exc=None) -> None:
     """Advance `coro` one step and park it again if it suspends.
 
@@ -165,6 +265,13 @@ def step(coro, future, send_value=None, throw_exc=None) -> None:
     something to resolve.
     """
     while True:
+        # A cancel() that landed while this coroutine was parked is
+        # delivered here, at its next resume, as a throw into the
+        # coroutine - so `finally` blocks and `except CancelledError`
+        # handlers inside it run normally.
+        if throw_exc is None and getattr(future, "cancel_requested", False):
+            throw_exc = CancelledError()
+
         _local.active = getattr(_local, "active", 0) + 1
         try:
             if throw_exc is not None:
@@ -176,18 +283,33 @@ def step(coro, future, send_value=None, throw_exc=None) -> None:
         except StopIteration as e:
             future.set_result(e.value)
             return
+        except CancelledError:
+            _set_cancelled(future)
+            return
         except BaseException as e:
             future.set_exception(e)
             return
         finally:
             _local.active -= 1
 
+        # ── cooperative yield ────────────────────────────────────────────
+        if type(req) is _Yield:
+            # Re-queue behind whatever else is already ready, so other
+            # coroutines actually get a turn. No token needed: this
+            # fiber is still counted until it returns, and the resume is
+            # queued before that happens.
+            from .core import task as _task
+            _task(step, coro, future)
+            return
+
         # ── sleep ────────────────────────────────────────────────────────
         if type(req) is _Sleep:
             # Token first: once this fiber returns, nothing else keeps
             # the task count above zero until the timer fires.
             _pending_token_acquire()
-            _timers.add(req.delay_ns, coro, future)
+            waiter = _Waiter(coro, future)
+            _register_waiter(future, waiter)
+            _timers.add(req.delay_ns, waiter)
             return
 
         # ── another gsyncio Future ───────────────────────────────────────
@@ -202,16 +324,22 @@ def step(coro, future, send_value=None, throw_exc=None) -> None:
                 continue
 
             _pending_token_acquire()
+            waiter = _Waiter(coro, future)
+            _register_waiter(future, waiter)
 
-            def _on_done(_f, _coro=coro, _fut=future):
+            def _on_done(_f, _w=waiter):
                 from .core import task as _task
+                # cancel() may already have woken this coroutine; only one
+                # of us may step it.
+                if not _w.claim():
+                    return
                 try:
                     try:
                         val = _f.result()
                     except BaseException as e:
-                        _task(step, _coro, _fut, None, e)
+                        _task(step, _w.coro, _w.future, None, e)
                     else:
-                        _task(step, _coro, _fut, val)
+                        _task(step, _w.coro, _w.future, val)
                 finally:
                     _pending_token_release()
 

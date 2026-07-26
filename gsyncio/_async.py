@@ -42,7 +42,13 @@ if _spawn is None:  # pure-Python fallback build has no chunked spawn
             _task(fn, *args)
 
 
-from ._suspend import step as _step, driver_active as _driver_active, _Sleep
+from ._suspend import (
+    step as _step,
+    driver_active as _driver_active,
+    _Sleep,
+    _Yield,
+    CancelledError,
+)
 
 
 # ── create_task ───────────────────────────────────────────────────────────────
@@ -71,10 +77,17 @@ async def sleep(ms: float) -> None:
     coroutine), so it stays a real blocking sleep on that worker. That
     is the Go-style path: use more workers, or use a coroutine.
     """
-    if ms <= 0:
-        return
     if _driver_active():
-        await _Sleep(int(ms * 1_000_000))
+        # sleep(0) is the idiomatic "let something else run" - it has to
+        # be a real yield, not a no-op return, or coroutines never
+        # interleave.
+        if ms <= 0:
+            await _Yield()
+        else:
+            await _Sleep(int(ms * 1_000_000))
+        return
+
+    if ms <= 0:
         return
 
     from .core import current_fiber_id
@@ -153,13 +166,33 @@ async def gather(*awaitables: Awaitable,
 
 
 # ── wait_for ──────────────────────────────────────────────────────────────────
+async def yield_now() -> None:
+    """Give other ready coroutines a turn, then continue.
+
+    The explicit form of `await sleep(0)`. Outside a driven coroutine
+    there is nothing to yield to, so it is a no-op.
+    """
+    if _driver_active():
+        await _Yield()
+
+
 async def wait_for(fut: Awaitable, timeout: float) -> Any:
-    """Wait for *fut* with a *timeout* in seconds."""
+    """Wait for *fut* with a *timeout* in seconds.
+
+    On timeout the pending task is CANCELLED before raising. Without
+    that the task keeps running - and since gs.run() waits for every
+    spawned task, a timed-out wait_for() would still block until the
+    abandoned work finished on its own (measured: a 50 ms timeout over a
+    1 s sleep took the full 1 s to return).
+    """
     if inspect.iscoroutine(fut):
         fut = create_task(fut)
     deadline = time.monotonic() + timeout
     while not fut.done:
         if time.monotonic() >= deadline:
+            cancel = getattr(fut, "cancel", None)
+            if cancel is not None:
+                cancel()
             raise TimeoutError("wait_for() timed out")
         await sleep(1)
     return fut.result()
